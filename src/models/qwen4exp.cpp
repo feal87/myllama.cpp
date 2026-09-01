@@ -410,7 +410,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         // the converter pads the table; a model synthesised from metadata has no tensor to ask
         const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
-        if (const auto * ple_w = ml.get_weight(ple_name.c_str())) {
+        const auto * ple_w = ml.get_weight(ple_name.c_str());
+        if (ple_w != nullptr) {
             if (ple_w->tensor->ne[1] < ple_rows) {
                 throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the PLE head ranges (%" PRId64 ")",
                                                 ple_name.c_str(), ple_w->tensor->ne[1], ple_rows));
@@ -422,8 +423,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                                            { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
         // --lazy-mode on-direct: read the gathered rows with explicit offset reads
         // instead of faulting them in through the mmap
-        if (ml.lazy.mode == LLAMA_LAZY_MODE_DIRECT) {
-            const auto & file = ml.files[ple_w.idx];
+        if (ml.lazy.mode == LLAMA_LAZY_MODE_DIRECT && ple_w != nullptr) {
+            const auto & file = ml.files[ple_w->idx];
 #ifdef _WIN32
             ple_win_handle direct_handle{ple_open_file(file->name())};
             if (direct_handle.handle == INVALID_HANDLE_VALUE) {
@@ -453,15 +454,15 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                 const int n_threads = 2 * (int) std::max(1u, std::thread::hardware_concurrency());
 
 #ifdef _WIN32
-                ple_reader = std::make_unique<ple_direct_reader>(direct_handle.handle, ple_w.offs,
+                ple_reader = std::make_unique<ple_direct_reader>(direct_handle.handle, ple_w->offs,
 #else
-                ple_reader = std::make_unique<ple_direct_reader>(fd, ple_w.offs,
+                ple_reader = std::make_unique<ple_direct_reader>(fd, ple_w->offs,
 #endif
                         ggml_row_size(per_layer_tok_embd->type, per_layer_tok_embd->ne[0]), ple_rows, n_threads,
                         per_layer_tok_embd->type, hparams.ple_head_dim);
 
                 LLAMA_LOG_INFO("%s: PLE direct read enabled: %" PRId64 " rows of %zu bytes at file offset %zu, %d threads\n",
-                        __func__, ple_rows, ple_reader->row_size, ple_w.offs, n_threads);
+                        __func__, ple_rows, ple_reader->row_size, ple_w->offs, n_threads);
 #ifdef _WIN32
                 direct_handle.handle = INVALID_HANDLE_VALUE;
 #endif
