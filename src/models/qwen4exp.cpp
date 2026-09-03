@@ -1058,7 +1058,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         m_g = ggml_cast(ctx0, m_g, GGML_TYPE_F16);                   // FA wants contiguous F16
         cb(m_g, "qsa_mask_gathered", il);
 
-        ggml_tensor * cur = build_attn_mha(q_cur, k_g, v_g, nullptr, m_g, nullptr, nullptr, kq_scale, il);
+        ggml_tensor * cur = build_attn_mha(q_cur, k_g, v_g, nullptr, m_g, nullptr, nullptr, 0, kq_scale, il);
         cb(cur, "kqv_out", il);
 
         // the rotation is its own inverse, so undo it on the value side of the output
