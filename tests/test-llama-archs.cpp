@@ -858,8 +858,11 @@ static void test_kv_rotation(ggml_backend_dev_t dev) {
     }
 }
 
-static void test_lazy_kv(llm_arch arch, size_t seed, ggml_backend_dev_t dev) {
-    auto gguf = get_gguf_ctx(arch, false);
+static void test_lazy_kv(llm_arch arch, size_t seed, ggml_backend_dev_t dev, ggml_type type) {
+    // phase 1 uses a larger overlay type; convert in flight once the overlay fills
+    GGML_ASSERT(type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0);
+    const ggml_type type_overlay = type == GGML_TYPE_Q8_0 ? GGML_TYPE_F16 : GGML_TYPE_Q8_0;
+    auto gguf = get_gguf_ctx(arch, moe_mandatory(arch));
     if (arch == LLM_ARCH_GEMMA4) {
         const bool pattern[] = {true, true, false, true, false};
         gguf_set_arr_data(gguf.get(), "gemma4.attention.sliding_window_pattern", GGUF_TYPE_BOOL, pattern, 5);
@@ -875,7 +878,7 @@ static void test_lazy_kv(llm_arch arch, size_t seed, ggml_backend_dev_t dev) {
     GGML_ASSERT(model);
 
     std::vector<ggml_type> attention_types;
-    auto make_context = [&](uint32_t n_ctx = 512, bool swa_full = true, uint32_t n_seq_max = 2, ggml_type type = GGML_TYPE_Q8_0) {
+    auto make_context = [&](uint32_t n_ctx = 512, bool swa_full = true, uint32_t n_seq_max = 2, ggml_type kv_type = GGML_TYPE_Q8_0) {
         auto p = llama_context_default_params();
         p.n_ctx = n_ctx;
         p.n_batch = 512;
@@ -884,7 +887,7 @@ static void test_lazy_kv(llm_arch arch, size_t seed, ggml_backend_dev_t dev) {
         p.kv_unified = true;
         p.swa_full = swa_full;
         p.n_threads = p.n_threads_batch = 2;
-        p.type_k = p.type_v = type;
+        p.type_k = p.type_v = kv_type;
         p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
         p.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
             if (ask && t->op == GGML_OP_FLASH_ATTN_EXT) {
@@ -923,9 +926,11 @@ static void test_lazy_kv(llm_arch arch, size_t seed, ggml_backend_dev_t dev) {
         }
     };
 
-    // Lazy F16 must match ordinary F16, including a pending context shift.
-    auto plain = make_context(512, true, 2, GGML_TYPE_F16);
-    auto lazy = make_context();
+    // The overlay phase must match an ordinary cache of the overlay type, including a pending context shift.
+    common_set_env("LLAMA_KV_CACHE_LAZY_QUANT", "0");
+    auto plain = make_context(512, true, 2, type_overlay);
+    common_set_env("LLAMA_KV_CACHE_LAZY_QUANT", "1");
+    auto lazy = make_context(512, true, 2, type);
     decode(plain.get(), 0, 16);
     decode(lazy.get(), 0, 16);
     GGML_ASSERT(save(plain.get()) == save(lazy.get()));
@@ -947,69 +952,69 @@ static void test_lazy_kv(llm_arch arch, size_t seed, ggml_backend_dev_t dev) {
     GGML_ASSERT(save(plain.get()) == save(lazy.get()));
 
     // Pre-transition snapshots must restore into the expanded cache on both IO paths.
-    auto ctx = make_context();
+    auto ctx = make_context(512, true, 2, type);
     GGML_ASSERT(ctx->get_memory()->get_has_lazy_quant());
     decode(ctx.get(), 0, 8);
     decode(ctx.get(), 0, 8, 1);
     decode(ctx.get(), 8, 8);
-    check_type(GGML_TYPE_F16);
-    const auto f16_host = save(ctx.get());
-    const auto f16_device = save(ctx.get(), LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
-    std::vector<uint8_t> f16_full(llama_state_get_size(ctx.get()));
-    GGML_ASSERT(llama_state_get_data(ctx.get(), f16_full.data(), f16_full.size()) == f16_full.size());
+    check_type(type_overlay);
+    const auto overlay_host = save(ctx.get());
+    const auto overlay_device = save(ctx.get(), LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+    std::vector<uint8_t> overlay_full(llama_state_get_size(ctx.get()));
+    GGML_ASSERT(llama_state_get_data(ctx.get(), overlay_full.data(), overlay_full.size()) == overlay_full.size());
     decode(ctx.get(), 16, 241);
     GGML_ASSERT(!ctx->get_memory()->get_has_lazy_quant());
-    check_type(GGML_TYPE_Q8_0);
+    check_type(type);
     GGML_ASSERT(llama_memory_seq_rm(ctx->get_memory(), 0, 16, -1));
-    const auto q8_host = save(ctx.get());
+    const auto final_host = save(ctx.get());
     for (bool device : {false, true}) {
-        restore(ctx.get(), device ? f16_device : f16_host, device ? LLAMA_STATE_SEQ_FLAGS_ON_DEVICE : 0);
-        GGML_ASSERT(save(ctx.get()) == q8_host);
+        restore(ctx.get(), device ? overlay_device : overlay_host, device ? LLAMA_STATE_SEQ_FLAGS_ON_DEVICE : 0);
+        GGML_ASSERT(save(ctx.get()) == final_host);
     }
-    GGML_ASSERT(llama_state_set_data(ctx.get(), f16_full.data(), f16_full.size()) == f16_full.size());
-    GGML_ASSERT(save(ctx.get()) == q8_host);
+    GGML_ASSERT(llama_state_set_data(ctx.get(), overlay_full.data(), overlay_full.size()) == overlay_full.size());
+    GGML_ASSERT(save(ctx.get()) == final_host);
 
     // Restore conversion depends on the formats, not on a prior lazy transition.
     common_set_env("LLAMA_KV_CACHE_LAZY_QUANT", "0");
-    auto fixed = make_context();
+    auto fixed = make_context(512, true, 2, type);
     common_set_env("LLAMA_KV_CACHE_LAZY_QUANT", "1");
     GGML_ASSERT(!fixed->get_memory()->get_has_lazy_quant());
-    restore(fixed.get(), f16_host);
-    GGML_ASSERT(save(fixed.get()) == q8_host);
+    restore(fixed.get(), overlay_host);
+    GGML_ASSERT(save(fixed.get()) == final_host);
 
     // Disk restore uses the same conversion as host and device snapshots.
     const std::string state_file = "test-lazy-kv-" + std::string(llm_arch_name(arch)) + ".bin";
-    restore(lazy.get(), f16_host);
+    restore(lazy.get(), overlay_host);
     GGML_ASSERT(llama_state_seq_save_file(lazy.get(), state_file.c_str(), 0, nullptr, 0) > 0);
     size_t n_tokens = 0;
     GGML_ASSERT(llama_state_seq_load_file(ctx.get(), state_file.c_str(), 0, nullptr, 0, &n_tokens) > 0);
-    GGML_ASSERT(save(ctx.get()) == q8_host);
+    GGML_ASSERT(save(ctx.get()) == final_host);
     GGML_ASSERT(std::remove(state_file.c_str()) == 0);
 
     // A matching type with a different rotation must be rejected.
     common_set_env("LLAMA_ATTN_ROT_DISABLE", "1");
-    auto unrotated = make_context();
+    auto unrotated = make_context(512, true, 2, type);
     common_set_env("LLAMA_ATTN_ROT_DISABLE", "0");
-    GGML_ASSERT(llama_state_seq_set_data(unrotated.get(), q8_host.data(), q8_host.size(), 0) == 0);
+    GGML_ASSERT(llama_state_seq_set_data(unrotated.get(), final_host.data(), final_host.size(), 0) == 0);
 
-    // The snapshot fits the final cache, but not the free space in the F16 cache.
-    ctx = make_context();
+    // The snapshot fits the final cache, but not the free space of the overlay cache.
+    ctx = make_context(512, true, 2, type);
     decode(ctx.get(), 0, 250, 1);
-    restore(ctx.get(), q8_host);
+    restore(ctx.get(), final_host);
     GGML_ASSERT(llama_memory_seq_pos_max(ctx->get_memory(), 1) == 249);
-    GGML_ASSERT(save(ctx.get()) == q8_host);
+    GGML_ASSERT(save(ctx.get()) == final_host);
 
     // A truncated restore must invalidate the graph even when the read throws.
-    ctx = make_context();
+    ctx = make_context(512, true, 2, type);
     decode(ctx.get(), 0, 1);
-    GGML_ASSERT(llama_state_seq_set_data(ctx.get(), q8_host.data(), q8_host.size() - 1, 0) == 0);
+    GGML_ASSERT(llama_state_seq_set_data(ctx.get(), final_host.data(), final_host.size() - 1, 0) == 0);
     GGML_ASSERT(!ctx->get_memory()->get_has_lazy_quant());
     decode(ctx.get(), 0, 1);
-    check_type(GGML_TYPE_Q8_0);
+    check_type(type);
 
     if (arch == LLM_ARCH_GEMMA4) {
-        // SWA fills first; full attention must remain F16 until it also fills.
-        ctx = make_context(4096, false, 1);
+        // SWA fills first; full attention must remain in the overlay type until it also fills.
+        ctx = make_context(4096, false, 1, type);
         auto * mem = dynamic_cast<llama_kv_cache_iswa *>(ctx->get_memory());
         GGML_ASSERT(mem && mem->get_base()->get_size() > mem->get_swa()->get_size());
         decode(ctx.get(), 0, 512);
@@ -1021,13 +1026,13 @@ static void test_lazy_kv(llm_arch arch, size_t seed, ggml_backend_dev_t dev) {
         const auto partial = save(ctx.get(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
         // A partial restore changes SWA layout while the aggregate lazy flag stays true.
-        ctx = make_context(4096, false, 1);
+        ctx = make_context(4096, false, 1, type);
         decode(ctx.get(), 0, 1);
         restore(ctx.get(), partial, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         decode(ctx.get(), 1, 1);
         GGML_ASSERT(attention_types.size() == 5);
         for (size_t il = 0; il < attention_types.size(); ++il) {
-            GGML_ASSERT(attention_types[il] == (il == 2 || il == 4 ? GGML_TYPE_F16 : GGML_TYPE_Q8_0));
+            GGML_ASSERT(attention_types[il] == (il == 2 || il == 4 ? type_overlay : type));
         }
     }
     LOG_INF("%s: %s passed\n", __func__, llm_arch_name(arch));
@@ -1116,7 +1121,8 @@ int main(int argc, char ** argv) {
             test_kv_rotation(dev);
             for (auto test_arch : {LLM_ARCH_LLAMA, LLM_ARCH_GEMMA4}) {
                 if (arch == LLM_ARCH_UNKNOWN || arch == test_arch) {
-                    test_lazy_kv(test_arch, seed, dev);
+                    test_lazy_kv(test_arch, seed, dev, GGML_TYPE_Q8_0);
+                    test_lazy_kv(test_arch, seed, dev, GGML_TYPE_Q4_0);
                 }
             }
             return 0;

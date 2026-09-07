@@ -129,27 +129,39 @@ llama_kv_cache::llama_kv_cache(
     const char * LLAMA_KV_CACHE_LAZY_QUANT = getenv("LLAMA_KV_CACHE_LAZY_QUANT");
     const bool lazy_requested = LLAMA_KV_CACHE_LAZY_QUANT ? atoi(LLAMA_KV_CACHE_LAZY_QUANT) != 0 : false;
 
+    // A configured cache type can start in a larger, higher-precision type and
+    // be quantized in flight once those cells fill. The overlay type must be
+    // larger than the configured type so that the whole configured cache fits
+    // in the same memory. Q4_0 starts as Q8_0, which starts as F16.
+    ggml_type type_lazy_k = GGML_TYPE_COUNT;
+    ggml_type type_lazy_v = GGML_TYPE_COUNT;
+    if (lazy_requested && type_k == type_v) {
+        switch (type_k) {
+            case GGML_TYPE_Q8_0: type_lazy_k = type_lazy_v = GGML_TYPE_F16; break;
+            case GGML_TYPE_Q4_0: type_lazy_k = type_lazy_v = GGML_TYPE_Q8_0; break;
+            default:             break;
+        }
+    }
+
     bool lazy_quant =
-        lazy_requested &&
-        type_k == GGML_TYPE_Q8_0 &&
-        type_v == GGML_TYPE_Q8_0 &&
+        type_lazy_k != GGML_TYPE_COUNT &&
         !v_trans &&
         n_stream == 1 &&
         other == nullptr &&
         !hparams.no_alloc;
 
     if (lazy_quant) {
-        kv_size = llama_kv_cache_size_for_type(target.size, type_k, GGML_TYPE_F16, std::max(n_pad, 256u));
+        kv_size = llama_kv_cache_size_for_type(target.size, type_k, type_lazy_k, std::max(n_pad, 256u));
         if (kv_size == 0) {
             lazy_quant = false;
             kv_size = target.size;
         } else {
-            LLAMA_LOG_INFO("%s: lazy KV quantization enabled, f16 cells = %u, q8_0 cells = %u\n",
-                    __func__, kv_size, target.size);
+            LLAMA_LOG_INFO("%s: lazy KV quantization enabled, %s cells = %u, %s cells = %u\n",
+                    __func__, ggml_type_name(type_lazy_k), kv_size, ggml_type_name(type_k), target.size);
         }
     }
 
-    current = { kv_size, lazy_quant ? GGML_TYPE_F16 : type_k, lazy_quant ? GGML_TYPE_F16 : type_v, 0, 0 };
+    current = { kv_size, lazy_quant ? type_lazy_k : type_k, lazy_quant ? type_lazy_v : type_v, 0, 0 };
 
     const uint32_t n_layer = hparams.n_layer_all;
 
@@ -866,6 +878,7 @@ bool llama_kv_cache::try_lazy_quantize(llama_context * lctx) {
     llama_io_tensor_converter converter;
     const uint32_t rot_k = current.n_rot_k == target.n_rot_k ? 0 : target.n_rot_k;
     const uint32_t rot_v = current.n_rot_v == target.n_rot_v ? 0 : target.n_rot_v;
+    const ggml_type type_src_k = current.type_k;
     GGML_ASSERT(current.n_rot_k == target.n_rot_k || current.n_rot_k == 0);
     GGML_ASSERT(current.n_rot_v == target.n_rot_v || current.n_rot_v == 0);
     for (auto & layer : layers) {
@@ -891,8 +904,8 @@ bool llama_kv_cache::try_lazy_quantize(llama_context * lctx) {
     current = target;
     lazy_quant_pending = false;
 
-    LLAMA_LOG_INFO("%s: converted %u populated f16 cells to q8_0 and expanded %u cells to %u in %.2f ms\n",
-            __func__, n_rows, kv_size_f16, target.size, (ggml_time_us() - t_start)/1000.0);
+    LLAMA_LOG_INFO("%s: converted %u populated %s cells to %s and expanded %u cells to %u in %.2f ms\n",
+            __func__, n_rows, ggml_type_name(type_src_k), ggml_type_name(target.type_k), kv_size_f16, target.size, (ggml_time_us() - t_start)/1000.0);
 
     return true;
 }
@@ -2670,10 +2683,15 @@ static bool llama_kv_cache_read_conversion(int32_t src_type, uint32_t src_rot, g
         conversion = {};
         return true;
     }
-    if (src_type != GGML_TYPE_F16 || dst->type != GGML_TYPE_Q8_0 || (src_rot != 0 && src_rot != dst_rot)) {
+    // snapshots can come from the larger overlay type of the lazy ladder
+    // (f16 -> q8_0 -> q4_0); conversion goes through host floats
+    const bool lazy_pair =
+        (src_type == GGML_TYPE_F16  && dst->type == GGML_TYPE_Q8_0) ||
+        (src_type == GGML_TYPE_Q8_0 && dst->type == GGML_TYPE_Q4_0);
+    if (!lazy_pair || (src_rot != 0 && src_rot != dst_rot)) {
         return false;
     }
-    conversion = { GGML_TYPE_F16, src_rot == dst_rot ? 0 : dst_rot };
+    conversion = { (ggml_type) src_type, src_rot == dst_rot ? 0 : dst_rot };
     return true;
 }
 

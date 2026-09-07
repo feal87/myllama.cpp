@@ -15,6 +15,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -208,7 +209,7 @@ llama_context::llama_context(
 
         auto * ctx_other = cparams.ctx_other;
         if (ctx_other->memory && ctx_other->memory->get_has_lazy_quant()) {
-            LLAMA_LOG_WARN("%s: converting target KV cache to q8_0 before sharing it with the assistant\n", __func__);
+            LLAMA_LOG_WARN("%s: converting target KV cache to its final type before sharing it with the assistant\n", __func__);
             ctx_other->synchronize();
             ctx_other->memory_update(false);
             ctx_other->sched_need_reserve = true;
@@ -2849,6 +2850,14 @@ private:
     std::vector<uint8_t> temp_buffer;
 };
 
+// number of elements of `tensor` needed to hold `size` bytes; quantized types
+// pack `ggml_blck_size` elements per `ggml_type_size` bytes, so the element
+// count scales by the block size (ggml_element_size returns the block size)
+static int64_t llama_io_n_elements_bytes(ggml_tensor * tensor, size_t size) {
+    GGML_ASSERT(size % ggml_type_size(tensor->type) == 0);
+    return (int64_t) size / ggml_type_size(tensor->type) * ggml_blck_size(tensor->type);
+}
+
 class llama_io_write_device : public llama_io_write_i {
 public:
     llama_io_write_device(uint8_t * p, size_t len, llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs)  {
@@ -2880,7 +2889,7 @@ public:
         for (const auto & winfo : winfos) {
             auto * buft = ggml_backend_buffer_get_type(winfo.tensor->buffer);
 
-            const int64_t n = winfo.size/ggml_element_size(winfo.tensor);
+            const int64_t n = llama_io_n_elements_bytes(winfo.tensor, winfo.size);
 
             auto & mbuf = mbufs_new[buft];
 
@@ -3045,7 +3054,7 @@ public:
         for (const auto & rinfo : rinfos) {
             auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
 
-            const int64_t n = rinfo.size/ggml_element_size(rinfo.tensor);
+            const int64_t n = llama_io_n_elements_bytes(rinfo.tensor, rinfo.size);
 
             auto & mbuf = mbufs_new[buft];
 
@@ -3112,8 +3121,8 @@ public:
 
                 const size_t n_copy = std::min(src_size - src_off, dst_size - dst_off);
 
-                const size_t   el   = ggml_element_size(src_t);
-                const int64_t n_el = (int64_t) (n_copy / el);
+                GGML_ASSERT(n_copy % ggml_type_size(src_t->type) == 0);
+                const int64_t n_el = llama_io_n_elements_bytes(src_t, n_copy);
 
                 auto * src_v = ggml_view_1d(ctx_scratch, src_t, n_el, src_off);
                 ggml_backend_view_init(src_v);
