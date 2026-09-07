@@ -35,6 +35,7 @@
         #define PATH_MAX MAX_PATH
     #endif
     #include <io.h>
+    #include <fcntl.h>
 #endif
 
 #if defined(__APPLE__)
@@ -85,9 +86,39 @@ struct llama_file::impl {
     }
 
     impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname) {
-        fp = ggml_fopen(fname, mode);
-        if (fp == NULL) {
-            throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
+        const bool read_only = std::strchr(mode, 'r') != nullptr && std::strchr(mode, 'w') == nullptr &&
+                               std::strchr(mode, '+') == nullptr;
+        if (read_only) {
+            // Model files are accessed at random offsets (expert rows via mmap
+            // page faults interleaved with our PrefetchVirtualMemory calls).
+            // Without FILE_FLAG_RANDOM_ACCESS the cache manager may apply
+            // sequential read-ahead heuristics to this file object and treat
+            // the mapping as a streamed file (aggressive trim/eviction of the
+            // pages we explicitly want to keep). This mirrors the Linux path,
+            // which marks the on-demand ranges POSIX_MADV_RANDOM.
+            HANDLE hFile = CreateFileA(fname, GENERIC_READ,
+                                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                       NULL, OPEN_EXISTING,
+                                       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, NULL);
+            if (hFile == INVALID_HANDLE_VALUE) {
+                throw std::runtime_error(format("failed to open %s: %s", fname,
+                                                llama_format_win_err(GetLastError()).c_str()));
+            }
+            const int fd = _open_osfhandle((intptr_t) hFile, _O_RDONLY);
+            if (fd < 0) {
+                CloseHandle(hFile);
+                throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
+            }
+            fp = _fdopen(fd, mode);
+            if (fp == NULL) {
+                _close(fd);
+                throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
+            }
+        } else {
+            fp = ggml_fopen(fname, mode);
+            if (fp == NULL) {
+                throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
+            }
         }
         fp_win32 = (HANDLE) _get_osfhandle(_fileno(fp));
         seek(0, SEEK_END);
