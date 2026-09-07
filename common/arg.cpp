@@ -2906,12 +2906,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--hot-experts-prefetch"},
         {"--no-hot-experts-prefetch"},
         string_format(
-            "prefetch the rows of the MoE experts that were just routed but are neither\n"
-            "mlock'd (--pin-hot-experts) nor served from VRAM (--moe-expert-cache*) into RAM\n"
-            "in the background while the rest of the ubatch computes, so the next read of\n"
-            "the same experts does not page-fault (default: %s, opt-in). Fully independent:\n"
-            "needs no pinning and no VRAM cache - on its own it starts the ranking engine\n"
-            "and prefetches the routed rows of host-resident MoE experts",
+            "batch/prefill read-ahead of the MoE experts that were just routed but are\n"
+            "neither mlock'd (--pin-hot-experts) nor served from VRAM (--moe-expert-cache*):\n"
+            "issued per layer right before its FFN reads them on multi-token ubatches, so\n"
+            "prefill does not demand-page every expert row (default: %s, opt-in). Skipped\n"
+            "on single-token decode, which re-reads the same pinned/VRAM-resident experts\n"
+            "every token. Fully independent: no pinning and no VRAM cache needed",
             params.hot_experts_prefetch ? "enabled" : "disabled"
         ),
         [](common_params & params, bool value) {

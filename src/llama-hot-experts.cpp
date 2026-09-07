@@ -234,35 +234,24 @@ void llama_hot_expert_cache::observe(int il, const struct ggml_tensor * t) {
             }
         }
 
-        // The expert FFNs run on the CPU, and ggml-cpu processes the routed
-        // experts of each token in the order they appear in the ids tensor.
-        // Reorder each token's ids so the resident (pinned) experts come first:
-        // the cold (unpinned) experts are then faulted in only after the pinned
-        // ones have computed, which gives the prefetch (issued below) time to
-        // land before the CPU reaches them. Positional pairing with the per-
-        // expert gating weights is preserved because every consumer reads the
-        // same permuted tensor. Only possible when the ids tensor is in host
-        // memory - i.e. it is the exact buffer the CPU mul_mat_id reads. Only
-        // meaningful when pinning AND prefetching run; a no-op otherwise.
-        if (prefetch_enabled && n_pin > 0 && ggml_backend_buffer_is_host(t->buffer)) {
-            for (int64_t j = 0; j < n_tokens; ++j) {
-                int32_t * row = ids.data() + j * n_expert_used;
-                std::stable_partition(row, row + n_expert_used, [&](int32_t id) {
-                    return id >= 0 && pinned.count(expert_key{ il, id }) != 0;
-                });
-            }
-            std::memcpy(t->data, ids.data(), n_ids * sizeof(int32_t));
-        }
+        // (A per-token reorder to put pinned experts first was tried here and
+        // removed: the CPU mul_mat_id batches each expert across the whole ubatch
+        // and walks experts in expert-id order, so the position of an expert
+        // inside a token's top-k ids does not influence when its rows are read.
+        // Prefetch below is what overlaps the page-ins with the ongoing compute.)
 
         // prefetch the routed-but-unpinned rows NOW, while the rest of this
-        // ubatch still computes: the reads run in the background and the same
-        // experts are routed again on the next token with high probability, so
-        // their rows are resident when the next FFN wants them. This is what
-        // keeps the disk busy while the GPU works (see the class comment).
-        // Gated on --hot-experts-prefetch, independent of pinning. Dedupe first:
-        // prompt-processing batches route hundreds of experts per layer and a
-        // duplicate would append the same rows once per token.
-        if (prefetch_enabled) {
+        // ubatch still computes: a multi-token ubatch routes a wide expert set
+        // that the per-layer FFNs read from host memory right after this point,
+        // and overlapping the page-ins with the ongoing compute is what keeps
+        // prefill fast (demand-paging every expert row one fault at a time
+        // stalls it). Gated on --hot-experts-prefetch AND on multi-token
+        // (batch/prefill) ubatches only: single-token decode re-reads the same
+        // few experts every token (pinned and/or VRAM-resident after warm-up),
+        // where per-token prefetch is pure syscall/page-cache churn. Dedupe
+        // first: prompt-processing batches route hundreds of experts per layer
+        // and a duplicate would append the same rows once per token.
+        if (prefetch_enabled && n_tokens > 1) {
             std::vector<int32_t> uniq = ids;
             std::sort(uniq.begin(), uniq.end());
             uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());

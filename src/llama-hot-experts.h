@@ -18,17 +18,19 @@
 // nothing is mlock'd.
 //
 // Prefetching (--hot-experts-prefetch / --no-hot-experts-prefetch) is an
-// independent knob, gated on prefetch_enabled rather than on pinning. Every
-// observation of a topk tensor immediately prefetches (asynchronously:
-// PrefetchVirtualMemory on Windows, posix_madvise WILLNEED on POSIX) the rows
-// the layer just routed that are neither pinned nor served from VRAM. The calls
-// are per-layer and issued while the rest of the ubatch still computes, so the
-// reads pipeline in the background: on the next token the same experts are
-// routed again with high probability (temporal locality), so their rows are
-// already resident when the next FFN wants them. Prompt processing gets the
-// same pipelining inside a single ubatch. This is the proven layout;
-// bulk-prefetching everything at ubatch start was tried and regressed both
-// prefill and generation (the burst serializes ahead of the demand reads).
+// independent knob, gated on prefetch_enabled rather than on pinning. It only
+// engages on multi-token (batch/prefill) ubatches: a wide ubatch routes a
+// mostly-unpinned expert set per layer that would otherwise be demand-paged one
+// fault at a time, so each observation of a topk tensor asynchronously
+// prefetches (PrefetchVirtualMemory on Windows, posix_madvise WILLNEED on
+// POSIX) the rows the layer just routed that are neither pinned nor served from
+// VRAM, right before that layer's FFN reads them. Single-token decode is
+// deliberately left alone: it re-reads the same few experts every token, which
+// are pinned and/or VRAM-resident after warm-up, so per-token prefetch is pure
+// syscall/page-cache churn (it measurably regressed decode). Bulk-prefetching
+// everything at ubatch start was also tried and regressed both prefill and
+// generation (the burst serializes ahead of the demand reads); issuing the
+// prefetch per layer at its topk keeps the reads pipelined inside the ubatch.
 //
 // Optional knobs:
 //  - aging (--pin-hot-experts-decay-tokens N): every N tokens of content all

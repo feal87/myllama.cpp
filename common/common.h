@@ -480,11 +480,12 @@ struct common_params {
     // halve all usage counts every N tokens (0 = disabled). See
     // --pin-hot-experts-decay-tokens.
     uint64_t n_pin_hot_experts_decay_tokens = 0;
-    // read-ahead (madvise WILLNEED / PrefetchVirtualMemory) the rows of the MoE
-    // experts that were just routed but are neither pinned nor served from VRAM.
-    // Fully independent toggle: off by default; on its own (no pinning, no MoE
-    // cache) it still starts the hot-expert ranking engine and prefetches the
-    // routed rows. See --hot-experts-prefetch.
+    // batch/prefill read-ahead (madvise WILLNEED / PrefetchVirtualMemory) of the
+    // MoE experts that were just routed but are neither pinned nor served from
+    // VRAM. Multi-token ubatches only: single-token decode is skipped (it reads
+    // the same pinned/VRAM-resident experts every token). Fully independent
+    // toggle: off by default; on its own (no pinning, no MoE cache) it still
+    // starts the hot-expert ranking engine. See --hot-experts-prefetch.
     bool     hot_experts_prefetch  =    false;
 
     // GPU-resident cache for host-offloaded MoE experts, served from VRAM on

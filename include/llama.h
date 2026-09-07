@@ -448,11 +448,13 @@ extern "C" {
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
 
-        // [EXPERIMENTAL] read-ahead the routed-but-unpinned MoE expert rows into
-        // RAM while the rest of the ubatch computes (default: false = opt-in).
-        // Fully independent of n_pin_hot_experts and n_moe_cache_*: on its own it
-        // still starts the router-observation engine and prefetches the routed
-        // rows (no pinning, no VRAM tier). See llama-hot-experts.h.
+        // [EXPERIMENTAL] batch/prefill-only read-ahead of the routed-but-unpinned
+        // MoE expert rows (default: false = opt-in). Issued per layer right before
+        // that layer's FFN reads the rows on multi-token ubatches; single-token
+        // decode is skipped (it re-reads the same pinned/VRAM-resident experts, so
+        // prefetch there is pure churn). Fully independent of n_pin_hot_experts
+        // and n_moe_cache_*: on its own it starts the router-observation engine.
+        // See llama-hot-experts.h.
         bool hot_experts_prefetch;
 
         // [EXPERIMENTAL]

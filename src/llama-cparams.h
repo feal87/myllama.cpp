@@ -81,8 +81,9 @@ struct llama_cparams {
     uint64_t n_moe_cache_budget_bytes; // total device-memory cap across all cached layers (used when slots == 0)
     int32_t  n_moe_cache_inserts;      // max expert uploads per decode step, across all cached layers (global)
 
-    // read-ahead the routed-but-unpinned MoE expert rows (--hot-experts-prefetch);
-    // starts the hot-expert engine on its own, so it works standalone (no pin, no MoE tier)
+    // batch/prefill read-ahead of the routed-but-unpinned MoE expert rows
+    // (--hot-experts-prefetch; multi-token ubatches only). Starts the hot-expert
+    // engine on its own, so it works standalone (no pin, no MoE tier)
     bool hot_experts_prefetch;
 
     llama_context * ctx_other;
