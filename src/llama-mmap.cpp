@@ -716,6 +716,27 @@ bool llama_mmap::prefetch(const std::vector<std::pair<const void *, size_t>> & r
     // already resident or otherwise not eligible for prefetch; do not turn that
     // into a warning on every routing event.
     return GetLastError() == ERROR_NOT_LOCKED;
+#elif defined(_POSIX_MAPPED_FILES)
+    // posix_madvise(POSIX_MADV_WILLNEED) is a hint that schedules kernel readahead
+    // for the mapped range; it is page-aligned and returns immediately.
+    bool all_ok = true;
+    const size_t page_size = sysconf(_SC_PAGESIZE);
+    for (const auto & range : ranges) {
+        if (range.first == nullptr || range.second == 0) {
+            continue;
+        }
+        const uintptr_t beg = (uintptr_t) range.first;
+        const uintptr_t end = beg + range.second;
+        const uintptr_t a0 = beg & ~(uintptr_t) (page_size - 1);
+        const uintptr_t a1 = (end + page_size - 1) & ~(uintptr_t) (page_size - 1);
+        if (a1 <= a0) {
+            continue;
+        }
+        if (posix_madvise((void *) a0, a1 - a0, POSIX_MADV_WILLNEED) != 0) {
+            all_ok = false;
+        }
+    }
+    return all_ok;
 #else
     GGML_UNUSED(ranges);
     return true;

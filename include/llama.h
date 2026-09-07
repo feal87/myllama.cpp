@@ -411,6 +411,12 @@ extern "C" {
         // destroyed). Bypasses the log callback and writes directly with fprintf.
         uint64_t n_pin_hot_experts_stats_interval;
 
+        // halve all hot-expert usage counts every N tokens (0 = disabled,
+        // lifetime counts). With aging, the pin set tracks the RECENT routing
+        // mix instead of letting experts that were hot at the start of a long
+        // session occupy slots after they drifted cold.
+        uint64_t n_pin_hot_experts_decay_tokens;
+
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 

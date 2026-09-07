@@ -477,6 +477,9 @@ struct common_params {
     // print hot-expert pinning stats to stderr every N router observations (0 = only
     // at teardown). See --pin-hot-experts-stats-interval.
     uint64_t n_pin_hot_experts_stats_interval = 200;
+    // halve all usage counts every N tokens (0 = disabled). See
+    // --pin-hot-experts-decay-tokens.
+    uint64_t n_pin_hot_experts_decay_tokens = 0;
 
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading

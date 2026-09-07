@@ -70,6 +70,8 @@ struct llama_cparams {
     uint64_t n_pin_hot_experts_budget_bytes;
     // print pinning stats to stderr every N router observations (0 = only at context teardown)
     uint64_t n_pin_hot_experts_stats_interval;
+    // halve all usage counts every N tokens (0 = disabled, lifetime counts)
+    uint64_t n_pin_hot_experts_decay_tokens;
 
     llama_context * ctx_other;
 };

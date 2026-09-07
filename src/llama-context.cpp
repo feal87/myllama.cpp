@@ -143,6 +143,7 @@ llama_context::llama_context(
     cparams.n_pin_hot_experts  = params.n_pin_hot_experts;
     cparams.n_pin_hot_experts_budget_bytes = params.n_pin_hot_experts_budget_bytes;
     cparams.n_pin_hot_experts_stats_interval = params.n_pin_hot_experts_stats_interval;
+    cparams.n_pin_hot_experts_decay_tokens   = params.n_pin_hot_experts_decay_tokens;
 
     if (cparams.n_pin_hot_experts > 0) {
         if (cparams.cb_eval != nullptr) {
@@ -151,7 +152,8 @@ llama_context::llama_context(
         } else {
             hot_experts = std::make_unique<llama_hot_expert_cache>(
                 model, cparams.n_pin_hot_experts, cparams.n_pin_hot_experts_budget_bytes,
-                cparams.n_pin_hot_experts_stats_interval);
+                cparams.n_pin_hot_experts_stats_interval,
+                cparams.n_pin_hot_experts_decay_tokens);
             cparams.cb_eval           = llama_hot_expert_cache::eval_callback;
             cparams.cb_eval_user_data = hot_experts.get();
         }
@@ -1406,6 +1408,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+    }
+
+    // feed the hot-expert cache at the ubatch boundary: advance its ubatch
+    // counter and decay the usage counts (no-op when pinning is disabled)
+    if (hot_experts) {
+        hot_experts->on_ubatch_begin(ubatch.n_tokens);
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
@@ -3659,6 +3667,7 @@ llama_context_params llama_context_default_params() {
         /*.n_pin_hot_experts            =*/ 0,
         /*.n_pin_hot_experts_budget_bytes=*/ 0,
         /*.n_pin_hot_experts_stats_interval=*/ 200,
+        /*.n_pin_hot_experts_decay_tokens=*/ 0,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,

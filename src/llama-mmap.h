@@ -58,7 +58,8 @@ struct llama_mmap {
 
     void unmap_fragment(size_t first, size_t last);
 
-    // Best-effort prefetch of mapped host ranges. Currently implemented on Windows.
+    // Best-effort prefetch of mapped host ranges (PrefetchVirtualMemory on
+    // Windows, posix_madvise POSIX_MADV_WILLNEED on POSIX). No-op on other platforms.
     static bool prefetch(const std::vector<std::pair<const void *, size_t>> & ranges);
 
     static const bool SUPPORTED;

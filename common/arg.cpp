@@ -2883,6 +2883,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.n_pin_hot_experts_stats_interval = (uint64_t) value;
         }
     ).set_env("LLAMA_ARG_PIN_HOTEXPERTS_STATS_INTERVAL"));
+    add_opt(common_arg(
+        {"--pin-hot-experts-decay-tokens"}, "N",
+        string_format(
+            "halve all hot-expert usage counts every N tokens of content, prefill and generation alike\n"
+            "(default: %" PRIu64 ", 0 = disabled). With aging, the pin set tracks the RECENT routing mix\n"
+            "instead of letting experts that were hot at the start of a long session occupy slots after they\n"
+            "drifted cold. Roughly one decay per phase length of interest works well\n"
+            "(e.g. 4096-32768 for a coding session)",
+            params.n_pin_hot_experts_decay_tokens
+        ),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --pin-hot-experts-decay-tokens must be >= 0");
+            }
+            params.n_pin_hot_experts_decay_tokens = (uint64_t) value;
+        }
+    ).set_env("LLAMA_ARG_PIN_HOTEXPERTS_DECAY_TOKENS"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
