@@ -417,10 +417,12 @@ extern "C" {
         // session occupy slots after they drifted cold.
         uint64_t n_pin_hot_experts_decay_tokens;
 
-        // GPU-resident cache for host-offloaded (CPU-pinned) MoE expert weights
-        // [EXPERIMENTAL, fused gate_up archs only]. Decode on a host-offloaded
-        // MoE layer is host-RAM-bandwidth bound; this serves the recently
-        // routed experts from VRAM instead. See llama-moecache.h.
+        // GPU-resident cache for host-offloaded MoE expert weights, VRAM tier on
+        // top of the hot-expert cache (--pin-hot-experts). Decode on a
+        // host-offloaded MoE layer is host-RAM-bandwidth bound; this serves the
+        // recently routed experts from VRAM instead. The routing ranking is
+        // observed automatically when this tier is requested, so --pin-hot-experts
+        // is NOT required (without it nothing is mlock'd). See llama-moecache.h.
         int32_t  n_moe_cache_slots;        // cache slots per cached layer (0 = derive from budget_bytes)
         uint64_t n_moe_cache_budget_bytes; // total device-memory cap across all cached layers (0 = no cap)
         int32_t  n_moe_cache_inserts;      // max expert uploads per decode step, across all cached layers
@@ -445,6 +447,13 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+
+        // [EXPERIMENTAL] read-ahead the routed-but-unpinned MoE expert rows into
+        // RAM while the rest of the ubatch computes (default: false = opt-in).
+        // Fully independent of n_pin_hot_experts and n_moe_cache_*: on its own it
+        // still starts the router-observation engine and prefetches the routed
+        // rows (no pinning, no VRAM tier). See llama-hot-experts.h.
+        bool hot_experts_prefetch;
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

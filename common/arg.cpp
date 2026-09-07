@@ -2840,7 +2840,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "them; ranking is GLOBAL across all layers (total slots = N x num_moe_layers),\n"
             "the hot set is tracked dynamically from actual router decisions and refreshed\n"
             "on the fly. Only affects experts kept in host (CPU) memory\n"
-            "(default: %d, 0 = disabled; incompatible with a custom eval callback)",
+            "(default: %d, 0 = no pinning). With N = 0 the router observation still runs\n"
+            "when --hot-experts-prefetch or --moe-expert-cache* is on (they feed on the\n"
+            "same ranking); incompatible with a custom eval callback",
             params.n_pin_hot_experts
         ),
         [](common_params & params, int value) {
@@ -2901,16 +2903,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PIN_HOTEXPERTS_DECAY_TOKENS"));
     add_opt(common_arg(
+        {"--hot-experts-prefetch"},
+        {"--no-hot-experts-prefetch"},
+        string_format(
+            "prefetch the rows of the MoE experts that were just routed but are neither\n"
+            "mlock'd (--pin-hot-experts) nor served from VRAM (--moe-expert-cache*) into RAM\n"
+            "in the background while the rest of the ubatch computes, so the next read of\n"
+            "the same experts does not page-fault (default: %s, opt-in). Fully independent:\n"
+            "needs no pinning and no VRAM cache - on its own it starts the ranking engine\n"
+            "and prefetches the routed rows of host-resident MoE experts",
+            params.hot_experts_prefetch ? "enabled" : "disabled"
+        ),
+        [](common_params & params, bool value) {
+            params.hot_experts_prefetch = value;
+        }
+    ).set_env("LLAMA_ARG_HOTEXPERTS_PREFETCH"));
+    add_opt(common_arg(
         {"--moe-expert-cache"}, "N",
         string_format(
             "GPU-resident cache for the HOTTEST MoE experts, layered on top of the hot-expert\n"
-            "cache (--pin-hot-experts, which is required): both tiers are fed by the same\n"
+            "cache (--pin-hot-experts, which is NOT required): both tiers are fed by the same\n"
             "global decayed routing ranking, the VRAM tier copies the top of it so those\n"
             "expert reads are skipped during decode. N = per-layer capacity override, 0 =\n"
             "derive per-layer capacities from the routing profile under\n"
-            "--moe-expert-cache-budget-mib (default: %d, 0 = disabled). Activation is lazy:\n"
-            "the cache allocates VRAM after the first prefill so the per-layer slot counts\n"
-            "reflect the actual routing mix (hot layers get many slots, cold layers none)",
+            "--moe-expert-cache-budget-mib (default: %d, 0 = disabled). With no pin settings\n"
+            "the ranking is still observed (counts/decay) but nothing is mlock'd. Activation\n"
+            "is lazy: the cache allocates VRAM after the first prefill so the per-layer slot\n"
+            "counts reflect the actual routing mix (hot layers get many slots, cold layers none)",
             params.n_moe_cache_slots
         ),
         [](common_params & params, int value) {

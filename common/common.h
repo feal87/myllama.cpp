@@ -480,10 +480,16 @@ struct common_params {
     // halve all usage counts every N tokens (0 = disabled). See
     // --pin-hot-experts-decay-tokens.
     uint64_t n_pin_hot_experts_decay_tokens = 0;
+    // read-ahead (madvise WILLNEED / PrefetchVirtualMemory) the rows of the MoE
+    // experts that were just routed but are neither pinned nor served from VRAM.
+    // Fully independent toggle: off by default; on its own (no pinning, no MoE
+    // cache) it still starts the hot-expert ranking engine and prefetches the
+    // routed rows. See --hot-experts-prefetch.
+    bool     hot_experts_prefetch  =    false;
 
     // GPU-resident cache for host-offloaded MoE experts, served from VRAM on
-    // decode (0 = disabled). See --moe-expert-cache*. Keep --pin-hot-experts off
-    // while tuning it for a clean A/B (they do not coordinate yet).
+    // decode (0 = disabled). See --moe-expert-cache*. Works with --pin-hot-experts
+    // off too: the shared routing ranking is then observed but nothing is mlock'd.
     int32_t  n_moe_cache_slots      = 0;   // cache slots per cached layer (0 = derive from budget)
     uint64_t n_moe_cache_budget_mib = 0;   // total device-memory cap in MiB (0 = no cap)
     int32_t  n_moe_cache_inserts    = 2;   // max expert uploads per decode step, across all cached layers

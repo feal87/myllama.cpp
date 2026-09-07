@@ -283,8 +283,10 @@ private:
 
     llama_cparams cparams;
 
-    // --pin-hot-experts N: mlocks the N hottest MoE experts per layer in place, in RAM
-    // (null when disabled, i.e. n_pin_hot_experts <= 0 or a custom cb_eval was supplied)
+    // --pin-hot-experts N / --hot-experts-prefetch / --moe-expert-cache*: the
+    // shared router-observation (ranking) engine. mlock'ing only when
+    // n_pin_hot_experts > 0 (0 = ranking-only, e.g. the MoE VRAM tier without
+    // pinning). Null when all of them are disabled or a custom cb_eval was given
     std::unique_ptr<llama_hot_expert_cache> hot_experts;
 
     // --moe-expert-cache*: GPU-resident cache for host-offloaded MoE experts

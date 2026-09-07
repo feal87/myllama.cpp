@@ -10,14 +10,23 @@
 // "ffn_moe_topk-<il>" nodes). Only experts that live in host (CPU) memory can be
 // pinned; experts offloaded to a device buffer are skipped entirely.
 //
-// Prefetching sits on top of the pinning. Every observation of a topk tensor
-// immediately prefetches (asynchronously: PrefetchVirtualMemory on Windows,
-// posix_madvise WILLNEED on POSIX) the rows the layer just routed that are not
-// pinned. The calls are per-layer and issued while the rest of the ubatch still
-// computes, so the reads pipeline in the background: on the next token the same
-// experts are routed again with high probability (temporal locality), so their
-// rows are already resident when the next FFN wants them. Prompt processing
-// gets the same pipelining inside a single ubatch. This is the proven layout;
+// This is also the ranking engine behind the VRAM MoE tier (llama_moe_cache)
+// and the standalone prefetch (--hot-experts-prefetch): the same router
+// observation maintains the decayed global counts it sizes itself from. The
+// engine therefore also runs with n_pin_experts == 0 (e.g. only
+// --moe-expert-cache* or --hot-experts-prefetch given): the counts are kept,
+// nothing is mlock'd.
+//
+// Prefetching (--hot-experts-prefetch / --no-hot-experts-prefetch) is an
+// independent knob, gated on prefetch_enabled rather than on pinning. Every
+// observation of a topk tensor immediately prefetches (asynchronously:
+// PrefetchVirtualMemory on Windows, posix_madvise WILLNEED on POSIX) the rows
+// the layer just routed that are neither pinned nor served from VRAM. The calls
+// are per-layer and issued while the rest of the ubatch still computes, so the
+// reads pipeline in the background: on the next token the same experts are
+// routed again with high probability (temporal locality), so their rows are
+// already resident when the next FFN wants them. Prompt processing gets the
+// same pipelining inside a single ubatch. This is the proven layout;
 // bulk-prefetching everything at ubatch start was tried and regressed both
 // prefill and generation (the burst serializes ahead of the demand reads).
 //
@@ -53,18 +62,23 @@ struct llama_model;
 
 class llama_hot_expert_cache {
   public:
-    // n_pin_experts:  number of hottest experts to keep mlock'd per layer (N in --pin-hot-experts N)
-    //                 total global capacity = N * num_moe_layers, ranked globally
-    // budget_bytes:   hard cap on total bytes locked across ALL layers combined (0 = unlimited, NOT recommended)
-    // stats_interval: print_stats() is called automatically every `stats_interval` router
-    //                 observations (0 = disabled, only the destructor prints a final summary)
-    // decay_interval: halve all usage counts every N tokens (0 = disabled, lifetime counts)
-    //                 (tokens of content: prefill and generation both count)
+    // n_pin_experts:     number of hottest experts to keep mlock'd per layer (N in --pin-hot-experts N);
+    //                    total global capacity = N * num_moe_layers, ranked globally. 0 = ranking-only
+    //                    mode (observe the routing for llama_moe_cache / prefetch, pin nothing)
+    // budget_bytes:      hard cap on total bytes locked across ALL layers combined (0 = unlimited, NOT recommended)
+    // stats_interval:    print_stats() is called automatically every `stats_interval` router
+    //                    observations (0 = disabled, only the destructor prints a final summary)
+    // decay_interval:    halve all usage counts every N tokens (0 = disabled, lifetime counts)
+    //                    (tokens of content: prefill and generation both count)
+    // prefetch_enabled:  read-ahead (madvise WILLNEED / PrefetchVirtualMemory) the rows of the
+    //                    experts a layer just routed that are neither pinned nor served from VRAM,
+    //                    so their next read does not page-fault (--hot-experts-prefetch)
     llama_hot_expert_cache(const llama_model & model,
                            int32_t             n_pin_experts,
                            uint64_t            budget_bytes,
                            uint64_t            stats_interval,
-                           uint64_t            decay_interval);
+                           uint64_t            decay_interval,
+                           bool                prefetch_enabled);
     ~llama_hot_expert_cache();
 
     llama_hot_expert_cache(const llama_hot_expert_cache &)             = delete;
@@ -258,6 +272,7 @@ class llama_hot_expert_cache {
     const uint64_t budget_bytes;     // 0 = unlimited
     const uint64_t stats_interval;   // 0 = disabled periodic printing
     const uint64_t decay_interval;   // 0 = lifetime counts (no aging)
+    const bool     prefetch_enabled; // read-ahead routed-but-unpinned expert rows (--hot-experts-prefetch)
     uint64_t       n_tokens_seen = 0;  // tokens since the last decay
 
     mutable std::mutex                   mu;

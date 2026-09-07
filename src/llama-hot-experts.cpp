@@ -16,12 +16,14 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
                                                int32_t             n_pin_experts,
                                                uint64_t            budget_bytes,
                                                uint64_t            stats_interval,
-                                               uint64_t            decay_interval) :
+                                               uint64_t            decay_interval,
+                                               bool                prefetch_enabled) :
     model(model),
     n_pin(n_pin_experts),
     budget_bytes(budget_bytes),
     stats_interval(stats_interval),
-    decay_interval(decay_interval) {
+    decay_interval(decay_interval),
+    prefetch_enabled(prefetch_enabled) {
     // Count MoE layers by checking which layers have ffn_down_exps.weight
     int32_t n_moe_layers = 0;
     for (int32_t il = 0; il < (int32_t) model.hparams.n_layer(); il++) {
@@ -33,50 +35,61 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
     n_pin_total = n_pin * n_moe_layers;
 
     if (n_moe_layers == 0) {
-        LLAMA_LOG_WARN("%s: no MoE layers detected in model, --pin-hot-experts has no effect\n", __func__);
-    } else if (budget_bytes > 0) {
-        LLAMA_LOG_INFO(
-            "%s: pinning (mlock) up to %d hottest MoE experts per layer (%d MoE layers, "
-            "%d total global slots) in place, budget %.2f MiB total, pin/evict on the fly\n",
-            __func__, n_pin, n_moe_layers, n_pin_total, budget_bytes / (1024.0 * 1024.0));
-    } else {
-        LLAMA_LOG_WARN(
-            "%s: --pin-hot-experts has NO memory budget cap (--pin-hot-experts-budget-mib "
-            "was not set); with enough layers/experts this WILL try to lock more memory "
-            "than physically fits and can be killed by the OOM killer. Setting an explicit "
-            "budget that leaves headroom for the KV cache and compute buffers is strongly "
-            "recommended.\n",
-            __func__);
+        if (n_pin > 0) {
+            LLAMA_LOG_WARN("%s: no MoE layers detected in model, --pin-hot-experts has no effect\n", __func__);
+        }
+    } else if (n_pin > 0) {
+        if (budget_bytes > 0) {
+            LLAMA_LOG_INFO(
+                "%s: pinning (mlock) up to %d hottest MoE experts per layer (%d MoE layers, "
+                "%d total global slots) in place, budget %.2f MiB total, pin/evict on the fly\n",
+                __func__, n_pin, n_moe_layers, n_pin_total, budget_bytes / (1024.0 * 1024.0));
+        } else {
+            LLAMA_LOG_WARN(
+                "%s: --pin-hot-experts has NO memory budget cap (--pin-hot-experts-budget-mib "
+                "was not set); with enough layers/experts this WILL try to lock more memory "
+                "than physically fits and can be killed by the OOM killer. Setting an explicit "
+                "budget that leaves headroom for the KV cache and compute buffers is strongly "
+                "recommended.\n",
+                __func__);
+        }
     }
-    if (budget_bytes > 0 && llama_mlock::SUPPORTED && !llama_mlock::reserve_working_set(budget_bytes)) {
-        LLAMA_LOG_WARN(
-            "%s: could not raise the Windows working-set minimum to the pin budget; "
-            "VirtualLock will retry and report failures as needed\n",
-            __func__);
+    if (n_pin > 0) {
+        if (budget_bytes > 0 && llama_mlock::SUPPORTED && !llama_mlock::reserve_working_set(budget_bytes)) {
+            LLAMA_LOG_WARN(
+                "%s: could not raise the Windows working-set minimum to the pin budget; "
+                "VirtualLock will retry and report failures as needed\n",
+                __func__);
+        }
+        if (stats_interval > 0) {
+            LLAMA_LOG_INFO("%s: printing pinning stats to stderr every %" PRIu64 " router observations\n", __func__,
+                           stats_interval);
+        }
+        if (llama_mlock::SUPPORTED) {
+            pin_worker = std::thread(&llama_hot_expert_cache::pin_worker_main, this);
+        } else {
+            LLAMA_LOG_WARN(
+                "%s: mlock is not supported on this platform, --pin-hot-experts will only "
+                "track usage statistics and will not actually lock any memory (--hot-experts-prefetch "
+                "still keeps recently-used expert rows in the page cache)\n",
+                __func__);
+        }
+    } else {
+        // ranking-only mode: the router observation feeds the VRAM MoE tier
+        // (llama_moe_cache) and/or the prefetch, but nothing is mlock'd
+        LLAMA_LOG_INFO("%s: tracking MoE router usage, nothing pinned%s\n", __func__,
+                       prefetch_enabled ? " (prefetching routed expert rows)" : "");
     }
     if (decay_interval > 0) {
         LLAMA_LOG_INFO("%s: halving all usage counts every %" PRIu64 " tokens of content\n", __func__, decay_interval);
-    }
-    if (stats_interval > 0) {
-        LLAMA_LOG_INFO("%s: printing pinning stats to stderr every %" PRIu64 " router observations\n", __func__,
-                       stats_interval);
-    }
-    if (n_pin > 0 && llama_mlock::SUPPORTED) {
-        pin_worker = std::thread(&llama_hot_expert_cache::pin_worker_main, this);
-    }
-
-    if (!llama_mlock::SUPPORTED) {
-        LLAMA_LOG_WARN(
-            "%s: mlock is not supported on this platform, --pin-hot-experts will only "
-            "track usage statistics and will not actually lock any memory (the per-layer "
-            "prefetch still keeps recently-used expert rows in the page cache)\n",
-            __func__);
     }
 
 }
 
 llama_hot_expert_cache::~llama_hot_expert_cache() {
-    print_stats();
+    if (n_pin > 0 || prefetch_enabled) {
+        print_stats();
+    }
 
     // stop the pin worker and drain whatever is queued (pending jobs are simply
     // abandoned: the lock guards they would have created are irrelevant now)
@@ -160,15 +173,13 @@ bool llama_hot_expert_cache::eval_callback(struct ggml_tensor * t, bool ask, voi
     return true;
 }
 
-// ask phase. Layers that cannot be pinned (experts offloaded to a device, or
-// pinning disabled) and layers that this ubatch's sampling pattern skips return
-// false, so the scheduler does not chunk the graph at their topk tensor.
+// ask phase. Layers with experts offloaded to a device cannot be observed, and
+// layers that this ubatch's sampling pattern skips return false, so the
+// scheduler does not chunk the graph at their topk tensor. Everything host-resident
+// is observed whenever the engine is active: pinning, prefetch and the VRAM MoE
+// tier all read the same ranking.
 bool llama_hot_expert_cache::wants_observe(int il) {
     std::lock_guard<std::mutex> lock(mu);
-
-    if (n_pin <= 0) {
-        return false;
-    }
 
     layer_state & ls = layers[il];
     if (!ls.resolved_tensors) {
@@ -231,8 +242,9 @@ void llama_hot_expert_cache::observe(int il, const struct ggml_tensor * t) {
         // land before the CPU reaches them. Positional pairing with the per-
         // expert gating weights is preserved because every consumer reads the
         // same permuted tensor. Only possible when the ids tensor is in host
-        // memory - i.e. it is the exact buffer the CPU mul_mat_id reads.
-        if (ggml_backend_buffer_is_host(t->buffer)) {
+        // memory - i.e. it is the exact buffer the CPU mul_mat_id reads. Only
+        // meaningful when pinning AND prefetching run; a no-op otherwise.
+        if (prefetch_enabled && n_pin > 0 && ggml_backend_buffer_is_host(t->buffer)) {
             for (int64_t j = 0; j < n_tokens; ++j) {
                 int32_t * row = ids.data() + j * n_expert_used;
                 std::stable_partition(row, row + n_expert_used, [&](int32_t id) {
@@ -247,23 +259,26 @@ void llama_hot_expert_cache::observe(int il, const struct ggml_tensor * t) {
         // experts are routed again on the next token with high probability, so
         // their rows are resident when the next FFN wants them. This is what
         // keeps the disk busy while the GPU works (see the class comment).
-        // Dedupe first: prompt-processing batches route hundreds of experts per
-        // layer and a duplicate would append the same rows once per token.
-        std::vector<int32_t> uniq = ids;
-        std::sort(uniq.begin(), uniq.end());
-        uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
-        for (int32_t id : uniq) {
-            if (id < 0) {
-                continue;
-            }
-            expert_key key{ il, id };
-            if (pinned.count(key) == 0 && !is_vram_resident(il, id)) {
-                add_expert_ranges(ls, id, ranges);
+        // Gated on --hot-experts-prefetch, independent of pinning. Dedupe first:
+        // prompt-processing batches route hundreds of experts per layer and a
+        // duplicate would append the same rows once per token.
+        if (prefetch_enabled) {
+            std::vector<int32_t> uniq = ids;
+            std::sort(uniq.begin(), uniq.end());
+            uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+            for (int32_t id : uniq) {
+                if (id < 0) {
+                    continue;
+                }
+                expert_key key{ il, id };
+                if (pinned.count(key) == 0 && !is_vram_resident(il, id)) {
+                    add_expert_ranges(ls, id, ranges);
+                }
             }
         }
     }  // lock released here
 
-    if (!ranges.empty()) {
+    if (prefetch_enabled && !ranges.empty()) {
         n_prefetch_calls++;
         for (const auto & range : ranges) {
             n_prefetch_bytes += range.second;
@@ -274,8 +289,9 @@ void llama_hot_expert_cache::observe(int il, const struct ggml_tensor * t) {
     }
 
     // print_stats() takes the same mutex itself, so this must run outside the
-    // scope above (the mutex is not recursive)
-    if (stats_interval > 0 && eval_calls_now % stats_interval == 0) {
+    // scope above (the mutex is not recursive). Periodic dumps are pin-focused;
+    // prefetch-only runs get their summary from the destructor.
+    if (n_pin > 0 && stats_interval > 0 && eval_calls_now % stats_interval == 0) {
         print_stats();
     }
 }

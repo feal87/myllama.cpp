@@ -5,12 +5,15 @@
 // global ranked set: the hot-expert cache's decayed per-(layer, expert) routing
 // counts. The VRAM tier copies the very top of that ranking into device memory
 // so their host reads are skipped entirely during decode; the hot-expert cache
-// mlock's the next ranks in place and prefetches the rest.
+// mlock's the next ranks in place and prefetches the rest. The VRAM tier only
+// needs the ranking, not the pinning: with --pin-hot-experts off, llama_context
+// still spins up the observation engine (n_pin_experts = 0) so nothing is
+// mlock'd but the counts above are maintained.
 //
 // Lifecycle:
 //  - requested via llama_context_params (CLI --moe-expert-cache-budget-mib +
-//    --moe-expert-cache-inserts). Requires the hot-expert cache (the counts
-//    live there).
+//    --moe-expert-cache-inserts). Requires the hot-expert ranking engine (the
+//    counts live there).
 //  - activated lazily on the first single-token decode ubatch once enough
 //    routing has been observed (the prefill of the current request). At that
 //    point the per-layer VRAM slot counts are sized from the actual routing

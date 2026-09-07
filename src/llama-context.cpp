@@ -149,32 +149,50 @@ llama_context::llama_context(
     cparams.n_moe_cache_slots        = params.n_moe_cache_slots;
     cparams.n_moe_cache_budget_bytes = params.n_moe_cache_budget_bytes;
     cparams.n_moe_cache_inserts      = params.n_moe_cache_inserts;
+    cparams.hot_experts_prefetch     = params.hot_experts_prefetch;
 
-    if (cparams.n_pin_hot_experts > 0) {
+    // The hot-expert cache is the shared router-observation engine: it maintains
+    // the global decayed ranking behind the RAM pinning tier (--pin-hot-experts
+    // N), the row read-ahead (--hot-experts-prefetch) and the VRAM MoE tier
+    // (--moe-expert-cache*). It runs when pinning, the MoE tier or the prefetch
+    // is requested (prefetch alone = read-ahead of the routed rows, no mlock);
+    // mlock'ing itself stays gated on n_pin_hot_experts (0 = observe the routing
+    // only, e.g. when only the MoE expert cache or the prefetch is enabled, and
+    // pin nothing).
+    const bool hot_experts_requested =
+        cparams.n_pin_hot_experts > 0 ||
+        cparams.n_moe_cache_slots > 0 ||
+        cparams.n_moe_cache_budget_bytes > 0 ||
+        cparams.hot_experts_prefetch;
+
+    if (hot_experts_requested) {
         if (cparams.cb_eval != nullptr) {
-            LLAMA_LOG_WARN("%s: --pin-hot-experts requires the eval callback slot, but a custom cb_eval "
-                            "was already supplied; hot-expert pinning is disabled\n", __func__);
+            LLAMA_LOG_WARN("%s: --pin-hot-experts / --hot-experts-prefetch / --moe-expert-cache* "
+                            "require the eval callback slot, but a custom cb_eval was already "
+                            "supplied; all hot-expert features disabled\n", __func__);
         } else {
             hot_experts = std::make_unique<llama_hot_expert_cache>(
                 model, cparams.n_pin_hot_experts, cparams.n_pin_hot_experts_budget_bytes,
                 cparams.n_pin_hot_experts_stats_interval,
-                cparams.n_pin_hot_experts_decay_tokens);
+                cparams.n_pin_hot_experts_decay_tokens,
+                cparams.hot_experts_prefetch);
             cparams.cb_eval           = llama_hot_expert_cache::eval_callback;
             cparams.cb_eval_user_data = hot_experts.get();
         }
     }
 
     if (cparams.n_moe_cache_slots > 0 || cparams.n_moe_cache_budget_bytes > 0) {
-        if (cparams.n_pin_hot_experts > 0 && hot_experts) {
-            // the VRAM tier sits on top of the hot-expert cache: it reads the
-            // same global ranking and only makes sense when the RAM tier runs.
+        if (hot_experts) {
+            // the VRAM tier feeds on the hot-expert cache's global ranking (it
+            // sizes its per-layer capacities from the observed routing profile).
             // Allocation is deferred until enough routing has been observed to
             // size the per-layer capacities (see llama_moe_cache::maybe_activate)
             moe_cache = std::make_unique<llama_moe_cache>(
                 model, hot_experts.get(), cparams.n_moe_cache_slots,
                 cparams.n_moe_cache_budget_bytes, cparams.n_moe_cache_inserts);
         } else {
-            LLAMA_LOG_WARN("%s: --moe-expert-cache* requires --pin-hot-experts (the VRAM tier is driven by the hot-expert ranking); MoE expert cache disabled\n", __func__);
+            LLAMA_LOG_WARN("%s: --moe-expert-cache* needs the router-observation engine, but a "
+                            "custom cb_eval is in use; MoE expert cache disabled\n", __func__);
         }
     }
 
@@ -3715,6 +3733,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.hot_experts_prefetch        =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
