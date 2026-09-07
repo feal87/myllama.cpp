@@ -27,19 +27,25 @@
 //    instead of lifetime leaders (a long session otherwise lets first-past-the-
 //    post experts occupy slots after they drifted cold).
 //
-// All bookkeeping and the pin/evict syscalls run on the decode thread; only the
-// mlock syscalls can stall it (a pin of a long-cold expert pages its rows in),
-// and those are tracked as "slow" in the stats output.
+// Pinning bookkeeping runs on the decode thread, but the mlock()/VirtualLock()
+// syscalls themselves - the only step that can fault a long-cold expert's pages
+// in - run on a dedicated worker thread, so a pin takeover never stalls the
+// graph callback. Evictions stay inline: munlock is cheap (no page-in). Syscalls
+// slower than lock_slow_us are counted as "slow" in the stats output.
 
 #include "ggml.h"
 #include "llama-mmap.h"
 
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <set>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -130,8 +136,13 @@ class llama_hot_expert_cache {
 
     // -- tuning constants ----------------------------------------------------
     // an mlock syscall slower than this (us) is counted as a stall in the stats;
-    // a large n_lock_slow count means pin/evict should move off the decode thread
+    // the syscalls run on the pin worker thread, so a large n_lock_slow count no
+    // longer stalls decode directly but still competes for the disk and CPU
     static constexpr int64_t lock_slow_us = 2000;
+    // pin jobs queued ahead of the worker (bounds the in-flight budget reserve
+    // and the memory of the queue itself); when full, newcomers are skipped and
+    // retried on a later observation instead of blocking the decode thread
+    static constexpr size_t pin_queue_max = 1024;
 
     // -- observation ---------------------------------------------------------
     // ask phase: would the layer's topk data be useful this ubatch?
@@ -146,16 +157,46 @@ class llama_hot_expert_cache {
     void observe_expert(int il, layer_state & ls, int32_t expert_id);
 
     // -- pinning -------------------------------------------------------------
-    // Returns true if at least some bytes were actually locked.
-    bool pin_expert(int il, layer_state & ls, int32_t expert_id);
     void unpin_expert(int il, layer_state & ls, int32_t expert_id);
 
-    // locks the byte range of `expert_id`'s row within tensor `w` in place, honoring
-    // the remaining global budget; returns bytes ACTUALLY locked (0 on failure/skip/no
-    // budget left).
-    size_t lock_expert_row(const struct ggml_tensor *                    w,
-                           int32_t                                       expert_id,
-                           std::unique_ptr<llama_mlock, mlock_deleter> & out_lock);
+    // expected bytes grow_to() would lock for `expert_id` across all of the
+    // layer's expert tensors; used to reserve budget BEFORE anything is evicted
+    // (so a takeover never needs a rollback) and to preflight pin jobs
+    size_t expert_row_bytes(const layer_state & ls, int32_t expert_id) const;
+
+    // -- async pin worker ----------------------------------------------------
+    // The decode thread only mutates bookkeeping and enqueues pin jobs. The
+    // worker thread performs the actual mlock()/VirtualLock() syscalls - the
+    // only step that can fault cold expert pages in (tens of ms) - so a pin
+    // takeover never stalls the graph callback. Evictions stay on the decode
+    // thread: munlock is cheap (no page-in).
+    struct pin_job {
+        int     il        = -1;
+        int32_t expert_id = -1;
+
+        const ggml_tensor * t_gate    = nullptr;
+        const ggml_tensor * t_gate_up = nullptr;
+        const ggml_tensor * t_up      = nullptr;
+        const ggml_tensor * t_down    = nullptr;
+
+        size_t expected_bytes = 0;  // reserved from the budget at enqueue time
+    };
+
+    void pin_worker_main();
+
+    // queue `job` and reserve its expected bytes (caller holds mu). Returns
+    // false when the queue is full or the reservation would exceed the budget;
+    // the job is dropped and the expert stays unpinned until a later observation
+    bool enqueue_pin(const pin_job & job);
+
+    std::thread             pin_worker;
+    std::deque<pin_job>     pin_queue;
+    std::condition_variable pin_cv;
+    // jobs queued but not yet locked by the worker (counted against the slot
+    // capacity and the budget together with `pinned`/`n_bytes_locked`)
+    std::unordered_set<expert_key, expert_key_hash> pin_inflight;
+    uint64_t n_bytes_reserved = 0;  // expected bytes of in-flight pin jobs
+    bool     pin_stop         = false;
 
     // -- prefetch ------------------------------------------------------------
     // appends the host-memory row ranges of `expert_id` within every expert tensor
@@ -192,8 +233,9 @@ class llama_hot_expert_cache {
     uint64_t n_ubatches     = 0;   // graph computes (ubatch chunks) seen
     uint64_t n_eval_calls   = 0;   // topk tensors actually observed
     uint64_t n_bytes_locked = 0;   // sum of llama_mlock::size() for expert rows
-    uint64_t n_lock_calls   = 0;   // mlock syscalls issued
+    uint64_t n_lock_calls   = 0;   // mlock syscalls issued (pin worker thread)
     uint64_t n_lock_slow    = 0;   // ... that took longer than lock_slow_us
+    uint64_t n_pin_failures = 0;   // async pins that locked nothing (queue/budget/OS)
     uint64_t n_prefetch_calls    = 0;
     uint64_t n_prefetch_bytes    = 0;
     uint64_t n_prefetch_failures = 0;

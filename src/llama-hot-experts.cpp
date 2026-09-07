@@ -61,6 +61,10 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
         LLAMA_LOG_INFO("%s: printing pinning stats to stderr every %" PRIu64 " router observations\n", __func__,
                        stats_interval);
     }
+    if (n_pin > 0 && llama_mlock::SUPPORTED) {
+        pin_worker = std::thread(&llama_hot_expert_cache::pin_worker_main, this);
+    }
+
     if (!llama_mlock::SUPPORTED) {
         LLAMA_LOG_WARN(
             "%s: mlock is not supported on this platform, --pin-hot-experts will only "
@@ -73,6 +77,17 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
 
 llama_hot_expert_cache::~llama_hot_expert_cache() {
     print_stats();
+
+    // stop the pin worker and drain whatever is queued (pending jobs are simply
+    // abandoned: the lock guards they would have created are irrelevant now)
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        pin_stop = true;
+    }
+    pin_cv.notify_all();
+    if (pin_worker.joinable()) {
+        pin_worker.join();
+    }
 }
 
 void llama_hot_expert_cache::print_stats() const {
@@ -96,12 +111,12 @@ void llama_hot_expert_cache::print_stats() const {
 
     LLAMA_LOG_INFO("[pin-hot-experts] ub=%" PRIu64
                    " obs=%" PRIu64
-                   " | experts_locked=%.2f MiB (lock calls=%" PRIu64 " slow=%" PRIu64 ")"
+                   " | experts_locked=%.2f MiB (lock calls=%" PRIu64 " slow=%" PRIu64 " fails=%" PRIu64 ")"
                    " | moe_layers=%zu | "
                    "pinned=%zu/%d (global, N=%d x layers=%zu) | distinct (layer,expert) seen=%zu"
                    " | prefetch calls=%" PRIu64 " bytes=%.2f MiB failures=%" PRIu64 " | decays=%" PRIu64,
                    n_ubatches, n_eval_calls,
-                   n_bytes_locked / (1024.0 * 1024.0), n_lock_calls, n_lock_slow,
+                   n_bytes_locked / (1024.0 * 1024.0), n_lock_calls, n_lock_slow, n_pin_failures,
                    layers.size(), total_pinned, n_pin_total, n_pin,
                    layers.size(), total_distinct_seen, n_prefetch_calls,
                    n_prefetch_bytes / (1024.0 * 1024.0), n_prefetch_failures, n_decays);
@@ -208,6 +223,25 @@ void llama_hot_expert_cache::observe(int il, const struct ggml_tensor * t) {
             }
         }
 
+        // The expert FFNs run on the CPU, and ggml-cpu processes the routed
+        // experts of each token in the order they appear in the ids tensor.
+        // Reorder each token's ids so the resident (pinned) experts come first:
+        // the cold (unpinned) experts are then faulted in only after the pinned
+        // ones have computed, which gives the prefetch (issued below) time to
+        // land before the CPU reaches them. Positional pairing with the per-
+        // expert gating weights is preserved because every consumer reads the
+        // same permuted tensor. Only possible when the ids tensor is in host
+        // memory - i.e. it is the exact buffer the CPU mul_mat_id reads.
+        if (ggml_backend_buffer_is_host(t->buffer)) {
+            for (int64_t j = 0; j < n_tokens; ++j) {
+                int32_t * row = ids.data() + j * n_expert_used;
+                std::stable_partition(row, row + n_expert_used, [&](int32_t id) {
+                    return id >= 0 && pinned.count(expert_key{ il, id }) != 0;
+                });
+            }
+            std::memcpy(t->data, ids.data(), n_ids * sizeof(int32_t));
+        }
+
         // prefetch the routed-but-unpinned rows NOW, while the rest of this
         // ubatch still computes: the reads run in the background and the same
         // experts are routed again on the next token with high probability, so
@@ -286,7 +320,7 @@ void llama_hot_expert_cache::observe_expert(int il, layer_state & ls, int32_t ex
     count++;
     const uint64_t new_count = count;
 
-    if (!ls.tensors_are_host || n_pin <= 0) {
+    if (!ls.tensors_are_host || n_pin <= 0 || !llama_mlock::SUPPORTED) {
         return;  // stats-only mode, nothing to pin
     }
 
@@ -297,133 +331,223 @@ void llama_hot_expert_cache::observe_expert(int il, layer_state & ls, int32_t ex
         return;
     }
 
-    if ((int32_t) pinned.size() < n_pin_total) {
-        // a pin slot is still free: pin immediately, no eviction needed
-        if (pin_expert(il, ls, expert_id)) {
-            pinned_rank.insert({ new_count, il, expert_id });
-        }
+    if (pin_inflight.count(key)) {
+        return;  // a pin for this expert is already queued
+    }
+
+    // build the job up front so the budget/slot checks below are exact and the
+    // takeover never needs a rollback (nothing is evicted before the job is sure
+    // to be accepted)
+    pin_job job;
+    job.il        = il;
+    job.expert_id = expert_id;
+    job.t_gate    = ls.t_gate;
+    job.t_gate_up = ls.t_gate_up;
+    job.t_up      = ls.t_up;
+    job.t_down    = ls.t_down;
+    job.expected_bytes = expert_row_bytes(ls, expert_id);
+    if (job.expected_bytes == 0) {
         return;
     }
 
-    // all N slots are taken: only take over if we just overtook the coldest pinned expert
+    const size_t committed = pinned.size() + pin_inflight.size();
+    if (committed < (size_t) n_pin_total) {
+        // a slot is free: pin without evicting anyone (budget is checked inside
+        // enqueue_pin; if there is no headroom the job is dropped and the expert
+        // stays unpinned until the budget frees up again)
+        enqueue_pin(job);
+        return;
+    }
+
+    // all slots are committed: only take over if we just overtook the coldest
+    // pinned expert. The munlock of the victim is cheap (no page-in) and stays
+    // inline; only the mlock of the newcomer is deferred to the worker.
     const auto coldest = pinned_rank.begin();
-    if (coldest != pinned_rank.end() && new_count > std::get<0>(*coldest)) {
-        const uint64_t evict_count = std::get<0>(*coldest);
-        const int      evict_layer = std::get<1>(*coldest);
-        const int32_t  evict_id    = std::get<2>(*coldest);
+    if (coldest == pinned_rank.end() || new_count <= std::get<0>(*coldest)) {
+        return;
+    }
 
-        pinned_rank.erase(coldest);
+    const int      evict_layer = std::get<1>(*coldest);
+    const int32_t  evict_id    = std::get<2>(*coldest);
 
-        auto & evict_ls = layers[evict_layer];
-        if (!evict_ls.resolved_tensors) {
-            resolve_tensors(evict_layer, evict_ls);
-        }
-        unpin_expert(evict_layer, evict_ls, evict_id);
+    // if the worker queue is already full the replacement cannot be queued, so
+    // evicting the victim would only waste a resident expert: skip the takeover
+    if (pin_queue.size() >= pin_queue_max) {
+        return;
+    }
 
-        if (pin_expert(il, ls, expert_id)) {
-            pinned_rank.insert({ new_count, il, expert_id });
-        } else {
-            // New expert failed to lock anything (budget exhausted, mlock error, etc.).
-            // Roll back the eviction: re-pin the old expert to keep the data structures
-            // and actual locked pages consistent.
-            pin_expert(evict_layer, evict_ls, evict_id);
-            pinned_rank.insert({ evict_count, evict_layer, evict_id });
-        }
+    // the takeover may exceed the budget even though evicting the victim frees
+    // its bytes first: check the post-eviction total up front so we never evict
+    // a resident expert for a pin that cannot fit
+    const auto vit = pinned.find(expert_key{ evict_layer, evict_id });
+    const uint64_t victim_bytes = vit != pinned.end() ? vit->second.nbytes_locked : 0;
+    if (budget_bytes > 0 &&
+        n_bytes_locked + n_bytes_reserved + job.expected_bytes > budget_bytes + victim_bytes) {
+        return;
+    }
+
+    pinned_rank.erase(coldest);
+
+    auto & evict_ls = layers[evict_layer];
+    if (!evict_ls.resolved_tensors) {
+        resolve_tensors(evict_layer, evict_ls);
+    }
+    unpin_expert(evict_layer, evict_ls, evict_id);
+
+    if (!enqueue_pin(job)) {
+        // only possible if the queue filled or the budget was exhausted between
+        // the checks above and the reservation; the slot stays empty and the
+        // next promotion refills it
+        LLAMA_LOG_DEBUG("%s: pin of layer %d expert %d dropped after evicting %d/%d\n", __func__, il, expert_id,
+                        evict_layer, evict_id);
     }
 }
 
-size_t llama_hot_expert_cache::lock_expert_row(const struct ggml_tensor *                    w,
-                                               int32_t                                       expert_id,
-                                               std::unique_ptr<llama_mlock, mlock_deleter> & out_lock) {
-    if (!w || expert_id < 0 || expert_id >= w->ne[2] || !llama_mlock::SUPPORTED) {
-        return 0;
+size_t llama_hot_expert_cache::expert_row_bytes(const layer_state & ls, int32_t expert_id) const {
+    size_t nbytes = 0;
+
+    const ggml_tensor * ws[] = { ls.t_gate_up ? ls.t_gate_up : ls.t_gate, ls.t_up, ls.t_down };
+    for (const ggml_tensor * w : ws) {
+        if (w == nullptr || !ggml_backend_buffer_is_host(w->buffer) || w->data == nullptr) {
+            continue;
+        }
+        if (expert_id < 0 || expert_id >= w->ne[2]) {
+            continue;
+        }
+        nbytes += ggml_nbytes(w) / (size_t) w->ne[2];
     }
-    if (!ggml_backend_buffer_is_host(w->buffer) || w->data == nullptr) {
-        return 0;
-    }
-
-    const size_t nbytes = ggml_nbytes(w) / (size_t) w->ne[2];
-
-    // enforce the global budget BEFORE touching any memory -- mlock() itself
-    // faults pages in, so checking after the fact is too late to prevent an OOM
-    if (budget_bytes > 0 && n_bytes_locked + nbytes > budget_bytes) {
-        LLAMA_LOG_DEBUG(
-            "%s: skipping expert %d, would exceed the %.2f MiB pin budget "
-            "(%.2f MiB already locked)\n",
-            __func__, expert_id, budget_bytes / (1024.0 * 1024.0), n_bytes_locked / (1024.0 * 1024.0));
-        return 0;
-    }
-
-    const size_t offset = (size_t) expert_id * w->nb[2];
-    void *       ptr    = (uint8_t *) w->data + offset;
-
-    // lock the expert's rows IN PLACE inside the model's own tensor -- this is the
-    // exact memory ggml_mul_mat_id() reads during build_moe_ffn(), so the lock
-    // directly protects the data the compute graph actually uses.
-    out_lock.reset(new llama_mlock());
-    out_lock->init(ptr);
-    const int64_t t0 = ggml_time_us();
-    out_lock->grow_to(nbytes);
-    const int64_t dt = ggml_time_us() - t0;
-    n_lock_calls++;
-    if (dt > lock_slow_us) {
-        n_lock_slow++;
-        LLAMA_LOG_DEBUG("%s: mlock of expert %d took %" PRId64 " us (tensor %s)\n", __func__, expert_id, dt,
-                        ggml_get_name(w));
-    }
-
-    // only count what was ACTUALLY locked -- grow_to() silently stops (and logs a
-    // warning) on failure rather than throwing, so size() may be less than nbytes
-    const size_t locked = out_lock->size();
-    if (locked < nbytes) {
-        LLAMA_LOG_WARN(
-            "%s: only locked %zu/%zu bytes for expert %d (system out of lockable "
-            "memory?) -- consider lowering --pin-hot-experts N or its budget\n",
-            __func__, locked, nbytes, expert_id);
-    }
-    if (locked == 0) {
-        out_lock.reset();
-    }
-
-    n_bytes_locked += locked;  // update the running total immediately so sibling
-                               // tensors of the SAME expert also respect the budget
-
-    return locked;
+    return nbytes;
 }
 
-bool llama_hot_expert_cache::pin_expert(int il, layer_state & ls, int32_t expert_id) {
-    if (!ls.tensors_are_host) {
+bool llama_hot_expert_cache::enqueue_pin(const pin_job & job) {
+    // caller holds mu
+    expert_key key{ job.il, job.expert_id };
+    if (pin_inflight.count(key) != 0) {
+        return false;
+    }
+    if (pin_queue.size() >= pin_queue_max) {
+        return false;
+    }
+    if (budget_bytes > 0 && n_bytes_locked + n_bytes_reserved + job.expected_bytes > budget_bytes) {
         return false;
     }
 
-    expert_key key{ il, expert_id };
-    if (pinned.count(key)) {
-        return true;
-    }
-
-    pinned_expert pe;
-
-    if (ls.t_gate_up) {
-        pe.nbytes_locked += lock_expert_row(ls.t_gate_up, expert_id, pe.gate_up_lock);
-    } else if (ls.t_gate) {
-        pe.nbytes_locked += lock_expert_row(ls.t_gate, expert_id, pe.gate_lock);
-    }
-    if (ls.t_up) {
-        pe.nbytes_locked += lock_expert_row(ls.t_up, expert_id, pe.up_lock);
-    }
-    pe.nbytes_locked += lock_expert_row(ls.t_down, expert_id, pe.down_lock);
-
-    // n_bytes_locked was already updated incrementally inside lock_expert_row()
-    // (so sibling tensors of this same expert see an up-to-date budget)
-
-    if (pe.nbytes_locked == 0) {
-        // Nothing was actually locked (budget exhausted, mlock not supported, etc.).
-        // Do not insert a dead entry into the pinned map.
-        return false;
-    }
-
-    pinned.emplace(key, std::move(pe));
+    pin_queue.push_back(job);
+    pin_inflight.insert(key);
+    n_bytes_reserved += job.expected_bytes;
+    pin_cv.notify_one();
     return true;
+}
+
+void llama_hot_expert_cache::pin_worker_main() {
+    std::unique_lock<std::mutex> lock(mu);
+
+    for (;;) {
+        pin_cv.wait(lock, [&]() { return pin_stop || !pin_queue.empty(); });
+
+        if (pin_queue.empty()) {
+            break;  // pin_stop and nothing left to do
+        }
+
+        pin_job job = std::move(pin_queue.front());
+        pin_queue.pop_front();
+
+        // run the syscalls OUTSIDE the mutex: grow_to() faults the expert's rows
+        // in and can take tens of ms, which must not block any decode-thread work
+        lock.unlock();
+
+        pinned_expert pe;
+        uint64_t      lock_calls = 0;
+        uint64_t      lock_slow  = 0;
+        bool          syscall_error = false;
+
+        auto lock_row = [&](const ggml_tensor *                           w,
+                            std::unique_ptr<llama_mlock, mlock_deleter> & out) -> size_t {
+            if (!w || job.expert_id < 0 || job.expert_id >= w->ne[2] || !llama_mlock::SUPPORTED) {
+                return 0;
+            }
+            if (!ggml_backend_buffer_is_host(w->buffer) || w->data == nullptr) {
+                return 0;
+            }
+
+            const size_t nbytes = ggml_nbytes(w) / (size_t) w->ne[2];
+            const size_t offset = (size_t) job.expert_id * w->nb[2];
+
+            // lock the expert's rows IN PLACE inside the model's own tensor -- the
+            // exact memory ggml_mul_mat_id() reads during build_moe_ffn()
+            std::unique_ptr<llama_mlock, mlock_deleter> ml(new llama_mlock());
+            ml->init((uint8_t *) w->data + offset);
+            const int64_t t0 = ggml_time_us();
+            ml->grow_to(nbytes);
+            const int64_t dt = ggml_time_us() - t0;
+
+            lock_calls++;
+            if (dt > lock_slow_us) {
+                lock_slow++;
+                LLAMA_LOG_DEBUG("%s: async mlock of expert %d (tensor %s) took %" PRId64 " us\n", __func__,
+                                job.expert_id, ggml_get_name(w), dt);
+            }
+
+            // only keep what was ACTUALLY locked -- grow_to() silently stops (and
+            // logs a warning) on failure rather than throwing
+            const size_t locked = ml->size();
+            if (locked == 0) {
+                ml.reset();
+                return 0;
+            }
+            if (locked < nbytes) {
+                LLAMA_LOG_WARN(
+                    "%s: only locked %zu/%zu bytes for expert %d (system out of lockable "
+                    "memory?) -- consider lowering --pin-hot-experts N or its budget\n",
+                    __func__, locked, nbytes, job.expert_id);
+            }
+            out = std::move(ml);
+            return locked;
+        };
+
+        try {
+            if (job.t_gate_up) {
+                pe.nbytes_locked += lock_row(job.t_gate_up, pe.gate_up_lock);
+            } else {
+                pe.nbytes_locked += lock_row(job.t_gate, pe.gate_lock);
+            }
+            pe.nbytes_locked += lock_row(job.t_up, pe.up_lock);
+            pe.nbytes_locked += lock_row(job.t_down, pe.down_lock);
+        } catch (...) {
+            // never let an exception escape the worker (it would terminate the
+            // process); any rows already locked in pe are released on unwind and
+            // the job is counted as a failure below
+            syscall_error = true;
+        }
+
+        lock.lock();
+
+        // bookkeeping: release the budget reservation and account for the result
+        n_bytes_reserved -= job.expected_bytes;
+        n_lock_calls += lock_calls;
+        n_lock_slow += lock_slow;
+
+        expert_key key{ job.il, job.expert_id };
+        pin_inflight.erase(key);
+
+        if (pe.nbytes_locked == 0 || syscall_error) {
+            n_pin_failures++;
+            LLAMA_LOG_DEBUG("%s: async pin of layer %d expert %d locked nothing\n", __func__, job.il, job.expert_id);
+            continue;
+        }
+
+        n_bytes_locked += pe.nbytes_locked;
+
+        // the expert's count may have kept climbing (or been decayed) since the
+        // job was queued: insert its rank entry with the current value
+        uint64_t c = 0;
+        auto     it = counts.find(key);
+        if (it != counts.end()) {
+            c = it->second;
+        }
+        pinned.emplace(key, std::move(pe));
+        pinned_rank.insert({ c, job.il, job.expert_id });
+    }
 }
 
 void llama_hot_expert_cache::unpin_expert(int il, layer_state & /*ls*/, int32_t expert_id) {
