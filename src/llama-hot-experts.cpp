@@ -15,13 +15,11 @@
 llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
                                                int32_t             n_pin_experts,
                                                uint64_t            budget_bytes,
-                                               uint64_t            stats_interval,
                                                uint64_t            decay_interval,
                                                bool                prefetch_enabled) :
     model(model),
     n_pin(n_pin_experts),
     budget_bytes(budget_bytes),
-    stats_interval(stats_interval),
     decay_interval(decay_interval),
     prefetch_enabled(prefetch_enabled) {
     // Count MoE layers by checking which layers have ffn_down_exps.weight
@@ -61,10 +59,6 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
                 "VirtualLock will retry and report failures as needed\n",
                 __func__);
         }
-        if (stats_interval > 0) {
-            LLAMA_LOG_INFO("%s: printing pinning stats to stderr every %" PRIu64 " router observations\n", __func__,
-                           stats_interval);
-        }
         if (llama_mlock::SUPPORTED) {
             pin_worker = std::thread(&llama_hot_expert_cache::pin_worker_main, this);
         } else {
@@ -103,13 +97,26 @@ llama_hot_expert_cache::~llama_hot_expert_cache() {
     }
 }
 
-void llama_hot_expert_cache::print_stats() const {
+void llama_hot_expert_cache::print_stats() {
     std::lock_guard<std::mutex> lock(mu);
 
-    size_t   total_distinct_seen  = counts.size();
-    size_t   total_pinned         = pinned.size();
-    uint64_t global_coldest_count = UINT64_MAX;
-    uint64_t global_hottest_count = 0;
+    const size_t   total_distinct_seen = counts.size();
+    const size_t   total_pinned        = pinned.size();
+    const uint64_t total_routed        = n_route_hit + n_route_miss;
+
+    // list churn since the last report: the share of the current pinned set that
+    // was not pinned at the previous report. Every eviction (pin takeover) and
+    // VRAM takeover shows up as a new arrival here.
+    size_t n_new = 0;
+    for (const auto & [key, pe] : pinned) {
+        if (pinned_prev.find(key) == pinned_prev.end()) {
+            n_new++;
+        }
+    }
+    pinned_prev.clear();
+    for (const auto & [key, pe] : pinned) {
+        pinned_prev.insert(key);
+    }
 
     // Per-layer breakdown of pinned experts
     std::unordered_map<int, size_t> pinned_per_layer;
@@ -117,21 +124,25 @@ void llama_hot_expert_cache::print_stats() const {
         pinned_per_layer[key.layer]++;
     }
 
+    uint64_t global_coldest_count = UINT64_MAX;
+    uint64_t global_hottest_count = 0;
     if (!pinned_rank.empty()) {
         global_coldest_count = std::get<0>(*pinned_rank.begin());
         global_hottest_count = std::get<0>(*pinned_rank.rbegin());
     }
 
-    LLAMA_LOG_INFO("[pin-hot-experts] ub=%" PRIu64
-                   " obs=%" PRIu64
-                   " | experts_locked=%.2f MiB (lock calls=%" PRIu64 " slow=%" PRIu64 " fails=%" PRIu64 ")"
-                   " | moe_layers=%zu | "
-                   "pinned=%zu/%d (global, N=%d x layers=%zu) | distinct (layer,expert) seen=%zu"
+    LLAMA_LOG_INFO("[pin-hot-experts] RAM tier: pinned=%zu/%d (N=%d x %zu MoE layers)"
+                   " | hit=%.1f%% (%" PRIu64 "/%" PRIu64 " routed)"
+                   " | churn=%.1f%% (%zu/%zu changed since last report)"
+                   " | locked=%.2f MiB (lock calls=%" PRIu64 " slow=%" PRIu64 " fails=%" PRIu64 ")",
+                   total_pinned, n_pin_total, n_pin, layers.size(),
+                   total_routed ? 100.0 * n_route_hit / total_routed : 0.0, n_route_hit, total_routed,
+                   total_pinned ? 100.0 * n_new / total_pinned : 0.0, n_new, total_pinned,
+                   n_bytes_locked / (1024.0 * 1024.0), n_lock_calls, n_lock_slow, n_pin_failures);
+
+    LLAMA_LOG_CONT(" | obs=%" PRIu64 " ub=%" PRIu64 " | distinct (layer,expert) seen=%zu"
                    " | prefetch calls=%" PRIu64 " bytes=%.2f MiB failures=%" PRIu64 " | decays=%" PRIu64,
-                   n_ubatches, n_eval_calls,
-                   n_bytes_locked / (1024.0 * 1024.0), n_lock_calls, n_lock_slow, n_pin_failures,
-                   layers.size(), total_pinned, n_pin_total, n_pin,
-                   layers.size(), total_distinct_seen, n_prefetch_calls,
+                   n_eval_calls, n_ubatches, total_distinct_seen, n_prefetch_calls,
                    n_prefetch_bytes / (1024.0 * 1024.0), n_prefetch_failures, n_decays);
 
     if (!pinned_rank.empty()) {
@@ -212,7 +223,6 @@ void llama_hot_expert_cache::observe(int il, const struct ggml_tensor * t) {
         ggml_backend_tensor_get(t, ids.data(), 0, n_ids * sizeof(int32_t));
     }
 
-    uint64_t eval_calls_now = 0;
     std::vector<std::pair<const void *, size_t>> ranges;  // rows to prefetch (filled under the lock)
     {
         std::lock_guard<std::mutex> lock(mu);
@@ -226,12 +236,22 @@ void llama_hot_expert_cache::observe(int il, const struct ggml_tensor * t) {
         }
 
         n_eval_calls++;
-        eval_calls_now = n_eval_calls;
 
         for (int32_t id : ids) {
-            if (id >= 0) {
-                observe_expert(il, ls, id);
+            if (id < 0) {
+                continue;
             }
+            // realized RAM-tier hit rate: a routed expert is a hit when its pages
+            // are already mlock'd at routing time. Experts served from VRAM are
+            // the MoE tier's business and are ignored entirely here.
+            if (!is_vram_resident(il, id)) {
+                if (pinned.count(expert_key{ il, id }) != 0) {
+                    n_route_hit++;
+                } else {
+                    n_route_miss++;
+                }
+            }
+            observe_expert(il, ls, id);
         }
 
         // (A per-token reorder to put pinned experts first was tried here and
@@ -275,13 +295,6 @@ void llama_hot_expert_cache::observe(int il, const struct ggml_tensor * t) {
         if (!llama_mmap::prefetch(ranges)) {
             n_prefetch_failures++;
         }
-    }
-
-    // print_stats() takes the same mutex itself, so this must run outside the
-    // scope above (the mutex is not recursive). Periodic dumps are pin-focused;
-    // prefetch-only runs get their summary from the destructor.
-    if (n_pin > 0 && stats_interval > 0 && eval_calls_now % stats_interval == 0) {
-        print_stats();
     }
 }
 

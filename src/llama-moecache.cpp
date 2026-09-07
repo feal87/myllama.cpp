@@ -18,6 +18,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -88,6 +89,10 @@ struct llama_moe_cache::impl {
     uint64_t n_content      = 0;
     uint64_t last_rebalance = 0;
     uint64_t n_ticks        = 0;
+
+    // (layer, expert) residents at the previous stats report; diffed against the
+    // current residents to measure list churn (key = (uint32 layer << 32) | expert)
+    std::unordered_set<uint64_t> prev_resident;
 
     impl(const llama_model & model_, llama_hot_expert_cache * hot_,
          int32_t slots_, uint64_t budget_, int32_t inserts_) :
@@ -666,25 +671,81 @@ void llama_moe_cache::tick(int64_t n_content_tokens) {
         }
         p->wcv.notify_one();
     }
+}
 
-    if (p->n_ticks % 512 == 0) {
-        uint64_t h = 0, m = 0;
+// periodic stats report, driven by llama_context at the shared
+// --experts-stats-interval cadence. Data is gathered under the same locks as
+// tick(), then logged outside them.
+void llama_moe_cache::print_stats() {
+    auto * p = pimpl.get();
+
+    struct layer_report {
+        int      il;
+        int32_t  n_slots;
+        int32_t  n_res;
+        uint64_t n_hit;
+        uint64_t n_miss;
+    };
+
+    std::vector<layer_report> report;
+    uint64_t n_hit_total = 0;
+    uint64_t n_miss_total = 0;
+    size_t   n_slots_total = 0;
+    size_t   n_res_total   = 0;
+    size_t   n_new         = 0;  // residents that arrived since the previous report
+    uint64_t n_ticks       = 0;
+
+    {
+        std::lock_guard<std::mutex> wlk(p->wmtx);
+        std::lock_guard<std::mutex> lk(p->mtx);
+
+        n_ticks = p->n_ticks;
+        report.reserve(p->layers.size());
         for (auto & ls : p->layers) {
-            h += ls.n_hit;
-            m += ls.n_miss;
-        }
-        LLAMA_LOG_INFO("moe-cache: ticks=%" PRIu64 " hits=%" PRIu64 " misses=%" PRIu64 " hit-rate=%.1f%% | per-layer: {",
-                p->n_ticks, h, m, (h + m) ? 100.0*h/(h + m) : 0.0);
-        for (size_t li = 0; li < p->layers.size(); ++li) {
-            auto & ls = p->layers[li];
-            int32_t n_res = 0;
+            layer_report r = { ls.pub.il, ls.pub.n_slots, 0, ls.n_hit, ls.n_miss };
             for (int32_t e : ls.slot_expert) {
-                n_res += e >= 0;
+                if (e < 0) {
+                    continue;
+                }
+                r.n_res++;
+                const uint64_t k = ((uint64_t) (uint32_t) ls.pub.il << 32) | (uint32_t) e;
+                if (p->prev_resident.find(k) == p->prev_resident.end()) {
+                    n_new++;
+                }
             }
-            const uint64_t t = ls.n_hit + ls.n_miss;
-            LLAMA_LOG_CONT("L%d:slots=%d res=%d hit=%.1f%%%s", ls.pub.il, ls.pub.n_slots, n_res,
-                    t ? 100.0*ls.n_hit/t : 0.0, (li + 1 < p->layers.size()) ? ", " : "");
+            n_slots_total += (size_t) r.n_slots;
+            n_res_total   += (size_t) r.n_res;
+            n_hit_total   += r.n_hit;
+            n_miss_total  += r.n_miss;
+            report.push_back(r);
         }
-        LLAMA_LOG_CONT("}\n");
+
+        // refresh the churn snapshot for the next report
+        p->prev_resident.clear();
+        p->prev_resident.reserve(n_res_total);
+        for (auto & ls : p->layers) {
+            for (int32_t e : ls.slot_expert) {
+                if (e >= 0) {
+                    p->prev_resident.insert(((uint64_t) (uint32_t) ls.pub.il << 32) | (uint32_t) e);
+                }
+            }
+        }
     }
+
+    const uint64_t t_total = n_hit_total + n_miss_total;
+    LLAMA_LOG_INFO("[moe-cache] VRAM tier: resident=%zu/%zu slots (%zu layer(s), inserts=%d)"
+                   " | hit=%.1f%% (%" PRIu64 "/%" PRIu64 " routed)"
+                   " | churn=%.1f%% (%zu/%zu changed since last report)"
+                   " | ticks=%" PRIu64 " | per-layer: {",
+                   n_res_total, n_slots_total, report.size(), p->max_inserts,
+                   t_total ? 100.0 * n_hit_total / t_total : 0.0, n_hit_total, t_total,
+                   n_res_total ? 100.0 * n_new / n_res_total : 0.0, n_new, n_res_total,
+                   n_ticks);
+    for (size_t li = 0; li < report.size(); ++li) {
+        const auto & r   = report[li];
+        const uint64_t t = r.n_hit + r.n_miss;
+        LLAMA_LOG_CONT("L%d:slots=%d res=%d hit=%.1f%%%s", r.il, r.n_slots, r.n_res,
+                t ? 100.0 * r.n_hit / t : 0.0, (li + 1 < report.size()) ? ", " : "");
+    }
+    LLAMA_LOG_CONT("}\n");
 }

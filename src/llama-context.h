@@ -293,6 +293,9 @@ private:
     // (null when disabled or when the model has no cacheable layer)
     std::unique_ptr<llama_moe_cache> moe_cache;
 
+    // last time the periodic expert-tier stats report was printed (us)
+    int64_t t_experts_stats_us = 0;
+
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
 

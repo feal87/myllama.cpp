@@ -143,7 +143,7 @@ llama_context::llama_context(
     cparams.cb_eval_user_data = params.cb_eval_user_data;
     cparams.n_pin_hot_experts  = params.n_pin_hot_experts;
     cparams.n_pin_hot_experts_budget_bytes = params.n_pin_hot_experts_budget_bytes;
-    cparams.n_pin_hot_experts_stats_interval = params.n_pin_hot_experts_stats_interval;
+    cparams.n_experts_stats_interval = params.n_experts_stats_interval;
     cparams.n_pin_hot_experts_decay_tokens   = params.n_pin_hot_experts_decay_tokens;
 
     cparams.n_moe_cache_slots        = params.n_moe_cache_slots;
@@ -173,7 +173,6 @@ llama_context::llama_context(
         } else {
             hot_experts = std::make_unique<llama_hot_expert_cache>(
                 model, cparams.n_pin_hot_experts, cparams.n_pin_hot_experts_budget_bytes,
-                cparams.n_pin_hot_experts_stats_interval,
                 cparams.n_pin_hot_experts_decay_tokens,
                 cparams.hot_experts_prefetch);
             cparams.cb_eval           = llama_hot_expert_cache::eval_callback;
@@ -1474,6 +1473,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // new ones (evictions + table updates are only safe between graph executions)
     if (moe_cache) {
         moe_cache->tick(ubatch.n_tokens);
+    }
+
+    // periodic expert-tier stats report: one shared wall-clock interval (seconds)
+    // drives the RAM pin tier and the VRAM MoE tier together (0 = disabled, only
+    // the destructor summary remains). Printed at the ubatch boundary so it never
+    // interleaves with a running graph; the first report waits a full interval.
+    if (cparams.n_experts_stats_interval > 0) {
+        const int64_t now_us = ggml_time_us();
+        if (t_experts_stats_us == 0) {
+            t_experts_stats_us = now_us;
+        } else if (now_us - t_experts_stats_us >= (int64_t) cparams.n_experts_stats_interval * 1000000) {
+            t_experts_stats_us = now_us;
+            if (hot_experts && cparams.n_pin_hot_experts > 0) {
+                hot_experts->print_stats();
+            }
+            if (moe_cache && moe_cache->is_active()) {
+                moe_cache->print_stats();
+            }
+        }
     }
 
     return res;
@@ -3718,7 +3736,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.n_pin_hot_experts            =*/ 0,
         /*.n_pin_hot_experts_budget_bytes=*/ 0,
-        /*.n_pin_hot_experts_stats_interval=*/ 200,
+        /*.n_experts_stats_interval     =*/ 5,
         /*.n_pin_hot_experts_decay_tokens=*/ 0,
         /*.n_moe_cache_slots           =*/ 0,
         /*.n_moe_cache_budget_bytes    =*/ 0,

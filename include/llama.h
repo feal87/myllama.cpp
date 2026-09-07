@@ -406,10 +406,12 @@ extern "C" {
         // recommended whenever n_pin_hot_experts > 0.
         uint64_t n_pin_hot_experts_budget_bytes;
 
-        // print hot-expert pinning stats to stderr every N router observations
-        // (0 = disabled, a final summary is still printed when the context is
-        // destroyed). Bypasses the log callback and writes directly with fprintf.
-        uint64_t n_pin_hot_experts_stats_interval;
+        // print the periodic MoE expert-tier stats report (RAM pin tier + VRAM
+        // MoE tier: totals, hit rates, list churn, per-layer breakdown) every N
+        // seconds of evaluation (0 = disabled, a final hot-expert summary is
+        // still printed when the context is destroyed). Shared by the pin and
+        // MoE tiers.
+        uint64_t n_experts_stats_interval;
 
         // halve all hot-expert usage counts every N tokens (0 = disabled,
         // lifetime counts). With aging, the pin set tracks the RECENT routing

@@ -101,6 +101,12 @@ class llama_moe_cache {
     // uploads and periodically rebalances content against the current ranking
     void tick(int64_t n_content_tokens);
 
+    // print the periodic stats report (resident vs capacity, hit rate, list
+    // churn since the previous report, per-layer breakdown) via LLAMA_LOG_INFO
+    // (verbosity 4). Called by llama_context at the shared
+    // --experts-stats-interval cadence; also refreshes the churn snapshot.
+    void print_stats();
+
     // llama_hot_expert_cache::vram_query_fn-compatible: is this expert currently
     // served from VRAM? (the RAM tier uses this to skip double-covering)
     static bool vram_resident_cb(void * ud, int il, int32_t expert_id);

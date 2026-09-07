@@ -474,9 +474,11 @@ struct common_params {
     // hard cap in MiB on total memory locked by n_pin_hot_experts, across all layers
     // combined (0 = unlimited, NOT recommended -- see --pin-hot-experts-budget-mib).
     uint64_t n_pin_hot_experts_budget_mib = 0;
-    // print hot-expert pinning stats to stderr every N router observations (0 = only
-    // at teardown). See --pin-hot-experts-stats-interval.
-    uint64_t n_pin_hot_experts_stats_interval = 200;
+    // print the periodic MoE expert-tier stats report (RAM pin tier + VRAM MoE
+    // tier: totals, hit rates, list churn, per-layer breakdown) every N seconds
+    // of evaluation (0 = only at teardown). Shared by --pin-hot-experts and
+    // --moe-expert-cache*. See --experts-stats-interval.
+    uint64_t n_experts_stats_interval = 5;
     // halve all usage counts every N tokens (0 = disabled). See
     // --pin-hot-experts-decay-tokens.
     uint64_t n_pin_hot_experts_decay_tokens = 0;

@@ -68,8 +68,6 @@ class llama_hot_expert_cache {
     //                    total global capacity = N * num_moe_layers, ranked globally. 0 = ranking-only
     //                    mode (observe the routing for llama_moe_cache / prefetch, pin nothing)
     // budget_bytes:      hard cap on total bytes locked across ALL layers combined (0 = unlimited, NOT recommended)
-    // stats_interval:    print_stats() is called automatically every `stats_interval` router
-    //                    observations (0 = disabled, only the destructor prints a final summary)
     // decay_interval:    halve all usage counts every N tokens (0 = disabled, lifetime counts)
     //                    (tokens of content: prefill and generation both count)
     // prefetch_enabled:  read-ahead (madvise WILLNEED / PrefetchVirtualMemory) the rows of the
@@ -78,7 +76,6 @@ class llama_hot_expert_cache {
     llama_hot_expert_cache(const llama_model & model,
                            int32_t             n_pin_experts,
                            uint64_t            budget_bytes,
-                           uint64_t            stats_interval,
                            uint64_t            decay_interval,
                            bool                prefetch_enabled);
     ~llama_hot_expert_cache();
@@ -132,13 +129,11 @@ class llama_hot_expert_cache {
     // counts once every `decay_interval` tokens of content.
     void on_ubatch_begin(int64_t n_tokens);
 
-    // Prints a summary (bytes locked, per-layer breakdown, router observations,
-    // prefetch, slow lock syscalls) directly to stderr with fprintf.
-    // Deliberately bypasses LLAMA_LOG_* / the ggml log callback: at destruction
-    // time (process teardown, or a caller that already tore down its own log
-    // sink) those can silently swallow output, so this is a best-effort
-    // guaranteed-visible dump.
-    void print_stats() const;
+    // Prints the periodic stats report (pinned vs capacity, realized RAM-tier hit
+    // rate, list churn since the previous report, locked bytes, per-layer pinned
+    // breakdown) via LLAMA_LOG_INFO (verbosity 4). Called by llama_context at the
+    // shared --experts-stats-interval cadence and once by the destructor.
+    void print_stats();
 
   private:
     // Unique key identifying a specific expert in a specific layer
@@ -272,7 +267,6 @@ class llama_hot_expert_cache {
     const int32_t  n_pin;            // N experts per layer
     int32_t        n_pin_total = 0;  // N * num_moe_layers (global cap)
     const uint64_t budget_bytes;     // 0 = unlimited
-    const uint64_t stats_interval;   // 0 = disabled periodic printing
     const uint64_t decay_interval;   // 0 = lifetime counts (no aging)
     const bool     prefetch_enabled; // read-ahead routed-but-unpinned expert rows (--hot-experts-prefetch)
     uint64_t       n_tokens_seen = 0;  // tokens since the last decay
@@ -287,6 +281,9 @@ class llama_hot_expert_cache {
     // begin() is always the coldest pinned expert globally
     std::set<std::tuple<uint64_t, int, int32_t>>                   pinned_rank;
     std::unordered_map<expert_key, pinned_expert, expert_key_hash> pinned;
+    // pinned set at the previous stats report; diffed against the current one to
+    // measure the list churn (expert replaced since the last report)
+    std::unordered_set<expert_key, expert_key_hash> pinned_prev;
 
     uint64_t n_ubatches     = 0;   // graph computes (ubatch chunks) seen
     uint64_t n_eval_calls   = 0;   // topk tensors actually observed
@@ -299,6 +296,8 @@ class llama_hot_expert_cache {
     uint64_t n_prefetch_failures = 0;
     uint64_t n_decays            = 0;
     uint64_t n_content_tokens    = 0;  // lifetime content tokens (all ubatches)
+    uint64_t n_route_hit         = 0;  // routed expert selections served by the pinned (RAM) tier
+    uint64_t n_route_miss        = 0;  // routed selections not pinned (VRAM-served experts are skipped)
 
     // VRAM-tier residency query (see the public API docs); guarded by mu
     vram_query_fn vram_query = nullptr;

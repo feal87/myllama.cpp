@@ -2871,20 +2871,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PIN_HOTEXPERTS_BUDGET_MIB"));
     add_opt(common_arg(
-        {"--pin-hot-experts-stats-interval"}, "N",
+        {"--experts-stats-interval"}, "N",
         string_format(
-            "print hot-expert pinning stats (bytes locked, global pin counts, per-layer\n"
-            "breakdown) directly to stderr every N router observations (default: %" PRIu64 ", 0 = disabled --\n"
-            "a final summary is still printed when the context is destroyed)",
-            params.n_pin_hot_experts_stats_interval
+            "print the periodic MoE expert-tier stats report (RAM pin tier + VRAM\n"
+            "MoE tier: totals, hit rates, list churn, per-layer breakdown) to stderr\n"
+            "every N seconds of evaluation (default: %" PRIu64 ", 0 = disabled -- a final\n"
+            "hot-expert summary is still printed when the context is destroyed)",
+            params.n_experts_stats_interval
         ),
         [](common_params & params, int value) {
             if (value < 0) {
-                throw std::invalid_argument("error: --pin-hot-experts-stats-interval must be >= 0");
+                throw std::invalid_argument("error: --experts-stats-interval must be >= 0");
             }
-            params.n_pin_hot_experts_stats_interval = (uint64_t) value;
+            params.n_experts_stats_interval = (uint64_t) value;
         }
-    ).set_env("LLAMA_ARG_PIN_HOTEXPERTS_STATS_INTERVAL"));
+    ).set_env("LLAMA_ARG_EXPERTS_STATS_INTERVAL"));
     add_opt(common_arg(
         {"--pin-hot-experts-decay-tokens"}, "N",
         string_format(
