@@ -44,6 +44,12 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
             "recommended.\n",
             __func__);
     }
+    if (budget_bytes > 0 && llama_mlock::SUPPORTED && !llama_mlock::reserve_working_set(budget_bytes)) {
+        LLAMA_LOG_WARN(
+            "%s: could not raise the Windows working-set minimum to the pin budget; "
+            "VirtualLock will retry and report failures as needed\n",
+            __func__);
+    }
     if (stats_interval > 0) {
         LLAMA_LOG_INFO("%s: printing pinning stats to stderr every %" PRIu64 " router observations\n", __func__,
                        stats_interval);

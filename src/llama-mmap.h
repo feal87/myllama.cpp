@@ -76,6 +76,10 @@ struct llama_mlock {
     // if locking failed partway through -- see failed_already in the impl)
     size_t size() const;
 
+    // On Windows, raise the process working-set minimum to accommodate a lock budget.
+    // This is a best-effort reservation; it does not lock or fault pages in.
+    static bool reserve_working_set(size_t bytes);
+
     // explicitly unlock the pages (NOT called by the destructor -- the default
     // behavior is to leave pages locked until process exit, matching mlock(2))
     void unlock();

@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <mutex>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -783,6 +784,42 @@ struct llama_mlock::impl {
     static void raw_unlock(const void * addr, size_t len) {}
 #endif
 
+    static bool reserve_working_set(size_t bytes) {
+#if defined(_WIN32)
+        static std::mutex mutex;
+        static SIZE_T reserved_minimum = 0;
+        std::lock_guard<std::mutex> lock(mutex);
+
+        if (bytes == 0 || bytes <= reserved_minimum) {
+            return true;
+        }
+
+        SIZE_T min_ws_size, max_ws_size;
+        if (!GetProcessWorkingSetSize(GetCurrentProcess(), &min_ws_size, &max_ws_size)) {
+            LLAMA_LOG_WARN("warning: GetProcessWorkingSetSize failed: %s\n",
+                    llama_format_win_err(GetLastError()).c_str());
+            return false;
+        }
+        if ((SIZE_T) bytes <= min_ws_size) {
+            reserved_minimum = min_ws_size;
+            return true;
+        }
+
+        SIZE_T new_minimum = (SIZE_T) bytes;
+        SIZE_T new_maximum = std::max(max_ws_size, new_minimum);
+        if (!SetProcessWorkingSetSizeEx(GetCurrentProcess(), new_minimum, new_maximum, 0)) {
+            LLAMA_LOG_WARN("warning: SetProcessWorkingSetSizeEx failed: %s\n",
+                    llama_format_win_err(GetLastError()).c_str());
+            return false;
+        }
+        reserved_minimum = new_minimum;
+        return true;
+#else
+        GGML_UNUSED(bytes);
+        return true;
+#endif
+    }
+
     impl() : addr(NULL), size(0), failed_already(false) {}
 
     void init(void * ptr) {
@@ -818,6 +855,7 @@ llama_mlock::~llama_mlock() = default;
 void llama_mlock::init(void * ptr) { pimpl->init(ptr); }
 void llama_mlock::grow_to(size_t target_size) { pimpl->grow_to(target_size); }
 size_t llama_mlock::size() const { return pimpl->size; }
+bool llama_mlock::reserve_working_set(size_t bytes) { return impl::reserve_working_set(bytes); }
 void llama_mlock::unlock() {
     if (pimpl->addr != NULL && pimpl->size > 0) {
         pimpl->raw_unlock(pimpl->addr, pimpl->size);
