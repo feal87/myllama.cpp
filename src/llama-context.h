@@ -17,6 +17,7 @@
 struct llama_model;
 class llama_batch_allocr;
 class llama_hot_expert_cache;
+class llama_moe_cache;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -285,6 +286,10 @@ private:
     // --pin-hot-experts N: mlocks the N hottest MoE experts per layer in place, in RAM
     // (null when disabled, i.e. n_pin_hot_experts <= 0 or a custom cb_eval was supplied)
     std::unique_ptr<llama_hot_expert_cache> hot_experts;
+
+    // --moe-expert-cache*: GPU-resident cache for host-offloaded MoE experts
+    // (null when disabled or when the model has no cacheable layer)
+    std::unique_ptr<llama_moe_cache> moe_cache;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;

@@ -4,6 +4,7 @@
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-hot-experts.h"
+#include "llama-moecache.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
@@ -145,6 +146,10 @@ llama_context::llama_context(
     cparams.n_pin_hot_experts_stats_interval = params.n_pin_hot_experts_stats_interval;
     cparams.n_pin_hot_experts_decay_tokens   = params.n_pin_hot_experts_decay_tokens;
 
+    cparams.n_moe_cache_slots        = params.n_moe_cache_slots;
+    cparams.n_moe_cache_budget_bytes = params.n_moe_cache_budget_bytes;
+    cparams.n_moe_cache_inserts      = params.n_moe_cache_inserts;
+
     if (cparams.n_pin_hot_experts > 0) {
         if (cparams.cb_eval != nullptr) {
             LLAMA_LOG_WARN("%s: --pin-hot-experts requires the eval callback slot, but a custom cb_eval "
@@ -156,6 +161,20 @@ llama_context::llama_context(
                 cparams.n_pin_hot_experts_decay_tokens);
             cparams.cb_eval           = llama_hot_expert_cache::eval_callback;
             cparams.cb_eval_user_data = hot_experts.get();
+        }
+    }
+
+    if (cparams.n_moe_cache_slots > 0 || cparams.n_moe_cache_budget_bytes > 0) {
+        if (cparams.n_pin_hot_experts > 0 && hot_experts) {
+            // the VRAM tier sits on top of the hot-expert cache: it reads the
+            // same global ranking and only makes sense when the RAM tier runs.
+            // Allocation is deferred until enough routing has been observed to
+            // size the per-layer capacities (see llama_moe_cache::maybe_activate)
+            moe_cache = std::make_unique<llama_moe_cache>(
+                model, hot_experts.get(), cparams.n_moe_cache_slots,
+                cparams.n_moe_cache_budget_bytes, cparams.n_moe_cache_inserts);
+        } else {
+            LLAMA_LOG_WARN("%s: --moe-expert-cache* requires --pin-hot-experts (the VRAM tier is driven by the hot-expert ranking); MoE expert cache disabled\n", __func__);
         }
     }
 
@@ -1360,6 +1379,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
 
+    // lazy activation of the VRAM MoE tier on the first single-token decode
+    // ubatch (once enough routing has been observed to size its capacities).
+    // Afterwards gparams.moe_cache is non-null, which invalidates the reused
+    // pre-activation graph, so the decode graph is rebuilt with the cache chain.
+    if (ubatch.n_tokens == 1 && moe_cache) {
+        moe_cache->maybe_activate();
+    }
+
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
@@ -1424,6 +1451,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     ret = GGML_STATUS_SUCCESS;
+
+    // graph boundary: publish the completed MoE expert-cache uploads and schedule
+    // new ones (evictions + table updates are only safe between graph executions)
+    if (moe_cache) {
+        moe_cache->tick(ubatch.n_tokens);
+    }
 
     return res;
 }
@@ -2507,6 +2540,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.moe_cache   =*/ (moe_cache && moe_cache->is_active()) ? moe_cache.get() : nullptr,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3668,6 +3702,9 @@ llama_context_params llama_context_default_params() {
         /*.n_pin_hot_experts_budget_bytes=*/ 0,
         /*.n_pin_hot_experts_stats_interval=*/ 200,
         /*.n_pin_hot_experts_decay_tokens=*/ 0,
+        /*.n_moe_cache_slots           =*/ 0,
+        /*.n_moe_cache_budget_bytes    =*/ 0,
+        /*.n_moe_cache_inserts         =*/ 2,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,

@@ -1,0 +1,690 @@
+#include "llama-moecache.h"
+
+#include "llama-hot-experts.h"
+#include "llama-impl.h"
+#include "llama-model.h"
+
+#include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+
+#include <algorithm>
+#include <cinttypes>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+// content tokens of routing to collect before the VRAM tier sizes itself from
+// the profile (the prefill of the first request)
+static constexpr uint64_t kMinProfileContentTokens = 256;
+
+// content tokens between content rebalances (each rebalance reconciles the
+// residents with the current global ranking)
+static constexpr uint64_t kRebalanceContentTokens = 256;
+
+struct llama_moe_cache::impl {
+    struct layer_state {
+        llama_moe_cache_layer pub;
+
+        // (cache tensor, source tensor) pairs copied on upload
+        std::vector<std::pair<ggml_tensor *, const ggml_tensor *>> uploads;
+
+        // bookkeeping
+        std::vector<int32_t> slot_expert;   // slots -> published resident expert (-1 = empty)
+        std::vector<int32_t> slot_target;   // slots -> expert whose upload is in flight (-1 = none)
+        std::vector<char>    resident;      // n_expert -> currently served from VRAM (obs / hot query)
+        std::deque<int32_t>  pending_q;     // desired ids not yet resident/in flight, hottest first
+
+        uint64_t n_hit  = 0;
+        uint64_t n_miss = 0;
+    };
+
+    struct upload_job {
+        size_t  layer_idx;
+        int32_t expert;
+        int32_t slot;
+    };
+
+    const llama_model & model;
+    llama_hot_expert_cache * const hot;
+    const int32_t  slots_override;   // uniform per-layer capacity (0 = profile from budget)
+    const uint64_t budget_bytes;     // global device budget (used when slots_override == 0)
+    const int32_t  max_inserts;
+
+    bool activated = false;
+    bool failed    = false;
+
+    std::vector<layer_state> layers;
+
+    // tensor storage (device buffers per layer + one host context for the tables)
+    std::vector<ggml_context *>        ctxs_dev;
+    std::vector<ggml_backend_buffer_t> bufs_dev;
+    ggml_context *        ctx_host = nullptr;
+    ggml_backend_buffer_t buf_host = nullptr;
+
+    // async upload worker: slices are copied off the decode thread; the new
+    // mapping is only published at the next tick(), after the copy completed
+    std::thread              worker;
+    std::mutex               wmtx;
+    std::condition_variable  wcv;
+    std::deque<upload_job>   todo;
+    std::vector<upload_job>  done;
+    bool                     stop = false;
+
+    // guards the bookkeeping above + the obs telemetry. Obs runs during graph
+    // compute, tick()/rebalance() between graphs, so contention is negligible;
+    // the hot cache may call vram_resident_cb() (holding its own mutex) while
+    // we hold this one - that is the only lock order (never take hot's mutex
+    // while holding this one).
+    std::mutex mtx;
+
+    uint64_t n_content      = 0;
+    uint64_t last_rebalance = 0;
+    uint64_t n_ticks        = 0;
+
+    impl(const llama_model & model_, llama_hot_expert_cache * hot_,
+         int32_t slots_, uint64_t budget_, int32_t inserts_) :
+        model(model_), hot(hot_), slots_override(slots_), budget_bytes(budget_), max_inserts(inserts_) {}
+
+    layer_state * find_layer(int il) {
+        for (auto & ls : layers) {
+            if (ls.pub.il == il) {
+                return &ls;
+            }
+        }
+        return nullptr;
+    }
+
+    ~impl() {
+        {
+            std::lock_guard<std::mutex> lock(wmtx);
+            stop = true;
+        }
+        wcv.notify_all();
+        if (worker.joinable()) {
+            worker.join();
+        }
+        for (size_t i = 0; i < bufs_dev.size(); ++i) {
+            ggml_backend_buffer_free(bufs_dev[i]);
+        }
+        for (auto * ctx : ctxs_dev) {
+            ggml_free(ctx);
+        }
+        if (buf_host) {
+            ggml_backend_buffer_free(buf_host);
+        }
+        if (ctx_host) {
+            ggml_free(ctx_host);
+        }
+    }
+};
+
+static size_t expert_slice_bytes(const ggml_tensor * w) {
+    return w->nb[2];
+}
+
+llama_moe_cache::llama_moe_cache(const llama_model & model, llama_hot_expert_cache * hot,
+                                 int32_t slots, uint64_t budget_bytes, int32_t max_inserts) {
+    if (hot == nullptr || (slots <= 0 && budget_bytes == 0)) {
+        return; // disabled (missing ranking source or no capacity requested)
+    }
+    if (max_inserts <= 0) {
+        max_inserts = 2;
+    }
+
+    pimpl = std::make_unique<impl>(model, hot, slots, budget_bytes, max_inserts);
+}
+
+llama_moe_cache::~llama_moe_cache() {
+    if (pimpl) {
+        ggml_set_moe_obs_callback(nullptr, nullptr);
+        if (pimpl->hot) {
+            pimpl->hot->set_vram_query(nullptr, nullptr);
+        }
+    }
+    // pimpl releases the worker, buffers and contexts
+}
+
+bool llama_moe_cache::is_active() const {
+    return pimpl != nullptr && pimpl->activated;
+}
+
+bool llama_moe_cache::vram_resident_cb(void * ud, int il, int32_t expert_id) {
+    auto * self = static_cast<llama_moe_cache *>(ud);
+    if (!self || !self->pimpl || !self->pimpl->activated) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(self->pimpl->mtx);
+    auto * ls = self->pimpl->find_layer(il);
+    if (!ls || expert_id < 0 || expert_id >= (int32_t) ls->resident.size()) {
+        return false;
+    }
+    return ls->resident[expert_id] != 0;
+}
+
+void llama_moe_cache::maybe_activate() {
+    if (!pimpl || pimpl->activated || pimpl->failed) {
+        return;
+    }
+    auto * p = pimpl.get();
+
+    // wait until enough routing has been observed to size the layers from a
+    // real profile (the uniform-override mode does not need a profile, but it
+    // still only makes sense once generation starts)
+    if (p->slots_override <= 0 && p->hot->content_tokens() < kMinProfileContentTokens) {
+        return;
+    }
+
+    // collect the host-resident MoE layers that have a device home for the
+    // cache. Both the fused gate_up layout and the separate gate/up layout work.
+    struct cand {
+        int    il;
+        const llama_layer * l;
+        bool   fused;
+        size_t nbytes_1slot; // one expert across all of its tensors
+    };
+    std::vector<cand> cands;
+    for (size_t il = 0; il < p->model.layers.size(); ++il) {
+        const auto & l = p->model.layers[il];
+        if (!l.ffn_down_exps || !l.ffn_gate_inp) {
+            continue;
+        }
+        if (l.ffn_down_exps->ne[2] == 0 || !l.ffn_down_exps->data) {
+            continue; // dry-run / memory-estimation model: weights not loaded
+        }
+        if (ggml_backend_buffer_is_host(l.ffn_gate_inp->buffer)) {
+            continue; // no device home for the cache tensors
+        }
+
+        const ggml_tensor * gate = nullptr;
+        const ggml_tensor * up   = nullptr;
+        bool fused = false;
+
+        if (l.ffn_gate_up_exps && l.ffn_gate_up_exps->data &&
+                ggml_backend_buffer_is_host(l.ffn_gate_up_exps->buffer)) {
+            // fused gate+up tensor
+            if (l.ffn_gate_up_exps->ne[2] != l.ffn_down_exps->ne[2]) {
+                continue;
+            }
+            gate = l.ffn_gate_up_exps;
+            up   = l.ffn_gate_up_exps;
+            fused = true;
+        } else if (l.ffn_gate_exps && l.ffn_up_exps &&
+                l.ffn_gate_exps->data && l.ffn_up_exps->data &&
+                ggml_backend_buffer_is_host(l.ffn_gate_exps->buffer) &&
+                ggml_backend_buffer_is_host(l.ffn_up_exps->buffer)) {
+            // separate gate + up tensors
+            if (l.ffn_gate_exps->ne[2] != l.ffn_up_exps->ne[2] ||
+                l.ffn_gate_exps->ne[2] != l.ffn_down_exps->ne[2]) {
+                continue;
+            }
+            gate = l.ffn_gate_exps;
+            up   = l.ffn_up_exps;
+        } else {
+            continue; // experts already on a device, or an unsupported layout
+        }
+
+        if (!ggml_backend_buffer_is_host(l.ffn_down_exps->buffer)) {
+            continue; // down already on a device
+        }
+
+        size_t bytes_1slot = expert_slice_bytes(l.ffn_down_exps);
+        bytes_1slot += fused ? expert_slice_bytes(gate) : expert_slice_bytes(gate) + expert_slice_bytes(up);
+        cands.push_back({ (int) il, &l, fused, bytes_1slot });
+    }
+
+    if (cands.empty()) {
+        LLAMA_LOG_WARN("%s: no host-resident MoE layer with a device router was found - MoE expert cache stays disabled\n", __func__);
+        p->failed = true;
+        return;
+    }
+
+    // Per-layer VRAM slot capacities.
+    //  - --moe-expert-cache N (slots_override > 0): explicit UNIFORM override, N
+    //    slots for every candidate layer. Deliberate opt-out of the default for
+    //    A/B runs; it ignores the budget and the profile.
+    //  - default: derive the capacities from the observed routing profile by
+    //    handing the GLOBAL byte budget to the globally hottest experts (top of
+    //    the shared ranking first). A layer earns a slot only when one of its
+    //    experts is actually among the hottest model-wide, so hot layers end up
+    //    with many slots and cold layers with none.
+    std::vector<int32_t> caps(p->model.layers.size(), 0);
+
+    if (p->slots_override > 0) {
+        for (const auto & c : cands) {
+            caps[c.il] = p->slots_override;
+        }
+    } else {
+        std::vector<size_t> bytes_per_layer(p->model.layers.size(), 0);
+        for (const auto & c : cands) {
+            bytes_per_layer[c.il] = c.nbytes_1slot;
+        }
+        if (p->hot->assign_global_capacity(p->budget_bytes, bytes_per_layer, caps) <= 0) {
+            LLAMA_LOG_WARN("%s: no routing observed yet - MoE expert cache stays disabled\n", __func__);
+            p->failed = true;
+            return;
+        }
+    }
+
+    // shared host context for the CPU-side tables
+    {
+        ggml_init_params ip = {
+            /*.mem_size   =*/ ggml_tensor_overhead() * (cands.size() + 4),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        p->ctx_host = ggml_init(ip);
+        if (!p->ctx_host) {
+            p->failed = true;
+            return;
+        }
+    }
+
+    p->layers.reserve(cands.size());
+    size_t vram_bytes = 0;
+    int n_cached = 0;
+
+    for (const auto & c : cands) {
+        const int32_t n_slots = caps[c.il];
+        if (n_slots <= 0) {
+            continue; // this layer earned no VRAM slots
+        }
+        const auto & l = *c.l;
+        const ggml_tensor * gate_src = c.fused ? (const ggml_tensor *) l.ffn_gate_up_exps : (const ggml_tensor *) l.ffn_gate_exps;
+        const ggml_tensor * up_src   = c.fused ? (const ggml_tensor *) l.ffn_gate_up_exps : (const ggml_tensor *) l.ffn_up_exps;
+        const ggml_tensor * d_src    = l.ffn_down_exps;
+        const int64_t n_expert = gate_src->ne[2];
+
+        ggml_init_params ip = {
+            /*.mem_size   =*/ ggml_tensor_overhead() * 8,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context * ctx_dev = ggml_init(ip);
+        if (!ctx_dev) {
+            p->failed = true;
+            return;
+        }
+        p->ctxs_dev.push_back(ctx_dev);
+
+        p->layers.emplace_back();
+        auto & ls = p->layers.back();
+        auto & pub = ls.pub;
+        pub.il       = c.il;
+        pub.n_slots  = n_slots;
+        pub.fused    = c.fused;
+        pub.gate_src = gate_src;
+        pub.up_src   = up_src;
+        pub.d_src    = d_src;
+
+        pub.c_gate = ggml_new_tensor_3d(ctx_dev, gate_src->type, gate_src->ne[0], gate_src->ne[1], n_slots + 1);
+        ggml_format_name(pub.c_gate, "moe_cache_gate.%d", c.il);
+        ls.uploads.emplace_back(pub.c_gate, gate_src);
+
+        if (!c.fused) {
+            pub.c_up = ggml_new_tensor_3d(ctx_dev, up_src->type, up_src->ne[0], up_src->ne[1], n_slots + 1);
+            ggml_format_name(pub.c_up, "moe_cache_up.%d", c.il);
+            ls.uploads.emplace_back(pub.c_up, up_src);
+        }
+        pub.c_down = ggml_new_tensor_3d(ctx_dev, d_src->type, d_src->ne[0], d_src->ne[1], n_slots + 1);
+        ggml_format_name(pub.c_down, "moe_cache_down.%d", c.il);
+        ls.uploads.emplace_back(pub.c_down, d_src);
+
+        pub.dev_table = ggml_new_tensor_2d(ctx_dev, GGML_TYPE_I32, 1, n_expert);
+        ggml_format_name(pub.dev_table, "moe_cache_tbl.%d", c.il);
+
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_dev, ggml_backend_buffer_get_type(l.ffn_gate_inp->buffer));
+        if (!buf) {
+            LLAMA_LOG_WARN("%s: failed to allocate MoE cache buffer for layer %d - MoE expert cache stays disabled\n", __func__, c.il);
+            p->failed = true;
+            return;
+        }
+        ggml_backend_buffer_clear(buf, 0); // the dummy slot (n_slots) stays all zeros
+        p->bufs_dev.push_back(buf);
+
+        pub.host_table = ggml_new_tensor_2d(p->ctx_host, GGML_TYPE_I32, 1, n_expert);
+        ggml_format_name(pub.host_table, "moe_cache_htbl.%d", c.il);
+
+        ls.slot_expert.assign(n_slots, -1);
+        ls.slot_target.assign(n_slots, -1);
+        ls.resident.assign(n_expert, 0);
+
+        // everything uncached -> dummy slot n_slots (device copy now; the host
+        // copy is filled below once the shared host buffer exists)
+        std::vector<int32_t> dummy(n_expert, n_slots);
+        ggml_backend_tensor_set(pub.dev_table, dummy.data(), 0, n_expert*sizeof(int32_t));
+
+        vram_bytes += (size_t) (n_slots + 1) * c.nbytes_1slot;
+        n_cached++;
+    }
+
+    if (n_cached == 0) {
+        LLAMA_LOG_WARN("%s: no layer earned any VRAM slot from the routing profile - MoE expert cache stays disabled\n", __func__);
+        p->failed = true;
+        return;
+    }
+
+    // host buffer for the CPU-side tables
+    p->buf_host = ggml_backend_alloc_ctx_tensors_from_buft(p->ctx_host, ggml_backend_cpu_buffer_type());
+    if (!p->buf_host) {
+        LLAMA_LOG_WARN("%s: failed to allocate the CPU-side MoE cache tables - disabled\n", __func__);
+        p->failed = true;
+        return;
+    }
+
+    // fill the CPU-side tables: everything uncached -> dummy slot n_slots
+    for (auto & ls : p->layers) {
+        const int32_t n_expert = (int32_t) ls.pub.gate_src->ne[2];
+        std::vector<int32_t> dummy(n_expert, ls.pub.n_slots);
+        ggml_backend_tensor_set(ls.pub.host_table, dummy.data(), 0, n_expert*sizeof(int32_t));
+    }
+
+    // async upload worker
+    p->worker = std::thread([p]() {
+        for (;;) {
+            impl::upload_job j;
+            {
+                std::unique_lock<std::mutex> lk(p->wmtx);
+                p->wcv.wait(lk, [p]() { return p->stop || !p->todo.empty(); });
+                if (p->stop && p->todo.empty()) {
+                    return;
+                }
+                j = p->todo.front();
+                p->todo.pop_front();
+            }
+
+            auto & ls = p->layers[j.layer_idx];
+            for (const auto & [dst_c, src] : ls.uploads) {
+                const size_t sz = src->nb[2];
+                if ((size_t) j.expert*sz + sz <= ggml_nbytes(src) &&
+                        (size_t) j.slot*sz + sz <= ggml_nbytes(dst_c)) {
+                    ggml_backend_tensor_set(dst_c,
+                            (const char *) src->data + (size_t) j.expert*sz,
+                            (size_t) j.slot*sz, sz);
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lk(p->wmtx);
+                p->done.push_back(j);
+            }
+        }
+    });
+
+    ggml_set_moe_obs_callback(&llama_moe_cache::moe_obs_cb, this);
+    p->hot->set_vram_query(&llama_moe_cache::vram_resident_cb, this);
+
+    p->activated = true;
+
+    {
+        std::string layers_str;
+        size_t n_slots_total = 0;
+        for (auto & ls : p->layers) {
+            n_slots_total += (size_t) ls.pub.n_slots;
+            if (!layers_str.empty()) {
+                layers_str += ",";
+            }
+            layers_str += "L" + std::to_string(ls.pub.il) + "=" + std::to_string(ls.pub.n_slots);
+        }
+        LLAMA_LOG_INFO("%s: MoE expert cache enabled: %d layer(s), %zu VRAM slots total (%.1f MiB device memory), %d inserts/step (global); profile: %s\n",
+                __func__, n_cached, n_slots_total, vram_bytes/(1024.0*1024.0), p->max_inserts, layers_str.c_str());
+    }
+
+    // seed the content from the current ranking immediately
+    rebalance();
+}
+
+const llama_moe_cache_layer * llama_moe_cache::lookup(const ggml_tensor * gate) const {
+    if (!pimpl || !pimpl->activated) {
+        return nullptr;
+    }
+    for (const auto & ls : pimpl->layers) {
+        if (ls.pub.gate_src == gate) {
+            return &ls.pub;
+        }
+    }
+    return nullptr;
+}
+
+// ggml_moe_obs_cb_t: invoked from the CPU mul_mat_id of a host-resident gate
+// layer during decode. Telemetry only: measures the realized hit rate (an
+// expert counts as a hit when its host read is actually skipped because the
+// VRAM copy serves it). Content decisions live in the hot cache's counts.
+void llama_moe_cache::moe_obs_cb(const char * tensor_name, const struct ggml_tensor * ids, void * ud) {
+    auto * self = static_cast<llama_moe_cache *>(ud);
+    if (!self || !self->pimpl || !self->pimpl->activated) {
+        return;
+    }
+    auto * p = self->pimpl.get();
+
+    // "blk.<il>.ffn_gate_up_exps.weight" (or "...ffn_gate_exps.weight")
+    if (strncmp(tensor_name, "blk.", 4) != 0) {
+        return;
+    }
+    const int il = atoi(tensor_name + 4);
+
+    const int64_t n_ids    = ids->ne[0];
+    const int64_t n_tokens = ids->ne[1];
+    if (n_ids <= 0 || n_tokens != 1) {
+        return; // decode only: the cache graph is not built for batches/prefill
+    }
+    if (ids->type != GGML_TYPE_I32 || ids->data == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(p->mtx);
+
+    auto * ls = p->find_layer(il);
+    if (!ls) {
+        return; // not a cached layer
+    }
+
+    const int32_t * data = (const int32_t *) ids->data;
+    for (int64_t i = 0; i < n_ids; ++i) {
+        const int32_t id = data[i];
+        if (id >= 0 && id < (int32_t) ls->resident.size()) {
+            if (ls->resident[id]) {
+                ls->n_hit++;
+            } else {
+                ls->n_miss++;
+            }
+        }
+    }
+}
+
+// rebalance the residents against the current ranking. No locks held when
+// entering (queries the hot cache, which locks its own mutex). Applies the
+// evictions/queues the additions under the local mutex, then re-admits the
+// evicted experts to the RAM tier.
+void llama_moe_cache::rebalance() {
+    auto * p = pimpl.get();
+
+    // snapshot each cached layer's current counts and pick its top n_slots
+    struct plan {
+        size_t              li;
+        std::vector<int32_t> desired; // top of the ranking, hottest first
+    };
+    std::vector<plan> plans;
+    plans.reserve(p->layers.size());
+
+    for (size_t li = 0; li < p->layers.size(); ++li) {
+        auto & ls = p->layers[li];
+        std::vector<std::pair<int32_t, uint64_t>> raw;
+        p->hot->layer_counts(ls.pub.il, raw); // locks the hot cache's mutex
+
+        std::sort(raw.begin(), raw.end(), [](const auto & a, const auto & b) {
+            return a.second > b.second || (a.second == b.second && a.first < b.first);
+        });
+
+        plan pl;
+        pl.li = li;
+        pl.desired.reserve(ls.pub.n_slots);
+        for (const auto & [id, cnt] : raw) {
+            if ((int32_t) pl.desired.size() >= ls.pub.n_slots) {
+                break;
+            }
+            pl.desired.push_back(id);
+        }
+        plans.push_back(std::move(pl));
+    }
+
+    // apply: evict residents that left the top set, queue additions
+    std::vector<std::pair<int, int32_t>> evicted;
+    {
+        std::lock_guard<std::mutex> lock(p->mtx);
+        for (auto & pl : plans) {
+            auto & ls = p->layers[pl.li];
+            const int32_t n_slots = ls.pub.n_slots;
+            const int32_t dummy   = n_slots;
+
+            auto in_desired = [&](int32_t e) {
+                return std::find(pl.desired.begin(), pl.desired.end(), e) != pl.desired.end();
+            };
+
+            // evict published residents that are no longer in the top set
+            for (int32_t s = 0; s < n_slots; ++s) {
+                const int32_t e = ls.slot_expert[s];
+                if (e < 0) {
+                    continue;
+                }
+                if (in_desired(e)) {
+                    continue;
+                }
+                ls.slot_expert[s] = -1;
+                ls.resident[e]    = 0;
+                const int32_t v = dummy;
+                ggml_backend_tensor_set(ls.pub.dev_table,  &v, (size_t) e*sizeof(int32_t), sizeof(int32_t));
+                ggml_backend_tensor_set(ls.pub.host_table, &v, (size_t) e*sizeof(int32_t), sizeof(int32_t));
+                evicted.emplace_back(ls.pub.il, e);
+            }
+
+            // queue the additions (in ranking order) for the ticks to drain
+            ls.pending_q.clear();
+            for (int32_t e : pl.desired) {
+                if (ls.resident[e]) {
+                    continue;
+                }
+                // skip ids whose upload is already in flight
+                bool inflight = false;
+                for (int32_t s = 0; s < n_slots; ++s) {
+                    if (ls.slot_target[s] == e) {
+                        inflight = true;
+                        break;
+                    }
+                }
+                if (!inflight) {
+                    ls.pending_q.push_back(e);
+                }
+            }
+        }
+    }
+
+    // the evicted experts are still recent-hot: hand them back to the RAM tier
+    // so they stay mlock'd while VRAM no longer serves them
+    for (const auto & [il, e] : evicted) {
+        p->hot->promote_expert(il, e);
+    }
+}
+
+void llama_moe_cache::tick(int64_t n_content_tokens) {
+    if (!pimpl || !pimpl->activated) {
+        return;
+    }
+    auto * p = pimpl.get();
+
+    // 1) publish completed uploads (sync point: no graph is executing)
+    std::vector<std::pair<int, int32_t>> became_resident;
+    {
+        std::lock_guard<std::mutex> wlk(p->wmtx);
+        std::lock_guard<std::mutex> lk(p->mtx);
+        p->n_content += (uint64_t) std::max<int64_t>(0, n_content_tokens);
+        p->n_ticks++;
+
+        for (const auto & j : p->done) {
+            auto & ls = p->layers[j.layer_idx];
+            ls.slot_expert[j.slot]    = j.expert;
+            ls.slot_target[j.slot]    = -1;
+            ls.resident[j.expert]     = 1;
+
+            const int32_t v = j.slot;
+            ggml_backend_tensor_set(ls.pub.dev_table,  &v, (size_t) j.expert*sizeof(int32_t), sizeof(int32_t));
+            ggml_backend_tensor_set(ls.pub.host_table, &v, (size_t) j.expert*sizeof(int32_t), sizeof(int32_t));
+            became_resident.emplace_back(ls.pub.il, j.expert);
+        }
+        p->done.clear();
+    }
+
+    // residents are served from VRAM now: drop their RAM-tier mlock
+    for (const auto & [il, e] : became_resident) {
+        p->hot->vram_takeover(il, e);
+    }
+
+    // 2) periodic content rebalance against the shared ranking
+    if (p->n_content - p->last_rebalance >= kRebalanceContentTokens) {
+        p->last_rebalance = p->n_content;
+        rebalance();
+    }
+
+    // 3) drain the pending additions, bounded by the global per-tick budget
+    {
+        std::lock_guard<std::mutex> wlk(p->wmtx);
+        std::lock_guard<std::mutex> lk(p->mtx);
+
+        int remaining = p->max_inserts;
+        for (size_t li = 0; li < p->layers.size() && remaining > 0; ++li) {
+            auto & ls = p->layers[li];
+            const int32_t n_slots = ls.pub.n_slots;
+            while (remaining > 0 && !ls.pending_q.empty()) {
+                // find a free slot (published-empty and not uploading)
+                int32_t slot = -1;
+                for (int32_t s = 0; s < n_slots; ++s) {
+                    if (ls.slot_expert[s] < 0 && ls.slot_target[s] < 0) {
+                        slot = s;
+                        break;
+                    }
+                }
+                if (slot < 0) {
+                    break; // no room right now; retried next tick
+                }
+
+                const int32_t e = ls.pending_q.front();
+                ls.pending_q.pop_front();
+                if (ls.resident[e] || e < 0) {
+                    continue; // published meanwhile (or bad id)
+                }
+
+                ls.slot_target[slot] = e;
+                p->todo.push_back({ li, e, slot });
+                remaining--;
+            }
+        }
+        p->wcv.notify_one();
+    }
+
+    if (p->n_ticks % 512 == 0) {
+        uint64_t h = 0, m = 0;
+        for (auto & ls : p->layers) {
+            h += ls.n_hit;
+            m += ls.n_miss;
+        }
+        LLAMA_LOG_INFO("moe-cache: ticks=%" PRIu64 " hits=%" PRIu64 " misses=%" PRIu64 " hit-rate=%.1f%% | per-layer: {",
+                p->n_ticks, h, m, (h + m) ? 100.0*h/(h + m) : 0.0);
+        for (size_t li = 0; li < p->layers.size(); ++li) {
+            auto & ls = p->layers[li];
+            int32_t n_res = 0;
+            for (int32_t e : ls.slot_expert) {
+                n_res += e >= 0;
+            }
+            const uint64_t t = ls.n_hit + ls.n_miss;
+            LLAMA_LOG_CONT("L%d:slots=%d res=%d hit=%.1f%%%s", ls.pub.il, ls.pub.n_slots, n_res,
+                    t ? 100.0*ls.n_hit/t : 0.0, (li + 1 < p->layers.size()) ? ", " : "");
+        }
+        LLAMA_LOG_CONT("}\n");
+    }
+}

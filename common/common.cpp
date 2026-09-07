@@ -1747,6 +1747,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_pin_hot_experts_budget_bytes = params.n_pin_hot_experts_budget_mib * 1024ull * 1024ull;
     cparams.n_pin_hot_experts_stats_interval = params.n_pin_hot_experts_stats_interval;
     cparams.n_pin_hot_experts_decay_tokens   = params.n_pin_hot_experts_decay_tokens;
+    cparams.n_moe_cache_slots        = params.n_moe_cache_slots;
+    cparams.n_moe_cache_budget_bytes = params.n_moe_cache_budget_mib * 1024ull * 1024ull;
+    cparams.n_moe_cache_inserts      = params.n_moe_cache_inserts;
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;

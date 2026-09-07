@@ -2900,6 +2900,58 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.n_pin_hot_experts_decay_tokens = (uint64_t) value;
         }
     ).set_env("LLAMA_ARG_PIN_HOTEXPERTS_DECAY_TOKENS"));
+    add_opt(common_arg(
+        {"--moe-expert-cache"}, "N",
+        string_format(
+            "GPU-resident cache for the HOTTEST MoE experts, layered on top of the hot-expert\n"
+            "cache (--pin-hot-experts, which is required): both tiers are fed by the same\n"
+            "global decayed routing ranking, the VRAM tier copies the top of it so those\n"
+            "expert reads are skipped during decode. N = per-layer capacity override, 0 =\n"
+            "derive per-layer capacities from the routing profile under\n"
+            "--moe-expert-cache-budget-mib (default: %d, 0 = disabled). Activation is lazy:\n"
+            "the cache allocates VRAM after the first prefill so the per-layer slot counts\n"
+            "reflect the actual routing mix (hot layers get many slots, cold layers none)",
+            params.n_moe_cache_slots
+        ),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --moe-expert-cache must be >= 0");
+            }
+            params.n_moe_cache_slots = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-budget-mib"}, "N",
+        string_format(
+            "total device-memory cap, in MiB, for the MoE expert cache across ALL cached\n"
+            "layers (default: %" PRIu64 ", 0 = no cap). The budget is handed to the globally\n"
+            "hottest experts observed during prefill, so per-layer capacity is top-heavy, not\n"
+            "uniform. The device must have this much free VRAM on top of the model",
+            params.n_moe_cache_budget_mib
+        ),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --moe-expert-cache-budget-mib must be >= 0");
+            }
+            params.n_moe_cache_budget_mib = (uint64_t) value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_BUDGET_MIB"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-inserts"}, "N",
+        string_format(
+            "max expert uploads per decode step for the MoE expert cache, GLOBAL across\n"
+            "all cached layers combined (default: %d). This throttles PCIe upload traffic\n"
+            "during activation and ranking shifts, it is not a per-layer knob. Convergence\n"
+            "time ~ total_slots / inserts tokens, so raise it (e.g. 32-64) for a faster fill",
+            params.n_moe_cache_inserts
+        ),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --moe-expert-cache-inserts must be >= 0");
+            }
+            params.n_moe_cache_inserts = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_INSERTS"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

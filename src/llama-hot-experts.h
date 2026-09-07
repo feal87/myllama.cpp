@@ -77,6 +77,40 @@ class llama_hot_expert_cache {
     // true if `expert_id` in layer `il` is currently mlock'd in place
     bool is_pinned(int il, int32_t expert_id) const;
 
+    // ----- GPU-tier (llama_moe_cache) integration ---------------------------
+    // One global ranked set feeds both tiers: the RAM tier mlock's the top of it
+    // in place, the VRAM tier copies the very top into VRAM. These methods hand
+    // the shared decayed ranking to the VRAM tier and let it report residents so
+    // the RAM tier does not waste slots double-covering them.
+
+    // all (expert_id, count) pairs of one layer with count > 0 (unsorted)
+    void layer_counts(int il, std::vector<std::pair<int32_t, uint64_t>> & out) const;
+
+    // hand a global BYTE budget to the globally hottest (layer, expert) pairs:
+    // out[il] = slots for layer il (0 = none). bytes_per_layer[il] = cost of one
+    // expert of layer il; an expert is kept only while its whole cost fits, so
+    // hot layers end up with many slots and cold layers with none. Returns the
+    // number of slots assigned.
+    int32_t assign_global_capacity(uint64_t budget_bytes,
+            const std::vector<size_t> & bytes_per_layer, std::vector<int32_t> & out) const;
+
+    // lifetime content tokens observed (all ubatches, prefill + generation)
+    uint64_t content_tokens() const;
+
+    // experts currently served from VRAM are reported through this query so the
+    // RAM tier skips them (and prefetches nothing for them). Call with null to
+    // clear. The callback runs while the cache mutex is held.
+    using vram_query_fn = bool (*)(void * ud, int il, int32_t expert_id);
+    void set_vram_query(vram_query_fn fn, void * ud);
+
+    // an expert just became VRAM-resident: drop its RAM mlock (the VRAM copy
+    // serves it; the mlock would only waste a RAM slot for a deeper expert)
+    void vram_takeover(int il, int32_t expert_id);
+
+    // an expert was evicted from VRAM: re-admit it to the RAM tier right away
+    // (it is still recent-hot, it must not fall out of mlock protection)
+    void promote_expert(int il, int32_t expert_id);
+
     // Called by llama_context right before every graph compute (one call per
     // ubatch). Advances the ubatch counter and optionally decays the usage
     // counts once every `decay_interval` tokens of content.
@@ -155,6 +189,13 @@ class llama_hot_expert_cache {
     // called once per (layer, selected expert) observation; updates global counts and
     // pins/evicts on the fly against the global top-N set
     void observe_expert(int il, layer_state & ls, int32_t expert_id);
+
+    // pin/evict bookkeeping for one expert at its CURRENT count; shared by
+    // observe_expert (after a fresh count++) and promote_expert (VRAM eviction)
+    void try_promote(int il, layer_state & ls, int32_t expert_id, uint64_t count);
+
+    // is expert_id currently served by the VRAM tier? (caller holds mu)
+    bool is_vram_resident(int il, int32_t expert_id) const;
 
     // -- pinning -------------------------------------------------------------
     void unpin_expert(int il, layer_state & ls, int32_t expert_id);
@@ -240,4 +281,9 @@ class llama_hot_expert_cache {
     uint64_t n_prefetch_bytes    = 0;
     uint64_t n_prefetch_failures = 0;
     uint64_t n_decays            = 0;
+    uint64_t n_content_tokens    = 0;  // lifetime content tokens (all ubatches)
+
+    // VRAM-tier residency query (see the public API docs); guarded by mu
+    vram_query_fn vram_query = nullptr;
+    void *        vram_ud    = nullptr;
 };

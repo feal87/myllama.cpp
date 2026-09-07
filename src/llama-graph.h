@@ -92,6 +92,7 @@ struct llama_cross {
 };
 
 struct llm_graph_params;
+class  llama_moe_cache;
 
 //
 // llm_graph_input
@@ -785,6 +786,7 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_moe_cache        * moe_cache = nullptr; // GPU MoE expert cache (null when disabled)
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1025,6 +1027,7 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_moe_cache        * moe_cache = nullptr; // GPU MoE expert cache (null when disabled)
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

@@ -257,7 +257,7 @@ void llama_hot_expert_cache::observe(int il, const struct ggml_tensor * t) {
                 continue;
             }
             expert_key key{ il, id };
-            if (pinned.count(key) == 0) {
+            if (pinned.count(key) == 0 && !is_vram_resident(il, id)) {
                 add_expert_ranges(ls, id, ranges);
             }
         }
@@ -314,20 +314,26 @@ void llama_hot_expert_cache::resolve_tensors(int il, layer_state & ls) {
 
 void llama_hot_expert_cache::observe_expert(int il, layer_state & ls, int32_t expert_id) {
     expert_key key{ il, expert_id };
+    counts[key]++;  // default-constructs to 0
 
-    uint64_t &     count     = counts[key];  // default-constructs to 0
-    const uint64_t old_count = count;
-    count++;
-    const uint64_t new_count = count;
+    try_promote(il, ls, expert_id, counts[key]);
+}
 
+void llama_hot_expert_cache::try_promote(int il, layer_state & ls, int32_t expert_id, uint64_t count) {
     if (!ls.tensors_are_host || n_pin <= 0 || !llama_mlock::SUPPORTED) {
         return;  // stats-only mode, nothing to pin
     }
 
+    expert_key key{ il, expert_id };
+
+    if (is_vram_resident(il, expert_id)) {
+        return;  // served by the VRAM tier; no mlock needed
+    }
+
     if (pinned.count(key)) {
         // already pinned: keep its ordered-set position up to date
-        pinned_rank.erase({ old_count, il, expert_id });
-        pinned_rank.insert({ new_count, il, expert_id });
+        pinned_rank.erase({ count - 1, il, expert_id });
+        pinned_rank.insert({ count, il, expert_id });
         return;
     }
 
@@ -363,7 +369,7 @@ void llama_hot_expert_cache::observe_expert(int il, layer_state & ls, int32_t ex
     // pinned expert. The munlock of the victim is cheap (no page-in) and stays
     // inline; only the mlock of the newcomer is deferred to the worker.
     const auto coldest = pinned_rank.begin();
-    if (coldest == pinned_rank.end() || new_count <= std::get<0>(*coldest)) {
+    if (coldest == pinned_rank.end() || count <= std::get<0>(*coldest)) {
         return;
     }
 
@@ -401,6 +407,14 @@ void llama_hot_expert_cache::observe_expert(int il, layer_state & ls, int32_t ex
         LLAMA_LOG_DEBUG("%s: pin of layer %d expert %d dropped after evicting %d/%d\n", __func__, il, expert_id,
                         evict_layer, evict_id);
     }
+}
+
+bool llama_hot_expert_cache::is_vram_resident(int il, int32_t expert_id) const {
+    // caller holds mu
+    if (vram_query == nullptr) {
+        return false;
+    }
+    return vram_query(vram_ud, il, expert_id);
 }
 
 size_t llama_hot_expert_cache::expert_row_bytes(const layer_state & ls, int32_t expert_id) const {
@@ -582,6 +596,9 @@ size_t llama_hot_expert_cache::add_expert_ranges(const layer_state &            
 
 void llama_hot_expert_cache::on_ubatch_begin(int64_t n_tokens) {
     n_ubatches++;
+    if (n_tokens > 0) {
+        n_content_tokens += n_tokens;
+    }
 
     // periodic decay of the usage counts: keeps the pin set tracking the recent
     // routing mix instead of lifetime leaders. The clock is content tokens, not
@@ -622,4 +639,98 @@ bool llama_hot_expert_cache::is_pinned(int il, int32_t expert_id) const {
 
     expert_key key{ il, expert_id };
     return pinned.count(key) != 0;
+}
+
+void llama_hot_expert_cache::set_vram_query(vram_query_fn fn, void * ud) {
+    std::lock_guard<std::mutex> lock(mu);
+
+    vram_query = fn;
+    vram_ud    = ud;
+}
+
+uint64_t llama_hot_expert_cache::content_tokens() const {
+    std::lock_guard<std::mutex> lock(mu);
+    return n_content_tokens;
+}
+
+void llama_hot_expert_cache::layer_counts(int il, std::vector<std::pair<int32_t, uint64_t>> & out) const {
+    std::lock_guard<std::mutex> lock(mu);
+
+    out.clear();
+    out.reserve(512);
+    for (const auto & [key, count] : counts) {
+        if (key.layer == il && count > 0) {
+            out.emplace_back(key.expert_id, count);
+        }
+    }
+}
+
+int32_t llama_hot_expert_cache::assign_global_capacity(uint64_t budget_bytes,
+        const std::vector<size_t> & bytes_per_layer, std::vector<int32_t> & out) const {
+    std::lock_guard<std::mutex> lock(mu);
+
+    if (budget_bytes == 0 || counts.empty()) {
+        return 0;
+    }
+
+    // walk the global ranking by count descending; an expert is kept only if its
+    // whole cost still fits in the remaining budget (experts are indivisible)
+    std::vector<std::tuple<uint64_t, int, int32_t>> all;
+    all.reserve(counts.size());
+    for (const auto & [key, count] : counts) {
+        all.emplace_back(count, key.layer, key.expert_id);
+    }
+    std::sort(all.begin(), all.end(), [](const auto & a, const auto & b) {
+        return std::get<0>(a) > std::get<0>(b);
+    });
+
+    int32_t  assigned = 0;
+    uint64_t used     = 0;
+    for (const auto & [count, layer, expert] : all) {
+        if (layer < 0 || layer >= (int) out.size()) {
+            continue;
+        }
+        const size_t cost = bytes_per_layer[layer];
+        if (cost == 0 || used + cost > budget_bytes) {
+            continue; // does not fit; a colder expert that does fit may take its place
+        }
+        out[layer]++;
+        used += cost;
+        assigned++;
+    }
+    return assigned;
+}
+
+void llama_hot_expert_cache::vram_takeover(int il, int32_t expert_id) {
+    std::lock_guard<std::mutex> lock(mu);
+
+    expert_key key{ il, expert_id };
+    if (pinned.count(key) != 0) {
+        unpin_expert(il, layers[il], expert_id);
+    }
+}
+
+void llama_hot_expert_cache::promote_expert(int il, int32_t expert_id) {
+    std::lock_guard<std::mutex> lock(mu);
+
+    layer_state & ls = layers[il];
+    if (!ls.resolved_tensors) {
+        resolve_tensors(il, ls);
+    }
+    if (!ls.tensors_are_host || n_pin <= 0 || !llama_mlock::SUPPORTED) {
+        return;
+    }
+    if (is_vram_resident(il, expert_id)) {
+        return;  // still served from VRAM (race); nothing to re-pin
+    }
+
+    expert_key key{ il, expert_id };
+    auto it = counts.find(key);
+    if (it == counts.end() || it->second == 0) {
+        return;
+    }
+    if (pinned.count(key) != 0 || pin_inflight.count(key) != 0) {
+        return;  // already resident in RAM (or a pin for it is queued)
+    }
+    try_promote(il, ls, expert_id, it->second);
 }

@@ -1641,6 +1641,18 @@ static void ggml_compute_forward_mul_mat_id(
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
+        // llama MoE GPU expert cache: when src[3] is set it is an I32 host table
+        // mapping expert id -> device cache slot, and op_params[0] holds the
+        // "not cached" dummy slot value. Cached experts are served by the
+        // device-side cache chain, so this op skips them and zeroes their dst
+        // rows instead (saving the host-RAM weight reads entirely).
+        const int32_t * moe_tbl   = NULL;
+        int32_t         moe_dummy = 0;
+        if (dst->src[3]) {
+            moe_tbl   = (const int32_t *) dst->src[3]->data;
+            moe_dummy = ggml_get_op_params_i32(dst, 0);
+        }
+
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < n_ids; ++id) {
@@ -1648,9 +1660,26 @@ static void ggml_compute_forward_mul_mat_id(
 
                 assert(i02 >= 0 && i02 < n_as);
 
+                if (moe_tbl && moe_tbl[i02] != moe_dummy) {
+                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                    continue;
+                }
+
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
             }
+        }
+    }
+
+    // MoE routing observation for the llama GPU expert cache: report the routed
+    // ids of every host-resident gate mul_mat_id (fused gate_up or separate
+    // gate). Fired once per node on thread 0 only.
+    {
+        void * moe_obs_ud = NULL;
+        ggml_moe_obs_cb_t moe_obs_cb = ggml_get_moe_obs_callback(&moe_obs_ud);
+        if (ith == 0 && moe_obs_cb &&
+                (strstr(src0->name, "ffn_gate_up_exps") || strstr(src0->name, "ffn_gate_exps"))) {
+            moe_obs_cb(src0->name, ids, moe_obs_ud);
         }
     }
 

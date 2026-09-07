@@ -73,5 +73,11 @@ struct llama_cparams {
     // halve all usage counts every N tokens (0 = disabled, lifetime counts)
     uint64_t n_pin_hot_experts_decay_tokens;
 
+    // GPU-resident MoE expert cache, VRAM tier on top of the hot-expert cache
+    // (see llama-moecache.h; requires n_pin_hot_experts > 0 for its ranking)
+    int32_t  n_moe_cache_slots;        // per-layer capacity override (0 = derive capacities from the routing profile)
+    uint64_t n_moe_cache_budget_bytes; // total device-memory cap across all cached layers (used when slots == 0)
+    int32_t  n_moe_cache_inserts;      // max expert uploads per decode step, across all cached layers (global)
+
     llama_context * ctx_other;
 };

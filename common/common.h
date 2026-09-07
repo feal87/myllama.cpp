@@ -481,6 +481,13 @@ struct common_params {
     // --pin-hot-experts-decay-tokens.
     uint64_t n_pin_hot_experts_decay_tokens = 0;
 
+    // GPU-resident cache for host-offloaded MoE experts, served from VRAM on
+    // decode (0 = disabled). See --moe-expert-cache*. Keep --pin-hot-experts off
+    // while tuning it for a clean A/B (they do not coordinate yet).
+    int32_t  n_moe_cache_slots      = 0;   // cache slots per cached layer (0 = derive from budget)
+    uint64_t n_moe_cache_budget_mib = 0;   // total device-memory cap in MiB (0 = no cap)
+    int32_t  n_moe_cache_inserts    = 2;   // max expert uploads per decode step, across all cached layers
+
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 

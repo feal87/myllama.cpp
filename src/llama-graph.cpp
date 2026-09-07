@@ -5,6 +5,7 @@
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
+#include "llama-moecache.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1493,6 +1494,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    moe_cache        (params.moe_cache),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2167,13 +2169,56 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(cur, "ffn_moe_weighted", il);
     }
 
+    // GPU MoE expert cache (see llama-moecache.h): single-token decode on a
+    // layer whose gate/up/down experts are host-resident and cached in VRAM. A
+    // device-side mul_mat_id chain over the cache tensors serves the cached
+    // expert ids while the CPU chain (host weights) skips them; the two down
+    // projections are summed below, which is exact by construction. Both the
+    // fused gate_up and the separate gate/up layouts are handled. Only engaged
+    // for LLM_FFN_SILU layers whose host activation is the plain swiglu_split
+    // (no swiglu clamp); everything else keeps the stock graph (mc == nullptr).
+    const llama_moe_cache_layer * mc = nullptr;
+    if (moe_cache && n_tokens == 1 && type_op == LLM_FFN_SILU &&
+            !weight_before_ffn && loras->empty() &&
+            !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps_b &&
+            !up_exps_s && !gate_exps_s && !down_exps_s) {
+        bool clamp_free = true;
+        if (il >= 0) {
+            constexpr float eps = 1e-6f;
+            clamp_free = hparams.swiglu_clamp_exp[il] <= eps;
+        }
+        if (clamp_free) {
+            if (gate_up_exps && !gate_exps) {
+                mc = moe_cache->lookup(gate_up_exps); // fused layout
+                if (mc && !mc->fused) {
+                    mc = nullptr;
+                }
+            } else if (gate_exps && up_exps) {
+                mc = moe_cache->lookup(gate_exps);    // separate layout
+                if (mc && mc->fused) {
+                    mc = nullptr;
+                }
+            }
+        }
+    }
+
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
+
+    // the (unweighted) layer input in the shape the expert mul_mat_ids consume;
+    // captured here because `cur` is clobbered by the gate/up results below
+    ggml_tensor * mc_inp = cur;
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
+
+        if (mc) {
+            // host chain: skip the experts served by the VRAM cache (zero dst rows)
+            gate_up->src[3]       = mc->host_table;
+            gate_up->op_params[0] = mc->n_slots;
+        }
 
         if (up_exps_s) {
             cb(gate_up, "ffn_moe_gate_up_scaled", il);
@@ -2194,6 +2239,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
+        if (mc) {
+            up->src[3]       = mc->host_table;
+            up->op_params[0] = mc->n_slots;
+        }
+
         if (up_exps_s) {
             cb(up, "ffn_moe_up_scaled", il);
         }
@@ -2206,6 +2256,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (gate_exps) {
             cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
+
+            if (mc) {
+                cur->src[3]       = mc->host_table;
+                cur->op_params[0] = mc->n_slots;
+            }
         } else {
             cur = up;
         }
@@ -2307,6 +2362,43 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
+
+    if (mc) {
+        experts->src[3]       = mc->host_table;
+        experts->op_params[0] = mc->n_slots;
+
+        // device-side chain over the cached experts, mirroring the host
+        // activation (plain swiglu_split - clamp layers never reach here)
+        ggml_tensor * mc_slot_ids = ggml_get_rows(ctx0, mc->dev_table, selected_experts); // [1, n_expert_used, n_tokens]
+        mc_slot_ids = ggml_reshape_2d(ctx0, mc_slot_ids, selected_experts->ne[0], selected_experts->ne[1]);
+
+        ggml_tensor * mc_act = nullptr;
+        if (mc->fused) {
+            // one fused gate+up mul_mat_id, then split into gate and up views
+            ggml_tensor * mc_gu = ggml_mul_mat_id(ctx0, mc->c_gate, mc_inp, mc_slot_ids); // [n_ff*2, n_expert_used, n_tokens]
+            cb(mc_gu, "ffn_moe_cache_gate_up", il);
+
+            const int64_t mc_n_ff = mc_gu->ne[0] / 2;
+            ggml_tensor * mc_gate = ggml_view_3d(ctx0, mc_gu, mc_n_ff, mc_gu->ne[1], mc_gu->ne[2], mc_gu->nb[1], mc_gu->nb[2], 0);
+            ggml_tensor * mc_up   = ggml_view_3d(ctx0, mc_gu, mc_n_ff, mc_gu->ne[1], mc_gu->ne[2], mc_gu->nb[1], mc_gu->nb[2], mc_n_ff * mc_gu->nb[0]);
+            mc_act = ggml_swiglu_split(ctx0, mc_gate, mc_up);
+        } else {
+            ggml_tensor * mc_gate = ggml_mul_mat_id(ctx0, mc->c_gate, mc_inp, mc_slot_ids); // [n_ff, n_expert_used, n_tokens]
+            ggml_tensor * mc_up   = ggml_mul_mat_id(ctx0, mc->c_up,   mc_inp, mc_slot_ids);
+            cb(mc_gate, "ffn_moe_cache_gate", il);
+            cb(mc_up,   "ffn_moe_cache_up",   il);
+            mc_act = ggml_swiglu_split(ctx0, mc_gate, mc_up);
+        }
+        cb(mc_act, "ffn_moe_cache_swiglu", il);
+
+        ggml_tensor * mc_down = ggml_mul_mat_id(ctx0, mc->c_down, mc_act, mc_slot_ids); // [n_embd, n_expert_used, n_tokens]
+        cb(mc_down, "ffn_moe_cache_down", il);
+
+        // merge: each routed expert is computed on exactly one side, so the sum
+        // is the exact host-only result (up to fp rounding on the cached side)
+        experts = ggml_add(ctx0, experts, mc_down);
+        cb(experts, "ffn_moe_cache_merged", il);
+    }
 
     if (down_exps_s) {
         cb(experts, "ffn_moe_down_scaled", il);

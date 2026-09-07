@@ -417,6 +417,14 @@ extern "C" {
         // session occupy slots after they drifted cold.
         uint64_t n_pin_hot_experts_decay_tokens;
 
+        // GPU-resident cache for host-offloaded (CPU-pinned) MoE expert weights
+        // [EXPERIMENTAL, fused gate_up archs only]. Decode on a host-offloaded
+        // MoE layer is host-RAM-bandwidth bound; this serves the recently
+        // routed experts from VRAM instead. See llama-moecache.h.
+        int32_t  n_moe_cache_slots;        // cache slots per cached layer (0 = derive from budget_bytes)
+        uint64_t n_moe_cache_budget_bytes; // total device-memory cap across all cached layers (0 = no cap)
+        int32_t  n_moe_cache_inserts;      // max expert uploads per decode step, across all cached layers
+
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
