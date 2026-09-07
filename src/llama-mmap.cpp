@@ -616,8 +616,11 @@ struct llama_mmap::impl {
                 }
                 if (!entries.empty() &&
                         !pPrefetchVirtualMemory(GetCurrentProcess(), (ULONG_PTR) entries.size(), entries.data(), 0)) {
-                    LLAMA_LOG_WARN("warning: PrefetchVirtualMemory failed: %s\n",
-                            llama_format_win_err(GetLastError()).c_str());
+                    const DWORD error = GetLastError();
+                    if (error != ERROR_NOT_LOCKED) {
+                        LLAMA_LOG_WARN("warning: PrefetchVirtualMemory failed: %s\n",
+                                llama_format_win_err(error).c_str());
+                    }
                 }
             }
 #else
@@ -675,6 +678,49 @@ size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+
+bool llama_mmap::prefetch(const std::vector<std::pair<const void *, size_t>> & ranges) {
+#if defined(_WIN32) && _WIN32_WINNT >= 0x0602
+    if (ranges.empty()) {
+        return true;
+    }
+
+    using prefetch_virtual_memory_fn = BOOL (WINAPI *) (HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+    static const prefetch_virtual_memory_fn prefetch_virtual_memory = [] {
+        HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+        return kernel32 != nullptr
+            ? reinterpret_cast<prefetch_virtual_memory_fn>(GetProcAddress(kernel32, "PrefetchVirtualMemory"))
+            : nullptr;
+    }();
+    if (prefetch_virtual_memory == nullptr) {
+        return false;
+    }
+
+    std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
+    entries.reserve(ranges.size());
+    for (const auto & range : ranges) {
+        if (range.first == nullptr || range.second == 0) {
+            continue;
+        }
+        WIN32_MEMORY_RANGE_ENTRY entry;
+        entry.VirtualAddress = const_cast<void *>(range.first);
+        entry.NumberOfBytes = (SIZE_T) range.second;
+        entries.push_back(entry);
+    }
+    if (entries.empty() || prefetch_virtual_memory(
+            GetCurrentProcess(), (ULONG_PTR) entries.size(), entries.data(), 0) != FALSE) {
+        return true;
+    }
+
+    // PrefetchVirtualMemory is only a hint. Windows can reject ranges that are
+    // already resident or otherwise not eligible for prefetch; do not turn that
+    // into a warning on every routing event.
+    return GetLastError() == ERROR_NOT_LOCKED;
+#else
+    GGML_UNUSED(ranges);
+    return true;
+#endif
+}
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;
@@ -767,8 +813,11 @@ struct llama_mlock::impl {
 
     static void raw_unlock(void * ptr, size_t len) {
         if (!VirtualUnlock(ptr, len)) {
-            LLAMA_LOG_WARN("warning: failed to VirtualUnlock buffer: %s\n",
-                    llama_format_win_err(GetLastError()).c_str());
+            const DWORD error = GetLastError();
+            if (error != ERROR_NOT_LOCKED) {
+                LLAMA_LOG_WARN("warning: failed to VirtualUnlock buffer: %s\n",
+                        llama_format_win_err(error).c_str());
+            }
         }
     }
 #else

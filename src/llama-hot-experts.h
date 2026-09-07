@@ -122,13 +122,6 @@ class llama_hot_expert_cache {
     void on_topk_tensor(int il, const struct ggml_tensor * t);
     void resolve_tensors(int il, layer_state & ls);
 
-    // mlock() every dense (non-MoE-expert) tensor that lives in host memory
-    // (i.e. did not fit in VRAM) in place, BEFORE any hot expert is pinned,
-    // because dense parts are used on every token (hottest by definition).
-    // Consumes the global budget first, so hot experts only ever get the
-    // leftover budget. Stats-only (no-op) when mlock is unsupported.
-    void lock_dense_parts();
-
     // called once per (layer, selected expert) observation; updates global counts and
     // pins/evicts on the fly against the global top-N set
     void observe_expert(int il, layer_state & ls, int32_t expert_id);
@@ -163,10 +156,9 @@ class llama_hot_expert_cache {
     std::unordered_map<expert_key, pinned_expert, expert_key_hash> pinned;
 
     uint64_t n_eval_calls   = 0;
-    uint64_t n_bytes_locked = 0;  // sum of llama_mlock::size(), i.e. bytes ACTUALLY locked, across all layers
+    uint64_t n_bytes_locked = 0;  // sum of llama_mlock::size() for expert rows
+    uint64_t n_prefetch_calls = 0;
+    uint64_t n_prefetch_bytes = 0;
+    uint64_t n_prefetch_failures = 0;
 
-    // mlock guards keeping the dense (non-MoE-expert) tensors resident. These are
-    // locked once in the constructor and released when the cache is destroyed.
-    std::vector<std::unique_ptr<llama_mlock, mlock_deleter>> dense_locks;
-    uint64_t n_dense_bytes_locked = 0;  // bytes ACTUALLY locked for dense tensors
 };

@@ -61,77 +61,6 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
             __func__);
     }
 
-    // Dense parts are used on every token, so they are the hottest by definition:
-    // mlock all dense tensors that didn't fit in VRAM (i.e. live in host memory)
-    // FIRST, consuming the global budget before any MoE expert is pinned. The
-    // remaining budget is what the hot-expert pin/evict logic may use below.
-    lock_dense_parts();
-    if (llama_mlock::SUPPORTED && n_dense_bytes_locked > 0) {
-        LLAMA_LOG_INFO(
-            "%s: mlocked %.2f MiB of dense (non-MoE) tensors in RAM first (used on every token); "
-            "%.2f MiB of the pin budget remains for hot MoE experts\n",
-            __func__, n_dense_bytes_locked / (1024.0 * 1024.0),
-            (budget_bytes == 0 ? UINT64_MAX : (budget_bytes - n_dense_bytes_locked)) / (1024.0 * 1024.0));
-    } else if (llama_mlock::SUPPORTED) {
-        LLAMA_LOG_INFO("%s: no dense (non-MoE) tensors in host RAM to mlock (all offloaded to VRAM or mlock unsupported)\n",
-                       __func__);
-    }
-}
-
-void llama_hot_expert_cache::lock_dense_parts() {
-    if (!llama_mlock::SUPPORTED) {
-        return;  // stats-only mode, nothing can be locked
-    }
-
-    // A "dense" tensor is any model tensor that is NOT one of the MoE expert
-    // tensors (ffn_*_exps.*). Dense parts are used on every token, so they are
-    // the hottest by definition and must be mlocked before any hot expert.
-    auto is_expert_tensor = [](const std::string & name) -> bool {
-        return name.find("_exps.") != std::string::npos;
-    };
-
-    for (const auto & [name, t] : llama_internal_get_tensor_map(&model)) {
-        if (is_expert_tensor(name)) {
-            continue;  // handled by the hot-expert pin/evict mechanism below
-        }
-        if (!ggml_backend_buffer_is_host(t->buffer) || t->data == nullptr) {
-            continue;  // offloaded to VRAM (did fit) or empty: nothing to lock in RAM
-        }
-
-        const size_t nbytes = ggml_nbytes(t);
-
-        // honor the global budget BEFORE touching memory -- mlock() faults pages
-        // in, so checking after the fact is too late to prevent an OOM. Dense
-        // tensors are locked first, so the remaining budget is what hot experts
-        // may consume afterwards.
-        if (budget_bytes > 0 && n_bytes_locked + nbytes > budget_bytes) {
-            LLAMA_LOG_DEBUG(
-                "%s: skipping dense tensor %s (%zu bytes), would exceed the %.2f MiB pin budget "
-                "(%.2f MiB already locked)\n",
-                __func__, name.c_str(), nbytes, budget_bytes / (1024.0 * 1024.0),
-                n_bytes_locked / (1024.0 * 1024.0));
-            continue;
-        }
-
-        auto lock = std::unique_ptr<llama_mlock, mlock_deleter>(new llama_mlock());
-        lock->init(t->data);
-        lock->grow_to(nbytes);
-
-        const size_t locked = lock->size();
-        if (locked == 0) {
-            continue;
-        }
-        if (locked < nbytes) {
-            LLAMA_LOG_WARN(
-                "%s: only locked %zu/%zu bytes for dense tensor %s (system out of lockable "
-                "memory?)\n",
-                __func__, locked, nbytes, name.c_str());
-        }
-
-        n_bytes_locked += locked;
-        n_dense_bytes_locked += locked;
-        dense_locks.push_back(std::move(lock));
-    }
 }
 
 llama_hot_expert_cache::~llama_hot_expert_cache() {
@@ -158,13 +87,13 @@ void llama_hot_expert_cache::print_stats() const {
     }
 
     LLAMA_LOG_INFO("[pin-hot-experts] obs=%" PRIu64
-                   " | locked=%.2f MiB (dense_in_ram=%.2f MiB + experts=%.2f MiB) | moe_layers=%zu | "
-                   "pinned=%zu/%d (global, N=%d x layers=%zu) | distinct (layer,expert) seen=%zu",
+                   " | experts_locked=%.2f MiB | moe_layers=%zu | "
+                   "pinned=%zu/%d (global, N=%d x layers=%zu) | distinct (layer,expert) seen=%zu"
+                   " | prefetch_calls=%" PRIu64 " bytes=%.2f MiB failures=%" PRIu64,
                    n_eval_calls, n_bytes_locked / (1024.0 * 1024.0),
-                   n_dense_bytes_locked / (1024.0 * 1024.0),
-                   (n_bytes_locked - n_dense_bytes_locked) / (1024.0 * 1024.0),
                    layers.size(), total_pinned, n_pin_total, n_pin,
-                   layers.size(), total_distinct_seen);
+                   layers.size(), total_distinct_seen, n_prefetch_calls,
+                   n_prefetch_bytes / (1024.0 * 1024.0), n_prefetch_failures);
 
     if (!pinned_rank.empty()) {
         LLAMA_LOG_CONT(" | pinned count range=[%" PRIu64 ", %" PRIu64 "]", global_coldest_count, global_hottest_count);
@@ -220,6 +149,42 @@ void llama_hot_expert_cache::on_topk_tensor(int il, const struct ggml_tensor * t
     } else {
         ggml_backend_tensor_get(t, ids.data(), 0, n_ids * sizeof(int32_t));
     }
+
+#if defined(_WIN32)
+    layer_state & prefetch_layer = layers[il];
+    if (!prefetch_layer.resolved_tensors) {
+        resolve_tensors(il, prefetch_layer);
+    }
+    const ggml_tensor * prefetch_tensors[] = {
+        prefetch_layer.t_gate,
+        prefetch_layer.t_up,
+        prefetch_layer.t_down,
+        prefetch_layer.t_gate_up,
+    };
+    std::set<int32_t> unique_ids(ids.begin(), ids.end());
+    std::vector<std::pair<const void *, size_t>> prefetch_ranges;
+    for (const ggml_tensor * w : prefetch_tensors) {
+        if (w == nullptr || !ggml_backend_buffer_is_host(w->buffer) || w->data == nullptr || w->ne[2] <= 0) {
+            continue;
+        }
+        const size_t expert_size = w->nb[2];
+        for (int32_t expert_id : unique_ids) {
+            if (expert_id < 0 || expert_id >= w->ne[2] || is_pinned(il, expert_id)) {
+                continue;
+            }
+            prefetch_ranges.emplace_back((const char *) w->data + expert_id * expert_size, expert_size);
+        }
+    }
+    if (!prefetch_ranges.empty()) {
+        n_prefetch_calls++;
+        for (const auto & range : prefetch_ranges) {
+            n_prefetch_bytes += range.second;
+        }
+        if (!llama_mmap::prefetch(prefetch_ranges)) {
+            n_prefetch_failures++;
+        }
+    }
+#endif
 
     uint64_t eval_calls_now = 0;
     {
