@@ -334,8 +334,6 @@ void llama_memory_hybrid_idx::set_input_qsa(
     std::vector<int32_t> order;
     std::vector<int32_t> rank;
 
-    std::fill(dst_blk_pos, dst_blk_pos + 4*n_blocks*n_ns, 0);
-
     for (int64_t s = 0; s < n_ns; ++s) {
         // ubatch index s*n_tps belongs to this stream; ask which cells array it uses
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
@@ -343,8 +341,6 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
         int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
         int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
-
-        std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
 
         bid_idx  .clear();
         bid_cell .clear();
@@ -360,6 +356,9 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
         const bool one_seq = n_seq_present <= 1;
 
+        // with one sequence every occupied cell belongs to this stream, so the seq checks in the bias loops below are redundant
+        const bool need_seq = !one_seq;
+
         // a cell no block covers needs its own -inf, which a per-block bias cannot carry
         // every cache path keeps the position below the cell window, so this stays false
         bool oor = false;
@@ -370,7 +369,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
         auto group_cells = [&]() {
             // -1 means no usable block: an incomplete or short group cannot be pooled
-            std::fill(blk_of.begin(),   blk_of.end(),   -1);
+            // blk_of is not reset here: every cell is rewritten below after group_cells
             std::fill(cell_grp.begin(), cell_grp.end(), -1);
             std::fill(grp_head.begin(), grp_head.end(), -1);
 
@@ -526,6 +525,15 @@ void llama_memory_hybrid_idx::set_input_qsa(
             cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
         }
 
+        // pooled rows are fully written above, so only the tail rows (the dead block and the
+        // rows no cell maps to) need zeros; zero those instead of every row up front
+        std::fill(cur_blk_cells + n_bid*r, cur_blk_cells + n_blocks*r, 0);
+
+        for (int64_t sec = 0; sec < 4; ++sec) {
+            std::fill(dst_blk_pos + sec*(n_blocks*n_ns) + s*n_blocks + n_bid,
+                      dst_blk_pos + sec*(n_blocks*n_ns) + s*n_blocks + n_blocks, 0);
+        }
+
         for (int64_t ii = 0; ii < n_tps; ++ii) {
             const int64_t      i      = s*n_tps + ii;
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
@@ -564,7 +572,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 float * cur_blk_bias = dst_bias + i*n_blocks;
 
                 for (int64_t b = 0; b < n_blocks; ++b) {
-                    if (b >= n_bid || !cells.seq_has((uint32_t) bid_cell[b], seq_id)) {
+                    if (b >= n_bid || (need_seq && !cells.seq_has((uint32_t) bid_cell[b], seq_id))) {
                         cur_blk_bias[b] = -INFINITY;
                         continue;
                     }
@@ -588,7 +596,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
             for (int64_t j = 0; j < n_kv; ++j) {
                 float v = -INFINITY;
 
-                if (!cells.is_empty(j) && cells.seq_has(j, seq_id)) {
+                if (!cells.is_empty(j) && (!need_seq || cells.seq_has(j, seq_id))) {
                     const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
 
                     if (idx <= q) {

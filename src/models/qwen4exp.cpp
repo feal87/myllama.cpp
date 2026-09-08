@@ -1466,7 +1466,8 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         // an EOS in the window resets everything at or before it
         // a missing predecessor (before the sequence start, or no cached cell) reads as EOS
         // the EOS of the token itself does not cut its own context, as in the reference
-        std::vector<int64_t> ctx(n_gram);
+        // stack buffer: n_gram is bounded to LLAMA_MAX_PLE_NGRAM by load_arch_hparams
+        int64_t ctx[LLAMA_MAX_PLE_NGRAM];
         ctx[0] = tok_of(i);
         bool cut = false;
         for (int64_t s = 1; s < n_gram; ++s) {
