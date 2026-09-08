@@ -103,6 +103,12 @@ llama_hot_expert_cache::~llama_hot_expert_cache() {
     if (pin_worker.joinable()) {
         pin_worker.join();
     }
+
+    if (obs_stage_buf != nullptr) {
+        ggml_backend_buffer_free(obs_stage_buf);
+        obs_stage_buf = nullptr;
+        obs_stage     = nullptr;
+    }
 }
 
 void llama_hot_expert_cache::print_stats() {
@@ -111,7 +117,7 @@ void llama_hot_expert_cache::print_stats() {
     // rank keys are refreshed lazily; make the reported count range exact
     rebuild_pinned_rank();
 
-    const size_t   total_distinct_seen = counts.size();
+    const size_t   total_distinct_seen = (size_t) n_distinct;
     const size_t   total_pinned        = pinned.size();
     const uint64_t total_routed        = n_route_hit + n_route_miss;
 
@@ -293,11 +299,10 @@ void llama_hot_expert_cache::observe(int il, const struct ggml_tensor * t) {
             e = std::unique(b, e);
             for (int32_t * p = b; p != e; ++p) {
                 const int32_t id = *p;
-                if (id < 0) {
+                if (id < 0 || id >= (int32_t) ls.n_experts) {
                     continue;
                 }
-                expert_key key{ il, id };
-                if (pinned.count(key) != 0) {
+                if ((ls.pin_state[(size_t) id] & PIN_RESIDENT) != 0) {
                     continue;  // already resident: nothing to read ahead
                 }
                 add_expert_ranges(ls, id, prefetch_ranges);
@@ -316,46 +321,143 @@ void llama_hot_expert_cache::observe(int il, const struct ggml_tensor * t) {
     }
 }
 
-void llama_hot_expert_cache::observe_decode(const std::vector<ggml_tensor *> & topk) {
-    // one pass over the layers of the decode graph that just finished computing:
-    // read each layer's routed top-k ids from its kept-alive graph tensor
-    // (registered and flagged GGML_TENSOR_FLAG_OUTPUT by llama_context at graph
-    // build time) and feed the shared ranking exactly as the old mid-graph
-    // observation did - without chunking the decode graph at every MoE layer and
-    // without walking every node through the eval callback
+void llama_hot_expert_cache::observe_decode_begin(const std::vector<ggml_tensor *> & topk, ggml_backend_sched_t sched) {
+    // plan the staged readback: which layers to observe and where each layer's
+    // ids go in the shared scratch. One pass over the layers of the decode graph
+    // that just finished computing; the gates mirror what the old single-pass
+    // observe_decode() applied (valid tensor, single token, experts on host).
+    obs_off.assign(topk.size(), -1);
+    obs_cnt.assign(topk.size(), 0);
+    obs_ids = nullptr;
+
+    size_t total = 0;
     for (int il = 0; il < (int) topk.size(); ++il) {
         const ggml_tensor * t = topk[il];
         if (t == nullptr || t->type != GGML_TYPE_I32) {
             continue;
         }
-
-        const int64_t n_expert_used = t->ne[0];
-        const int64_t n_tokens      = t->ne[1];
-        const int64_t n_ids         = n_expert_used * n_tokens;
-
-        if (n_ids <= 0 || n_tokens != 1) {
+        const int64_t n_ids = t->ne[0] * t->ne[1];
+        if (n_ids <= 0 || t->ne[1] != 1) {
             continue;  // decode graphs route a single token per ubatch
         }
 
         layer_state & ls = layers[il];
-        if (!ls.resolved_tensors) {
-            resolve_tensors(il, ls);
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (!ls.resolved_tensors) {
+                resolve_tensors(il, ls);
+            }
         }
         if (!ls.tensors_are_host) {
             continue;  // experts offloaded to a device: nothing to count or pin
         }
 
-        // reuse the per-observation scratch: this runs once per layer per decode
-        // ubatch on the decode thread, so per-call allocation is pure churn
-        obs_scratch.resize(n_ids);
-        int32_t * ids = obs_scratch.data();
-        if (ggml_backend_buffer_is_host(t->buffer)) {
-            std::memcpy(ids, t->data, n_ids * sizeof(int32_t));
-        } else {
-            ggml_backend_tensor_get(t, ids, 0, n_ids * sizeof(int32_t));
-        }
+        obs_off[il] = (int) total;
+        obs_cnt[il] = (int) n_ids;
+        total += (size_t) n_ids;
+    }
 
-        std::lock_guard<std::mutex> lock(mu);
+    if (total == 0) {
+        return;
+    }
+
+    // stage the routed ids: one async D2H copy per device top-k tensor, queued
+    // on its backend stream right behind the decode graph, plus direct copies
+    // for host tensors (their compute already finished). The scratch is pinned
+    // host memory when the device exposes a host buft, so the copies are truly
+    // async (async D2H into pageable memory blocks until each copy completes,
+    // which serialized the whole readback behind the decode graph); llama_context
+    // syncs once after this, so the whole ubatch costs a single device sync.
+    const size_t bytes_total = total * sizeof(int32_t);
+
+    // size pinned staging from the first device-resident tensor's backend
+    ggml_backend_t stage_backend = nullptr;
+    if (sched) {
+        for (int il = 0; il < (int) topk.size() && stage_backend == nullptr; ++il) {
+            if (obs_off[il] < 0) {
+                continue;
+            }
+            const ggml_tensor * t = topk[il];
+            if (ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            stage_backend = ggml_backend_sched_get_tensor_backend(sched, const_cast<ggml_tensor *>(t));
+        }
+    }
+
+    int32_t * dst = nullptr;
+    if (stage_backend && ensure_obs_stage(stage_backend, bytes_total)) {
+        dst = (int32_t *) obs_stage;
+    } else {
+        obs_scratch.resize(total);
+        dst = obs_scratch.data();
+    }
+    obs_ids = dst;
+
+    for (int il = 0; il < (int) topk.size(); ++il) {
+        if (obs_off[il] < 0) {
+            continue;
+        }
+        const ggml_tensor * t = topk[il];
+        int32_t * dst_il = dst + obs_off[il];
+        const size_t nbytes = (size_t) obs_cnt[il] * sizeof(int32_t);
+        if (ggml_backend_buffer_is_host(t->buffer)) {
+            std::memcpy(dst_il, t->data, nbytes);
+            continue;
+        }
+        ggml_backend_t backend = sched ? ggml_backend_sched_get_tensor_backend(sched, const_cast<ggml_tensor *>(t)) : nullptr;
+        if (backend) {
+            ggml_backend_tensor_get_async(backend, t, dst_il, 0, nbytes);
+        } else {
+            ggml_backend_tensor_get(t, dst_il, 0, nbytes);
+        }
+    }
+}
+
+bool llama_hot_expert_cache::ensure_obs_stage(ggml_backend_t backend, size_t bytes) {
+    if (obs_stage_buf != nullptr && obs_stage_cap >= bytes) {
+        return true;
+    }
+
+    ggml_backend_dev_t           dev       = ggml_backend_get_device(backend);
+    ggml_backend_buffer_type_t   host_buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    if (host_buft == nullptr) {
+        return false;
+    }
+
+    if (obs_stage_buf != nullptr) {
+        ggml_backend_buffer_free(obs_stage_buf);
+        obs_stage_buf = nullptr;
+        obs_stage     = nullptr;
+    }
+    obs_stage_buf = ggml_backend_buft_alloc_buffer(host_buft, bytes);
+    if (obs_stage_buf == nullptr) {
+        obs_stage_cap = 0;
+        return false;
+    }
+    obs_stage     = ggml_backend_buffer_get_base(obs_stage_buf);
+    obs_stage_cap = bytes;
+    return true;
+}
+
+void llama_hot_expert_cache::observe_decode_finish() {
+    if (obs_ids == nullptr) {
+        return;  // nothing was staged (no observed layer)
+    }
+
+    const int32_t * ids_all = obs_ids;
+
+    // one lock for the whole ubatch (the old per-layer lock/unlock was 48
+    // uncontended acquisitions per decode token on the same mutex)
+    std::lock_guard<std::mutex> lock(mu);
+
+    for (int il = 0; il < (int) obs_off.size(); ++il) {
+        if (obs_off[il] < 0) {
+            continue;
+        }
+        layer_state & ls = layers[il];  // resolved in observe_decode_begin()
+        const int32_t * ids = ids_all + obs_off[il];
+        const int n_ids = obs_cnt[il];
 
         n_eval_calls++;
 
@@ -370,15 +472,17 @@ void llama_hot_expert_cache::observe_decode(const std::vector<ggml_tensor *> & t
         // everything else stays empty and reads as "not served from VRAM"
         const bool vram_tier_layer = !vram_flags.empty();
 
-        auto is_served = [&](int32_t id) {
-            return (size_t) id < vram_flags.size() && vram_flags[(size_t) id] != 0;
-        };
+        // flat per-expert tables, indexed by routed expert id
+        const int   n_experts = (int) ls.n_experts;
+        uint64_t *  counts    = ls.counts.data();
+        uint8_t *   pin_state = ls.pin_state.data();
 
-        for (int32_t id : obs_scratch) {
-            if (id < 0) {
+        for (int k = 0; k < n_ids; ++k) {
+            const int32_t id = ids[k];
+            if (id < 0 || id >= n_experts) {
                 continue;
             }
-            const bool served = is_served(id);
+            const bool served = (size_t) id < vram_flags.size() && vram_flags[(size_t) id] != 0;
             if (served) {
                 // decode-time VRAM-tier hit: the VRAM copy served the expert
                 // and this host read was skipped
@@ -386,7 +490,7 @@ void llama_hot_expert_cache::observe_decode(const std::vector<ggml_tensor *> & t
             } else {
                 // realized RAM-tier hit rate: a routed expert is a hit when its
                 // pages are already mlock'd at routing time
-                if (pinned.count(expert_key{ il, id }) != 0) {
+                if ((pin_state[id] & PIN_RESIDENT) != 0) {
                     n_route_hit++;
                 } else {
                     n_route_miss++;
@@ -395,7 +499,17 @@ void llama_hot_expert_cache::observe_decode(const std::vector<ggml_tensor *> & t
                     ls.n_vram_miss++;
                 }
             }
-            observe_expert(il, ls, id, served);
+            uint64_t & c = counts[id];
+            if (c == 0) {
+                n_distinct++;  // first route of this (layer, expert)
+            }
+            c++;
+            if (!served) {
+                // try_promote() returns immediately for VRAM-resident experts, so
+                // skipping the call here is behaviour-identical and keeps the
+                // hot path on the flat tables
+                try_promote(il, ls, id, c, false, true);
+            }
         }
     }
 }
@@ -424,6 +538,12 @@ void llama_hot_expert_cache::resolve_tensors(int il, layer_state & ls) {
     const ggml_tensor * repr = ls.t_down;
     ls.tensors_are_host      = ggml_backend_buffer_is_host(repr->buffer);
 
+    // size the flat per-expert tables (usage counts + pin state mirrors). Routed
+    // expert ids are validated against this range on the hot path
+    ls.n_experts = (uint32_t) repr->ne[2];
+    ls.counts.assign(ls.n_experts, 0);
+    ls.pin_state.assign(ls.n_experts, 0);
+
     if (!ls.tensors_are_host) {
         LLAMA_LOG_WARN(
             "%s: layer %d's MoE experts are not in host memory (offloaded to a "
@@ -432,11 +552,17 @@ void llama_hot_expert_cache::resolve_tensors(int il, layer_state & ls) {
     }
 }
 
-void llama_hot_expert_cache::observe_expert(int il, layer_state & ls, int32_t expert_id, bool vram_resident) {
-    expert_key key{ il, expert_id };
-    counts[key]++;  // default-constructs to 0
-
-    try_promote(il, ls, expert_id, counts[key], vram_resident, true);
+uint64_t llama_hot_expert_cache::count_of(int il, int32_t expert_id) const {
+    // caller holds mu. Cold path: any layer may be queried, resolved or not
+    const auto it = layers.find(il);
+    if (it == layers.end() || !it->second.resolved_tensors) {
+        return 0;
+    }
+    const layer_state & ls = it->second;
+    if (expert_id < 0 || (uint32_t) expert_id >= ls.n_experts) {
+        return 0;
+    }
+    return ls.counts[(size_t) expert_id];
 }
 
 void llama_hot_expert_cache::try_promote(int il, layer_state & ls, int32_t expert_id, uint64_t count, bool vram_resident,
@@ -449,14 +575,13 @@ void llama_hot_expert_cache::try_promote(int il, layer_state & ls, int32_t exper
         return;  // served by the VRAM tier; no mlock needed
     }
 
-    expert_key key{ il, expert_id };
-    if (pinned.count(key)) {
-        return;  // already pinned; rank keys are refreshed lazily (see rebuild_pinned_rank)
+    // the flat pin-state mirror is the hot-path membership check (the pin map
+    // and the inflight set below are the heavyweight containers)
+    if (expert_id < 0 || (uint32_t) expert_id >= ls.n_experts || (pin_state_at(ls, expert_id) & (PIN_RESIDENT | PIN_INFLIGHT)) != 0) {
+        return;  // already pinned, or a pin for it is already queued
     }
 
-    if (pin_inflight.count(key)) {
-        return;  // a pin for this expert is already queued
-    }
+    expert_key key{ il, expert_id };
 
     // build the job up front so the budget/slot checks below are exact and the
     // takeover never needs a rollback (nothing is evicted before the job is sure
@@ -517,8 +642,7 @@ void llama_hot_expert_cache::try_promote(int il, layer_state & ls, int32_t exper
             pinned_rank.erase(it);  // ghost entry from a VRAM takeover; drop it
             continue;
         }
-        const auto    cit = counts.find(expert_key{ mem_layer, mem_id });
-        const uint64_t true_count = cit == counts.end() ? 0 : cit->second;
+        const uint64_t true_count = count_of(mem_layer, mem_id);
         if (key_count != true_count) {
             pinned_rank.erase(it);  // stale-low key: heal it and re-check the bottom
             pinned_rank.insert({ true_count, mem_layer, mem_id });
@@ -628,6 +752,9 @@ bool llama_hot_expert_cache::enqueue_pin(const pin_job & job) {
 
     pin_queue.push_back(job);
     pin_inflight.insert(key);
+    if (job.expert_id >= 0 && job.expert_id < (int32_t) layers[job.il].n_experts) {
+        pin_state_at(layers[job.il], job.expert_id) |= PIN_INFLIGHT;
+    }
     n_bytes_reserved += job.expected_bytes;
     pin_cv.notify_one();
     return true;
@@ -724,6 +851,11 @@ void llama_hot_expert_cache::pin_worker_main() {
         expert_key key{ job.il, job.expert_id };
         pin_inflight.erase(key);
 
+        layer_state & wls = layers[job.il];
+        if (job.expert_id >= 0 && (uint32_t) job.expert_id < wls.n_experts) {
+            wls.pin_state[(size_t) job.expert_id] &= (uint8_t) ~PIN_INFLIGHT;
+        }
+
         if (pe.nbytes_locked == 0 || syscall_error) {
             n_pin_failures++;
             LLAMA_LOG_DEBUG("%s: async pin of layer %d expert %d locked nothing\n", __func__, job.il, job.expert_id);
@@ -734,18 +866,17 @@ void llama_hot_expert_cache::pin_worker_main() {
 
         // the expert's count may have kept climbing (or been decayed) since the
         // job was queued: insert its rank entry with the current value
-        uint64_t c = 0;
-        auto     it = counts.find(key);
-        if (it != counts.end()) {
-            c = it->second;
-        }
+        const uint64_t c = count_of(job.il, job.expert_id);
         pinned.emplace(key, std::move(pe));
+        if (job.expert_id >= 0 && (uint32_t) job.expert_id < wls.n_experts) {
+            wls.pin_state[(size_t) job.expert_id] |= PIN_RESIDENT;
+        }
         pinned_rank.insert({ c, job.il, job.expert_id });
         evicted_at.erase(key);  // pinned again: the grace bookkeeping is moot
     }
 }
 
-void llama_hot_expert_cache::unpin_expert(int il, layer_state & /*ls*/, int32_t expert_id) {
+void llama_hot_expert_cache::unpin_expert(int il, layer_state & ls, int32_t expert_id) {
     expert_key key{ il, expert_id };
     auto       it = pinned.find(key);
     if (it == pinned.end()) {
@@ -754,6 +885,9 @@ void llama_hot_expert_cache::unpin_expert(int il, layer_state & /*ls*/, int32_t 
 
     n_bytes_locked -= it->second.nbytes_locked;
     pinned.erase(it);  // pinned_expert's destructor releases the mlock guards
+    if (expert_id >= 0 && (uint32_t) expert_id < ls.n_experts) {
+        ls.pin_state[(size_t) expert_id] &= (uint8_t) ~PIN_RESIDENT;
+    }
 }
 
 void llama_hot_expert_cache::rebuild_pinned_rank() {
@@ -761,12 +895,7 @@ void llama_hot_expert_cache::rebuild_pinned_rank() {
     pinned_rank.clear();
     for (const auto & kv : pinned) {
         const expert_key & key = kv.first;
-        uint64_t          c    = 0;
-        auto              it   = counts.find(key);
-        if (it != counts.end()) {
-            c = it->second;
-        }
-        pinned_rank.insert({ c, key.layer, key.expert_id });
+        pinned_rank.insert({ count_of(key.layer, key.expert_id), key.layer, key.expert_id });
     }
 }
 
@@ -819,13 +948,17 @@ void llama_hot_expert_cache::on_ubatch_begin(int64_t n_tokens) {
 void llama_hot_expert_cache::decay_counts() {
     std::lock_guard<std::mutex> lock(mu);
 
-    for (auto it = counts.begin(); it != counts.end(); ++it) {
-        const uint64_t old_count = it->second;
-        const uint64_t new_count = (old_count + 1) / 2;  // floor at 1, halves everything else
-        if (new_count == old_count) {
-            continue;  // count == 1: nothing left to decay
+    for (auto & [il, ls] : layers) {
+        (void) il;
+        if (!ls.resolved_tensors) {
+            continue;
         }
-        it->second = new_count;
+        for (uint64_t & c : ls.counts) {
+            const uint64_t new_count = (c + 1) / 2;  // floor at 1, halves everything else
+            if (new_count != c) {
+                c = new_count;
+            }
+        }
     }
 
     // the halving changed the counts the pinned experts are ranked by: rebuild
@@ -838,8 +971,15 @@ void llama_hot_expert_cache::decay_counts() {
 bool llama_hot_expert_cache::is_pinned(int il, int32_t expert_id) const {
     std::lock_guard<std::mutex> lock(mu);
 
-    expert_key key{ il, expert_id };
-    return pinned.count(key) != 0;
+    const auto it = layers.find(il);
+    if (it == layers.end() || !it->second.resolved_tensors) {
+        return false;
+    }
+    const layer_state & ls = it->second;
+    if (expert_id < 0 || (uint32_t) expert_id >= ls.n_experts) {
+        return false;
+    }
+    return (ls.pin_state[(size_t) expert_id] & PIN_RESIDENT) != 0;
 }
 
 void llama_hot_expert_cache::set_vram_query(vram_query_fn fn, void * ud) {
@@ -871,10 +1011,16 @@ void llama_hot_expert_cache::all_counts(std::vector<std::tuple<int, int32_t, uin
     std::lock_guard<std::mutex> lock(mu);
 
     out.clear();
-    out.reserve(counts.size());
-    for (const auto & [key, count] : counts) {
-        if (count > 0) {
-            out.emplace_back(key.layer, key.expert_id, count);
+    out.reserve(n_distinct);
+    for (const auto & [il, ls] : layers) {
+        if (!ls.resolved_tensors) {
+            continue;
+        }
+        for (uint32_t id = 0; id < ls.n_experts; ++id) {
+            const uint64_t c = ls.counts[(size_t) id];
+            if (c > 0) {
+                out.emplace_back(il, (int32_t) id, c);
+            }
         }
     }
 }
@@ -884,7 +1030,7 @@ int32_t llama_hot_expert_cache::assign_global_capacity(uint64_t budget_bytes,
         const std::vector<size_t> & fixed_bytes, std::vector<int32_t> & out) const {
     std::lock_guard<std::mutex> lock(mu);
 
-    if (budget_bytes == 0 || counts.empty()) {
+    if (budget_bytes == 0 || n_distinct == 0) {
         return 0;
     }
 
@@ -893,9 +1039,17 @@ int32_t llama_hot_expert_cache::assign_global_capacity(uint64_t budget_bytes,
     // Each layer also pays its one-time fixed cost (dummy slot + tables) when
     // its first slot is granted, so the final layout always fits the budget.
     std::vector<std::tuple<uint64_t, int, int32_t>> all;
-    all.reserve(counts.size());
-    for (const auto & [key, count] : counts) {
-        all.emplace_back(count, key.layer, key.expert_id);
+    all.reserve(n_distinct);
+    for (const auto & [il, ls] : layers) {
+        if (!ls.resolved_tensors) {
+            continue;
+        }
+        for (uint32_t id = 0; id < ls.n_experts; ++id) {
+            const uint64_t c = ls.counts[(size_t) id];
+            if (c > 0) {
+                all.emplace_back(c, il, (int32_t) id);
+            }
+        }
     }
     std::sort(all.begin(), all.end(), [](const auto & a, const auto & b) {
         return std::get<0>(a) > std::get<0>(b);
@@ -946,14 +1100,16 @@ void llama_hot_expert_cache::promote_expert(int il, int32_t expert_id) {
     if (is_vram_resident(il, expert_id)) {
         return;  // still served from VRAM (race); nothing to re-pin
     }
-
-    expert_key key{ il, expert_id };
-    auto it = counts.find(key);
-    if (it == counts.end() || it->second == 0) {
+    if (expert_id < 0 || (uint32_t) expert_id >= ls.n_experts) {
         return;
     }
-    if (pinned.count(key) != 0 || pin_inflight.count(key) != 0) {
+
+    const uint64_t c = ls.counts[(size_t) expert_id];
+    if (c == 0) {
+        return;
+    }
+    if ((ls.pin_state[(size_t) expert_id] & (PIN_RESIDENT | PIN_INFLIGHT)) != 0) {
         return;  // already resident in RAM (or a pin for it is queued)
     }
-    try_promote(il, ls, expert_id, it->second, false, false);
+    try_promote(il, ls, expert_id, c, false, false);
 }

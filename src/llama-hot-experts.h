@@ -63,6 +63,7 @@
 // graph callback. Evictions stay inline: munlock is cheap (no page-in). Syscalls
 // slower than lock_slow_us are counted as "slow" in the stats output.
 
+#include "ggml-backend.h"
 #include "ggml.h"
 #include "llama-mmap.h"
 
@@ -124,8 +125,17 @@ class llama_hot_expert_cache {
     // build time and keeps them alive (GGML_TENSOR_FLAG_OUTPUT), so their routed
     // ids are read here, after the compute, instead of mid-graph through the eval
     // callback - which chunked and synchronized the decode graph at every MoE
-    // layer. Runs once per decode ubatch, before the VRAM tier's tick.
-    void observe_decode(const std::vector<ggml_tensor *> & topk);
+    // layer. The readback is staged in two steps so the whole ubatch costs one
+    // device sync instead of one per layer:
+    //   observe_decode_begin()  issue one async D2H copy per device top-k tensor
+    //                            (queued on its backend stream right behind the
+    //                            decode graph); host tensors are copied directly.
+    //                            llama_context then calls ggml_backend_sched_synchronize()
+    //   observe_decode_finish()  rank the staged ids (one lock for the whole
+    //                            ubatch, flat per-layer counters/bitmaps)
+    // Runs once per decode ubatch, before the VRAM tier's tick.
+    void observe_decode_begin(const std::vector<ggml_tensor *> & topk, ggml_backend_sched_t sched);
+    void observe_decode_finish();
 
     // true if `expert_id` in layer `il` is currently mlock'd in place
     bool is_pinned(int il, int32_t expert_id) const;
@@ -235,11 +245,25 @@ class llama_hot_expert_cache {
         bool tensors_are_host = false;  // false => experts live on a non-CPU backend, pinning is a no-op
         bool resolved_tensors = false;
 
+        // number of experts (ne[2] of the layer's expert tensors); the flat
+        // per-expert tables below are sized to it in resolve_tensors()
+        uint32_t n_experts = 0;
+        // per-expert usage count, indexed by expert id (hot path of the ranking)
+        std::vector<uint64_t> counts;
+        // per-expert pin bookkeeping mirror, indexed by expert id: bit 0 =
+        // mlock'd resident (pinned map), bit 1 = pin job queued/in flight
+        // (pin_inflight set). Mirrors are updated at the same funnel points as
+        // their maps (enqueue_pin, pin_worker_main, unpin_expert) so the hot
+        // path never touches the hash containers
+        std::vector<uint8_t> pin_state;
+
         // decode-time VRAM-tier hit/miss of this layer (see vram_stats()); updated
         // by observe() only while the VRAM tier serves this layer
         uint64_t n_vram_hit  = 0;
         uint64_t n_vram_miss = 0;
     };
+
+    enum : uint8_t { PIN_RESIDENT = 1, PIN_INFLIGHT = 2 };
 
     // -- tuning constants ----------------------------------------------------
     // an mlock syscall slower than this (us) is counted as a stall in the stats;
@@ -270,19 +294,16 @@ class llama_hot_expert_cache {
 
     void resolve_tensors(int il, layer_state & ls);
 
-    // called once per (layer, selected expert) observation; updates global counts and
-    // pins/evicts on the fly against the global top-N set
-    void observe_expert(int il, layer_state & ls, int32_t expert_id, bool vram_resident);
-
-    // pin/evict bookkeeping for one expert at its CURRENT count; shared by
-    // observe_expert (after a fresh count++) and promote_expert (VRAM eviction).
-    // vram_resident is the result of this layer's residency snapshot, so the
-    // hot path never re-queries the VRAM tier per expert. apply_hysteresis is
-    // true on the routing path: full-set takeovers then need takeover_min_lead
-    // and the challenger cannot return within evict_grace_tokens of its own
-    // eviction, so count noise cannot swap two near-equal experts back and
-    // forth. The VRAM eviction handoff (promote_expert) passes false: that
-    // decision was already made on a full set recompute and must stay prompt
+    // pin/evict bookkeeping for one expert at its CURRENT count; shared by the
+    // decode ranking loop (observe_decode_finish, after a fresh count++) and
+    // promote_expert (VRAM eviction). vram_resident is the result of this
+    // layer's residency snapshot, so the hot path never re-queries the VRAM
+    // tier per expert. apply_hysteresis is true on the routing path: full-set
+    // takeovers then need takeover_min_lead and the challenger cannot return
+    // within evict_grace_tokens of its own eviction, so count noise cannot swap
+    // two near-equal experts back and forth. The VRAM eviction handoff
+    // (promote_expert) passes false: that decision was already made on a full
+    // set recompute and must stay prompt
     void try_promote(int il, layer_state & ls, int32_t expert_id, uint64_t count, bool vram_resident,
                      bool apply_hysteresis);
 
@@ -291,6 +312,22 @@ class llama_hot_expert_cache {
 
     // -- pinning -------------------------------------------------------------
     void unpin_expert(int il, layer_state & ls, int32_t expert_id);
+
+    // (mu held) flat per-expert state of a resolved layer. `ls` must be resolved
+    // and `expert_id` in [0, n_experts) - all callers guarantee this. These are
+    // the only read/write points of the flattened counters/bitmaps, so the rest
+    // of the code never indexes the vectors by hand
+    static uint64_t & count_at(layer_state & ls, int32_t expert_id) {
+        return ls.counts[(size_t) expert_id];
+    }
+    static uint8_t & pin_state_at(layer_state & ls, int32_t expert_id) {
+        return ls.pin_state[(size_t) expert_id];
+    }
+
+    // (mu held) usage count of (il, expert_id) for cold paths (rank rebuild,
+    // VRAM handoff) that may not hold a resolved layer_state reference; 0 when
+    // the layer was never resolved
+    uint64_t count_of(int il, int32_t expert_id) const;
 
     // rebuild pinned_rank from the current counts (caller holds mu). Called at
     // decay boundaries and in the stats report: updating one ordered-set key per
@@ -360,20 +397,44 @@ class llama_hot_expert_cache {
     const bool     track_rank;       // rank feeds pinning/VRAM tier; false = prefetch-only mode
     uint64_t       n_tokens_seen = 0;  // tokens since the last decay
     int64_t        n_tokens_cur  = 0;  // tokens of the ubatch being computed (ask-phase gate)
-
-    // per-observation scratch, reused instead of per-call allocation: observe()
+    // per-observation scratch, reused instead of per-call allocation: observation
     // runs once per layer per ubatch on the compute thread, so nothing here is
     // shared across threads (ids are read on the compute thread, the residency
     // flags and prefetch ranges under mu)
-    std::vector<int32_t>                                 obs_scratch;      // routed expert ids of the ubatch
+    std::vector<int32_t>                                 obs_scratch;      // routed expert ids of the ubatch (pageable; also the multi-token prefetch scratch)
+    // decode readback staging: how each layer's ids are packed into the staging
+    // buffer by observe_decode_begin() (obs_off[il] = element offset, -1 when the
+    // layer is not staged; obs_cnt[il] = staged id count)
+    std::vector<int>                                     obs_off;
+    std::vector<int>                                     obs_cnt;
+    // where observe_decode_finish() reads the staged ids from: obs_stage (pinned
+    // host memory, preferred) or obs_scratch (pageable fallback)
+    const int32_t *                                      obs_ids = nullptr;
     std::vector<uint8_t>                                 vram_flags;       // per-layer VRAM residency snapshot
     std::vector<std::pair<const void *, size_t>>         prefetch_ranges;  // rows to read ahead
+
+    // pinned host staging buffer for the decode readback. Async D2H copies into
+    // ordinary pageable memory block until each copy completes (the CUDA runtime
+    // stages pageable transfers on the host side), serializing the whole
+    // readback on the decode thread behind the decode graph; pinned memory keeps
+    // the copies truly async. Allocated once from the host buffer type of the
+    // device that produces the top-k tensors; freed in the destructor
+    ggml_backend_buffer_t obs_stage_buf = nullptr;
+    void *                obs_stage     = nullptr;
+    size_t                obs_stage_cap = 0;
+    // ensure obs_stage holds at least `bytes` of pinned host memory usable for
+    // async reads from `backend`; returns false when no pinned host buft exists
+    // (caller falls back to the pageable obs_scratch)
+    bool ensure_obs_stage(ggml_backend_t backend, size_t bytes);
 
     mutable std::mutex                   mu;
     std::unordered_map<int, layer_state> layers;
 
-    // Global tracking across all layers
-    std::unordered_map<expert_key, uint64_t, expert_key_hash> counts;  // (layer, expert_id) -> times selected
+    // Global tracking across all layers. The per-expert usage counts and the
+    // resident/in-flight pin mirrors live flattened per layer inside layer_state
+    // (indexed by expert id) so the per-token routing path is pure array work;
+    // the maps below hold the heavyweight state (mlock guards, ordered rank) and
+    // are only touched on pins/evictions/decay/stat reports.
 
     // Global pinned set: (count, layer, expert_id) ordered ascending by count;
     // begin() is the coldest pinned expert. Keys are only kept exact when the
@@ -392,6 +453,7 @@ class llama_hot_expert_cache {
 
     uint64_t n_ubatches     = 0;   // graph computes (ubatch chunks) seen
     uint64_t n_eval_calls   = 0;   // topk tensors actually observed
+    uint64_t n_distinct     = 0;   // (layer, expert) pairs ever routed (counts went 0->1)
     uint64_t n_bytes_locked = 0;   // sum of llama_mlock::size() for expert rows
     uint64_t n_lock_calls   = 0;   // mlock syscalls issued (pin worker thread)
     uint64_t n_lock_slow    = 0;   // ... that took longer than lock_slow_us

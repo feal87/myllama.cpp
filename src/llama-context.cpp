@@ -1536,15 +1536,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     ret = GGML_STATUS_SUCCESS;
 
-    // feed the ranking from the decode graph that just computed: reads the
-    // kept-alive top-k tensors registered at build time. The graph compute is
-    // async on device backends, so synchronize first (the top-k tensors live in
-    // the CUDA compute buffer for layers whose router runs on the GPU). Runs
-    // before the VRAM tier's tick so its rebalance sees the refreshed counts
-    // (same ordering as the old mid-graph observation).
+    // feed the ranking from the decode graph that just computed. The readback
+    // is staged first: one async D2H copy per device top-k tensor, queued on its
+    // backend stream right behind the graph compute (host tensors are copied
+    // directly), and the single sync below then covers both the compute and all
+    // copies - one device sync per decode ubatch instead of the per-layer
+    // stream-synchronizing reads. Runs before the VRAM tier's tick so its
+    // rebalance sees the refreshed counts (same ordering as the old mid-graph
+    // observation).
     if (hot_experts && hot_observe_decode && ubatch.n_tokens == 1) {
+        hot_experts->observe_decode_begin(hot_topk_tensors, sched.get());
         ggml_backend_sched_synchronize(sched.get());
-        hot_experts->observe_decode(hot_topk_tensors);
+        hot_experts->observe_decode_finish();
     }
 
     // graph boundary: publish the completed MoE expert-cache uploads and schedule
