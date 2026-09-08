@@ -80,7 +80,10 @@ class llama_moe_cache {
     // slots:    per-layer uniform capacity override (0 = derive per-layer slots
     //           from budget_bytes and the observed routing profile)
     // budget_bytes: global device-memory cap across all cached layers (used when slots == 0)
-    // max_inserts: max expert uploads per decode step, GLOBAL across all cached layers
+    // max_inserts: max expert uploads queued to the async upload worker at once,
+    //               GLOBAL across all cached layers (0 = default 2). The worker
+    //               uploads continuously while experts are pending, so this caps
+    //               the queue depth, not the per-step upload rate
     llama_moe_cache(const llama_model & model, llama_hot_expert_cache * hot,
                     int32_t slots, uint64_t budget_bytes, int32_t max_inserts);
     ~llama_moe_cache();
@@ -115,9 +118,14 @@ class llama_moe_cache {
     static void vram_resident_cb(void * ud, int il, std::vector<uint8_t> & flags);
 
   private:
+    struct impl;
+    std::unique_ptr<impl> pimpl;
+
     // reconcile the residents with the current ranking (see llama-moecache.cpp)
     void rebalance();
 
-    struct impl;
-    std::unique_ptr<impl> pimpl;
+    // move up to `max_inserts` pending experts to the upload worker's queue, one
+    // per layer per pass; the worker keeps its queue topped up between calls.
+    // Caller holds impl::wmtx; takes impl::mtx.
+    static void fill_upload_queue(impl * p);
 };

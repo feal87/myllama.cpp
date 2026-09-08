@@ -210,6 +210,10 @@ class llama_hot_expert_cache {
     // and the memory of the queue itself); when full, newcomers are skipped and
     // retried on a later observation instead of blocking the decode thread
     static constexpr size_t pin_queue_max = 1024;
+    // byte bound on the same queue: caps how much cold (not yet locked) work can
+    // sit ahead of a newer, hotter expert, so a large (or missing) budget cannot
+    // be consumed by reservations for a backlog of colder pins
+    static constexpr uint64_t pin_queue_max_bytes = 1ULL << 30; // 1 GiB
 
     // -- observation ---------------------------------------------------------
     // ask phase: would the layer's topk data be useful this ubatch?
@@ -234,6 +238,12 @@ class llama_hot_expert_cache {
 
     // -- pinning -------------------------------------------------------------
     void unpin_expert(int il, layer_state & ls, int32_t expert_id);
+
+    // rebuild pinned_rank from the current counts (caller holds mu). Called at
+    // decay boundaries, in the stats report, and on demand just before an
+    // eviction decision: updating one ordered-set key per routed selection was
+    // pure churn on the decode thread, so the keys are refreshed lazily instead
+    void rebuild_pinned_rank();
 
     // expected bytes grow_to() would lock for `expert_id` across all of the
     // layer's expert tensors; used to reserve budget BEFORE anything is evicted
@@ -311,8 +321,10 @@ class llama_hot_expert_cache {
     // Global tracking across all layers
     std::unordered_map<expert_key, uint64_t, expert_key_hash> counts;  // (layer, expert_id) -> times selected
 
-    // Global pinned set: (count, layer, expert_id) ordered ascending by count
-    // begin() is always the coldest pinned expert globally
+    // Global pinned set: (count, layer, expert_id) ordered ascending by count;
+    // begin() is the coldest pinned expert. Keys are only kept exact when the
+    // set is rebuilt (see rebuild_pinned_rank): between rebuilds the keys of
+    // routed experts lag their true counts, which they never exceed
     std::set<std::tuple<uint64_t, int, int32_t>>                   pinned_rank;
     std::unordered_map<expert_key, pinned_expert, expert_key_hash> pinned;
     // pinned set at the previous stats report; diffed against the current one to

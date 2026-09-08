@@ -151,6 +151,55 @@ static void sync_tables(llama_moe_cache_layer & pub, const std::vector<int32_t> 
     ggml_backend_tensor_set(pub.host_table, tbl.data(), 0, n_expert*sizeof(int32_t));
 }
 
+// move up to `max_inserts` pending experts to the upload worker's queue, one per
+// layer per pass so a hot layer cannot starve the others behind a long pending
+// list. The worker tops its own queue up whenever it runs dry (see below), so
+// this only matters right after a rebalance filled pending_q; the uploads then
+// proceed at the worker's pace instead of a fixed number per decode step, which
+// is what kept the cache from filling for many steps. Caller holds p->wmtx;
+// takes p->mtx (wmtx -> mtx is the lock order used everywhere).
+void llama_moe_cache::fill_upload_queue(llama_moe_cache::impl * p) {
+    std::lock_guard<std::mutex> lk(p->mtx);
+
+    while ((int32_t) p->todo.size() < p->max_inserts) {
+        bool pushed = false;
+        for (size_t li = 0; li < p->layers.size(); ++li) {
+            auto & ls = p->layers[li];
+            const int32_t n_slots = ls.pub.n_slots;
+            if (ls.pending_q.empty()) {
+                continue;
+            }
+            // find a free slot (published-empty and not uploading)
+            int32_t slot = -1;
+            for (int32_t s = 0; s < n_slots; ++s) {
+                if (ls.slot_expert[s] < 0 && ls.slot_target[s] < 0) {
+                    slot = s;
+                    break;
+                }
+            }
+            if (slot < 0) {
+                continue; // no free slot right now; retried once a slot frees
+            }
+
+            const int32_t e = ls.pending_q.front();
+            ls.pending_q.pop_front();
+            if (ls.resident[e] || e < 0) {
+                continue; // published meanwhile (or bad id)
+            }
+
+            ls.slot_target[slot] = e;
+            p->todo.push_back({ li, e, slot });
+            pushed = true;
+            if ((int32_t) p->todo.size() >= p->max_inserts) {
+                break;
+            }
+        }
+        if (!pushed) {
+            break; // nothing uploadable left in any layer
+        }
+    }
+}
+
 llama_moe_cache::llama_moe_cache(const llama_model & model, llama_hot_expert_cache * hot,
                                  int32_t slots, uint64_t budget_bytes, int32_t max_inserts) {
     if (hot == nullptr || (slots <= 0 && budget_bytes == 0)) {
@@ -415,6 +464,12 @@ void llama_moe_cache::maybe_activate() {
             impl::upload_job j;
             {
                 std::unique_lock<std::mutex> lk(p->wmtx);
+                // self-sustain: refill the queue from pending_q before waiting, so
+                // a burst of additions (activation, content rebalance) uploads at
+                // the worker's pace instead of one tick() batch per decode step
+                if (!p->stop && p->todo.empty()) {
+                    llama_moe_cache::fill_upload_queue(p);
+                }
                 p->wcv.wait(lk, [p]() { return p->stop || !p->todo.empty(); });
                 if (p->stop && p->todo.empty()) {
                     return;
@@ -454,12 +509,18 @@ void llama_moe_cache::maybe_activate() {
             }
             layers_str += "L" + std::to_string(ls.pub.il) + "=" + std::to_string(ls.pub.n_slots);
         }
-        LLAMA_LOG_INFO("%s: MoE expert cache enabled: %d layer(s), %zu VRAM slots total (%.1f MiB device memory), %d inserts/step (global); profile: %s\n",
+        LLAMA_LOG_INFO("%s: MoE expert cache enabled: %d layer(s), %zu VRAM slots total (%.1f MiB device memory), up to %d uploads queued (global); profile: %s\n",
                 __func__, n_cached, n_slots_total, vram_bytes/(1024.0*1024.0), p->max_inserts, layers_str.c_str());
     }
 
-    // seed the content from the current ranking immediately
+    // seed the content from the current ranking immediately, then kick the
+    // upload worker (tick() keeps the queue topped up between graphs)
     rebalance();
+    {
+        std::lock_guard<std::mutex> wlk(p->wmtx);
+        fill_upload_queue(p);
+    }
+    p->wcv.notify_one();
 }
 
 const llama_moe_cache_layer * llama_moe_cache::lookup(const ggml_tensor * gate) const {
@@ -630,41 +691,14 @@ void llama_moe_cache::tick(int64_t n_content_tokens) {
         rebalance();
     }
 
-    // 3) drain the pending additions, bounded by the global per-tick budget
+    // 3) top the upload queue up again: the worker keeps its own queue full from
+    //    pending_q between calls, so this only matters right after a rebalance
+    //    filled pending_q (and it is what wakes the worker from idle)
     {
         std::lock_guard<std::mutex> wlk(p->wmtx);
-        std::lock_guard<std::mutex> lk(p->mtx);
-
-        int remaining = p->max_inserts;
-        for (size_t li = 0; li < p->layers.size() && remaining > 0; ++li) {
-            auto & ls = p->layers[li];
-            const int32_t n_slots = ls.pub.n_slots;
-            while (remaining > 0 && !ls.pending_q.empty()) {
-                // find a free slot (published-empty and not uploading)
-                int32_t slot = -1;
-                for (int32_t s = 0; s < n_slots; ++s) {
-                    if (ls.slot_expert[s] < 0 && ls.slot_target[s] < 0) {
-                        slot = s;
-                        break;
-                    }
-                }
-                if (slot < 0) {
-                    break; // no room right now; retried next tick
-                }
-
-                const int32_t e = ls.pending_q.front();
-                ls.pending_q.pop_front();
-                if (ls.resident[e] || e < 0) {
-                    continue; // published meanwhile (or bad id)
-                }
-
-                ls.slot_target[slot] = e;
-                p->todo.push_back({ li, e, slot });
-                remaining--;
-            }
-        }
-        p->wcv.notify_one();
+        fill_upload_queue(p);
     }
+    p->wcv.notify_one();
 }
 
 // periodic stats report, driven by llama_context at the shared
@@ -734,7 +768,7 @@ void llama_moe_cache::print_stats() {
     }
 
     const uint64_t t_total = n_hit_total + n_miss_total;
-    LLAMA_LOG_INFO("[moe-cache] VRAM tier: resident=%zu/%zu slots (%zu layer(s), inserts=%d)"
+    LLAMA_LOG_INFO("[moe-cache] VRAM tier: resident=%zu/%zu slots (%zu layer(s), queue cap=%d)"
                    " | hit=%.1f%% (%" PRIu64 "/%" PRIu64 " routed)"
                    " | churn=%.1f%% (%zu/%zu changed since last report)"
                    " | ticks=%" PRIu64 " | per-layer: {",

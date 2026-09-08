@@ -2959,10 +2959,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-expert-cache-inserts"}, "N",
         string_format(
-            "max expert uploads per decode step for the MoE expert cache, GLOBAL across\n"
-            "all cached layers combined (default: %d). This throttles PCIe upload traffic\n"
-            "during activation and ranking shifts, it is not a per-layer knob. Convergence\n"
-            "time ~ total_slots / inserts tokens, so raise it (e.g. 32-64) for a faster fill",
+            "max expert uploads queued to the upload worker at once, GLOBAL across\n"
+            "all cached layers combined (default: %d). The worker uploads continuously\n"
+            "while experts are pending, so this bounds the queue depth instead of the\n"
+            "per-step rate: a burst right after activation and each content rebalance\n"
+            "fills the cache at upload speed. Raise it only to queue more work ahead\n"
+            "of the worker during those bursts",
             params.n_moe_cache_inserts
         ),
         [](common_params & params, int value) {

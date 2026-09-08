@@ -108,6 +108,9 @@ llama_hot_expert_cache::~llama_hot_expert_cache() {
 void llama_hot_expert_cache::print_stats() {
     std::lock_guard<std::mutex> lock(mu);
 
+    // rank keys are refreshed lazily; make the reported count range exact
+    rebuild_pinned_rank();
+
     const size_t   total_distinct_seen = counts.size();
     const size_t   total_pinned        = pinned.size();
     const uint64_t total_routed        = n_route_hit + n_route_miss;
@@ -403,10 +406,7 @@ void llama_hot_expert_cache::try_promote(int il, layer_state & ls, int32_t exper
 
     expert_key key{ il, expert_id };
     if (pinned.count(key)) {
-        // already pinned: keep its ordered-set position up to date
-        pinned_rank.erase({ count - 1, il, expert_id });
-        pinned_rank.insert({ count, il, expert_id });
-        return;
+        return;  // already pinned; rank keys are refreshed lazily (see rebuild_pinned_rank)
     }
 
     if (pin_inflight.count(key)) {
@@ -438,8 +438,14 @@ void llama_hot_expert_cache::try_promote(int il, layer_state & ls, int32_t exper
     }
 
     // all slots are committed: only take over if we just overtook the coldest
-    // pinned expert. The munlock of the victim is cheap (no page-in) and stays
-    // inline; only the mlock of the newcomer is deferred to the worker.
+    // pinned expert. The ordered set is refreshed lazily, so a stale key can
+    // only understate the true count: refresh before trusting the check below.
+    // The munlock of the victim is cheap (no page-in) and stays inline; only the
+    // mlock of the newcomer is deferred to the worker.
+    const auto coldest0 = pinned_rank.begin();
+    if (coldest0 != pinned_rank.end() && count > std::get<0>(*coldest0)) {
+        rebuild_pinned_rank();
+    }
     const auto coldest = pinned_rank.begin();
     if (coldest == pinned_rank.end() || count <= std::get<0>(*coldest)) {
         return;
@@ -450,7 +456,8 @@ void llama_hot_expert_cache::try_promote(int il, layer_state & ls, int32_t exper
 
     // if the worker queue is already full the replacement cannot be queued, so
     // evicting the victim would only waste a resident expert: skip the takeover
-    if (pin_queue.size() >= pin_queue_max) {
+    if (pin_queue.size() >= pin_queue_max ||
+            (!pin_queue.empty() && n_bytes_reserved + job.expected_bytes > pin_queue_max_bytes)) {
         return;
     }
 
@@ -514,7 +521,8 @@ bool llama_hot_expert_cache::enqueue_pin(const pin_job & job) {
     if (pin_inflight.count(key) != 0) {
         return false;
     }
-    if (pin_queue.size() >= pin_queue_max) {
+    if (pin_queue.size() >= pin_queue_max ||
+            (!pin_queue.empty() && n_bytes_reserved + job.expected_bytes > pin_queue_max_bytes)) {
         return false;
     }
     if (budget_bytes > 0 && n_bytes_locked + n_bytes_reserved + job.expected_bytes > budget_bytes) {
@@ -650,6 +658,20 @@ void llama_hot_expert_cache::unpin_expert(int il, layer_state & /*ls*/, int32_t 
     pinned.erase(it);  // pinned_expert's destructor releases the mlock guards
 }
 
+void llama_hot_expert_cache::rebuild_pinned_rank() {
+    // caller holds mu
+    pinned_rank.clear();
+    for (const auto & kv : pinned) {
+        const expert_key & key = kv.first;
+        uint64_t          c    = 0;
+        auto              it   = counts.find(key);
+        if (it != counts.end()) {
+            c = it->second;
+        }
+        pinned_rank.insert({ c, key.layer, key.expert_id });
+    }
+}
+
 size_t llama_hot_expert_cache::add_expert_ranges(const layer_state &                    ls,
                                                  int32_t                                 expert_id,
                                                  std::vector<std::pair<const void *, size_t>> & out) {
@@ -693,19 +715,17 @@ void llama_hot_expert_cache::decay_counts() {
     std::lock_guard<std::mutex> lock(mu);
 
     for (auto it = counts.begin(); it != counts.end(); ++it) {
-        const expert_key & key         = it->first;
-        const uint64_t     old_count   = it->second;
-        const uint64_t     new_count   = (old_count + 1) / 2;  // floor at 1, halves everything else
+        const uint64_t old_count = it->second;
+        const uint64_t new_count = (old_count + 1) / 2;  // floor at 1, halves everything else
         if (new_count == old_count) {
             continue;  // count == 1: nothing left to decay
         }
         it->second = new_count;
-        if (pinned.count(key) != 0) {
-            // keep the ordered-set key in sync with the count
-            pinned_rank.erase({ old_count, key.layer, key.expert_id });
-            pinned_rank.insert({ new_count, key.layer, key.expert_id });
-        }
     }
+
+    // the halving changed the counts the pinned experts are ranked by: rebuild
+    // the ordered set once instead of patching one key per pinned expert
+    rebuild_pinned_rank();
 
     n_decays++;
 }

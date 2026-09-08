@@ -427,7 +427,9 @@ extern "C" {
         // is NOT required (without it nothing is mlock'd). See llama-moecache.h.
         int32_t  n_moe_cache_slots;        // cache slots per cached layer (0 = derive from budget_bytes)
         uint64_t n_moe_cache_budget_bytes; // total device-memory cap across all cached layers (0 = no cap)
-        int32_t  n_moe_cache_inserts;      // max expert uploads per decode step, across all cached layers
+        int32_t  n_moe_cache_inserts;      // max expert uploads queued to the upload worker at once, across all
+                                           // cached layers (0 = auto: 2). The worker uploads continuously while
+                                           // experts are pending, so this caps queue depth, not the per-step rate
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
