@@ -157,13 +157,16 @@ llama_context::llama_context(
     // N), the row read-ahead (--hot-experts-prefetch) and the VRAM MoE tier
     // (--moe-expert-cache*). It runs when pinning, the MoE tier or the prefetch
     // is requested (prefetch alone = read-ahead of the routed rows, no mlock);
-    // mlock'ing itself stays gated on n_pin_hot_experts (0 = observe the routing
-    // only, e.g. when only the MoE expert cache or the prefetch is enabled, and
-    // pin nothing).
+    // mlock'ing itself stays gated on n_pin_hot_experts. The observed ranking is
+    // tracked only while pinning or the MoE tier can consume it (track_rank); a
+    // prefetch-only run needs no counts, so it skips them and observes multi-token
+    // ubatches only.
+    const bool moe_requested =
+        cparams.n_moe_cache_slots > 0 ||
+        cparams.n_moe_cache_budget_bytes > 0;
     const bool hot_experts_requested =
         cparams.n_pin_hot_experts > 0 ||
-        cparams.n_moe_cache_slots > 0 ||
-        cparams.n_moe_cache_budget_bytes > 0 ||
+        moe_requested ||
         cparams.hot_experts_prefetch;
 
     if (hot_experts_requested) {
@@ -175,13 +178,14 @@ llama_context::llama_context(
             hot_experts = std::make_unique<llama_hot_expert_cache>(
                 model, cparams.n_pin_hot_experts, cparams.n_pin_hot_experts_budget_bytes,
                 cparams.n_pin_hot_experts_decay_tokens,
-                cparams.hot_experts_prefetch);
+                cparams.hot_experts_prefetch,
+                cparams.n_pin_hot_experts > 0 || moe_requested);
             cparams.cb_eval           = llama_hot_expert_cache::eval_callback;
             cparams.cb_eval_user_data = hot_experts.get();
         }
     }
 
-    if (cparams.n_moe_cache_slots > 0 || cparams.n_moe_cache_budget_bytes > 0) {
+    if (moe_requested) {
         if (hot_experts) {
             // the VRAM tier feeds on the hot-expert cache's global ranking (it
             // sizes its per-layer capacities from the observed routing profile).

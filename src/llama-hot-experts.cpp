@@ -16,12 +16,14 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
                                                int32_t             n_pin_experts,
                                                uint64_t            budget_bytes,
                                                uint64_t            decay_interval,
-                                               bool                prefetch_enabled) :
+                                               bool                prefetch_enabled,
+                                               bool                track_rank) :
     model(model),
     n_pin(n_pin_experts),
     budget_bytes(budget_bytes),
     decay_interval(decay_interval),
-    prefetch_enabled(prefetch_enabled) {
+    prefetch_enabled(prefetch_enabled),
+    track_rank(track_rank) {
     // Count MoE layers by checking which layers have ffn_down_exps.weight
     int32_t n_moe_layers = 0;
     for (int32_t il = 0; il < (int32_t) model.hparams.n_layer(); il++) {
@@ -68,11 +70,17 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
                 "still keeps recently-used expert rows in the page cache)\n",
                 __func__);
         }
-    } else {
+    } else if (track_rank) {
         // ranking-only mode: the router observation feeds the VRAM MoE tier
         // (llama_moe_cache) and/or the prefetch, but nothing is mlock'd
         LLAMA_LOG_INFO("%s: tracking MoE router usage, nothing pinned%s\n", __func__,
                        prefetch_enabled ? " (prefetching routed expert rows)" : "");
+    } else {
+        // prefetch-only mode: no ranking consumer exists, so only multi-token
+        // (batch/prefill) ubatches are observed, purely to read the routed rows
+        // ahead; nothing is counted or pinned
+        LLAMA_LOG_INFO("%s: prefetching routed expert rows on batch/prefill ubatches, "
+                       "no usage tracking\n", __func__);
     }
     if (decay_interval > 0) {
         LLAMA_LOG_INFO("%s: halving all usage counts every %" PRIu64 " tokens of content\n", __func__, decay_interval);
@@ -188,9 +196,15 @@ bool llama_hot_expert_cache::eval_callback(struct ggml_tensor * t, bool ask, voi
 // layers that this ubatch's sampling pattern skips return false, so the
 // scheduler does not chunk the graph at their topk tensor. Everything host-resident
 // is observed whenever the engine is active: pinning, prefetch and the VRAM MoE
-// tier all read the same ranking.
+// tier all read the same ranking. Prefetch-only mode observes multi-token
+// ubatches only: decode ubatches never prefetch (they re-read warm rows), so
+// their observations would be pure overhead.
 bool llama_hot_expert_cache::wants_observe(int il) {
     std::lock_guard<std::mutex> lock(mu);
+
+    if (!track_rank && n_tokens_cur <= 1) {
+        return false;
+    }
 
     layer_state & ls = layers[il];
     if (!ls.resolved_tensors) {
@@ -237,21 +251,26 @@ void llama_hot_expert_cache::observe(int il, const struct ggml_tensor * t) {
 
         n_eval_calls++;
 
-        for (int32_t id : ids) {
-            if (id < 0) {
-                continue;
-            }
-            // realized RAM-tier hit rate: a routed expert is a hit when its pages
-            // are already mlock'd at routing time. Experts served from VRAM are
-            // the MoE tier's business and are ignored entirely here.
-            if (!is_vram_resident(il, id)) {
-                if (pinned.count(expert_key{ il, id }) != 0) {
-                    n_route_hit++;
-                } else {
-                    n_route_miss++;
+        // update the shared ranking (and the pin set) for every routed selection.
+        // Only pinning and the VRAM MoE tier read it, so prefetch-only runs skip
+        // the loop entirely.
+        if (track_rank) {
+            for (int32_t id : ids) {
+                if (id < 0) {
+                    continue;
                 }
+                // realized RAM-tier hit rate: a routed expert is a hit when its pages
+                // are already mlock'd at routing time. Experts served from VRAM are
+                // the MoE tier's business and are ignored entirely here.
+                if (!is_vram_resident(il, id)) {
+                    if (pinned.count(expert_key{ il, id }) != 0) {
+                        n_route_hit++;
+                    } else {
+                        n_route_miss++;
+                    }
+                }
+                observe_expert(il, ls, id);
             }
-            observe_expert(il, ls, id);
         }
 
         // (A per-token reorder to put pinned experts first was tried here and
@@ -280,9 +299,10 @@ void llama_hot_expert_cache::observe(int il, const struct ggml_tensor * t) {
                     continue;
                 }
                 expert_key key{ il, id };
-                if (pinned.count(key) == 0 && !is_vram_resident(il, id)) {
-                    add_expert_ranges(ls, id, ranges);
+                if (track_rank && (pinned.count(key) != 0 || is_vram_resident(il, id))) {
+                    continue;  // pinned or VRAM-served experts read no cold pages
                 }
+                add_expert_ranges(ls, id, ranges);
             }
         }
     }  // lock released here
@@ -614,6 +634,7 @@ size_t llama_hot_expert_cache::add_expert_ranges(const layer_state &            
 
 void llama_hot_expert_cache::on_ubatch_begin(int64_t n_tokens) {
     n_ubatches++;
+    n_tokens_cur = n_tokens;
     if (n_tokens > 0) {
         n_content_tokens += n_tokens;
     }

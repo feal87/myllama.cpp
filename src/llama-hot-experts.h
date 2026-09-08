@@ -14,8 +14,10 @@
 // and the standalone prefetch (--hot-experts-prefetch): the same router
 // observation maintains the decayed global counts it sizes itself from. The
 // engine therefore also runs with n_pin_experts == 0 (e.g. only
-// --moe-expert-cache* or --hot-experts-prefetch given): the counts are kept,
-// nothing is mlock'd.
+// --moe-expert-cache* or --hot-experts-prefetch given): the counts feed the
+// VRAM tier, nothing is mlock'd. When the prefetch is the ONLY feature
+// requested the counts have no consumer and are dropped: only multi-token
+// (batch/prefill) ubatches are observed, purely to read-ahead the routed rows.
 //
 // Prefetching (--hot-experts-prefetch / --no-hot-experts-prefetch) is an
 // independent knob, gated on prefetch_enabled rather than on pinning. It only
@@ -73,11 +75,15 @@ class llama_hot_expert_cache {
     // prefetch_enabled:  read-ahead (madvise WILLNEED / PrefetchVirtualMemory) the rows of the
     //                    experts a layer just routed that are neither pinned nor served from VRAM,
     //                    so their next read does not page-fault (--hot-experts-prefetch)
+    // track_rank:        true when pinning or the VRAM MoE tier consumes the usage ranking; false in
+    //                    prefetch-only runs, where the count bookkeeping is skipped entirely and
+    //                    single-token decode ubatches (which never prefetch) are not observed
     llama_hot_expert_cache(const llama_model & model,
                            int32_t             n_pin_experts,
                            uint64_t            budget_bytes,
                            uint64_t            decay_interval,
-                           bool                prefetch_enabled);
+                           bool                prefetch_enabled,
+                           bool                track_rank);
     ~llama_hot_expert_cache();
 
     llama_hot_expert_cache(const llama_hot_expert_cache &)             = delete;
@@ -269,7 +275,9 @@ class llama_hot_expert_cache {
     const uint64_t budget_bytes;     // 0 = unlimited
     const uint64_t decay_interval;   // 0 = lifetime counts (no aging)
     const bool     prefetch_enabled; // read-ahead routed-but-unpinned expert rows (--hot-experts-prefetch)
+    const bool     track_rank;       // rank feeds pinning/VRAM tier; false = prefetch-only mode
     uint64_t       n_tokens_seen = 0;  // tokens since the last decay
+    int64_t        n_tokens_cur  = 0;  // tokens of the ubatch being computed (ask-phase gate)
 
     mutable std::mutex                   mu;
     std::unordered_map<int, layer_state> layers;
