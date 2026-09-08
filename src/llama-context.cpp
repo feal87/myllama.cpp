@@ -1504,9 +1504,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // periodic expert-tier stats report: one shared wall-clock interval (seconds)
     // drives the RAM pin tier and the VRAM MoE tier together (0 = disabled, only
-    // the destructor summary remains). Printed at the ubatch boundary so it never
-    // interleaves with a running graph; the first report waits a full interval.
-    if (cparams.n_experts_stats_interval > 0) {
+    // the destructor summary remains). Printed at the single-token decode ubatch
+    // boundary so it never interleaves with a running graph and only after a
+    // decode ubatch: the reported counters move on decode ubatches only, so a
+    // report during batch/prefill ubatches would repeat frozen numbers. The timer
+    // is not touched by batch/prefill ubatches, so short decode phases between
+    // long prefills still report (on their first decode ubatch) and the first
+    // report waits a full interval.
+    if (cparams.n_experts_stats_interval > 0 && ubatch.n_tokens == 1) {
         const int64_t now_us = ggml_time_us();
         if (t_experts_stats_us == 0) {
             t_experts_stats_us = now_us;
