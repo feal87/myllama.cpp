@@ -14,18 +14,25 @@
 //  - requested via llama_context_params (CLI --moe-expert-cache-budget-mib +
 //    --moe-expert-cache-inserts). Requires the hot-expert ranking engine (the
 //    counts live there).
-//  - activated lazily on the first single-token decode ubatch once enough
-//    routing has been observed (the prefill of the current request). At that
-//    point the per-layer VRAM slot counts are sized from the actual routing
-//    profile: a global budget is handed to the experts with the highest counts,
-//    so hot layers get many slots and cold layers get none (top-heavy, not
-//    uniform).
+//  - reserved up-front at context creation (reserve()): the whole byte budget is
+//    allocated as ONE device pool, so whether it fits is decided at load time,
+//    not after generation started. The per-layer slot counts are still sized
+//    lazily on the first single-token decode ubatch once enough routing has been
+//    observed (maybe_activate): the budget is then handed to the experts with
+//    the highest counts, so hot layers get many slots and cold layers get none
+//    (top-heavy, not uniform), and the cache tensors are bound into the pool.
 //  - content is maintained in batches at rebalance boundaries (every
 //    rebalance interval of content tokens): each cached layer holds the top
 //    C_l of the CURRENT ranking; losers are evicted back to the RAM tier (the
 //    hot cache re-mlock's them) and winners are uploaded asynchronously and
 //    published between graphs. The LRU-free design means a super-expert that
 //    keeps being routed is never displaced by a merely-recent one.
+//
+// Memory accounting: budget_bytes is the exact total device footprint of the
+// cache (expert slots + the per-layer dummy slot + the device tables). The
+// budget hand-out (llama_hot_expert_cache::assign_global_capacity) charges the
+// one-time per-layer cost when a layer's first slot is granted, so whatever the
+// routing profile decides, the resulting layout always fits inside the pool.
 //
 // Mechanism (no custom kernels):
 //  - per cached layer, companion tensors in the device buffer type of that
@@ -77,15 +84,17 @@ class llama_moe_cache {
   public:
     // hot:      ranking source (must outlive this object; the hot cache itself is
     //           kept by llama_context, destroyed after this)
-    // slots:    per-layer uniform capacity override (0 = derive per-layer slots
-    //           from budget_bytes and the observed routing profile)
-    // budget_bytes: global device-memory cap across all cached layers (used when slots == 0)
+    // budget_bytes: total device memory of the whole cache, reserved up-front as
+    //           a single pool at context creation (see reserve()). The per-layer
+    //           layout is carved from it once routing has been observed, and the
+    //           budget hand-out guarantees the layout always fits (dummy slot +
+    //           device tables included). 0 = disabled
     // max_inserts: max expert uploads queued to the async upload worker at once,
-    //               GLOBAL across all cached layers (0 = default 2). The worker
-    //               uploads continuously while experts are pending, so this caps
-    //               the queue depth, not the per-step upload rate
+    //           GLOBAL across all cached layers (0 = default 2). The worker
+    //           uploads continuously while experts are pending, so this caps
+    //           the queue depth, not the per-step upload rate
     llama_moe_cache(const llama_model & model, llama_hot_expert_cache * hot,
-                    int32_t slots, uint64_t budget_bytes, int32_t max_inserts);
+                    uint64_t budget_bytes, int32_t max_inserts);
     ~llama_moe_cache();
 
     llama_moe_cache(const llama_moe_cache &) = delete;
@@ -93,8 +102,18 @@ class llama_moe_cache {
 
     bool is_active() const;
 
-    // called before every decode ubatch until activated: allocates the device
-    // buffers once enough routing has been observed to size them
+    // called once at context creation (after the model, KV and graph buffers
+    // are in place): scans the host-resident MoE layers and reserves the device
+    // pool of budget_bytes from the layer routers' device, so whether the
+    // requested budget fits is answered here instead of mid-generation. No-op
+    // when disabled or already reserved; marks the cache failed (with a
+    // warning) when no cacheable layer exists; throws when the pool cannot be
+    // allocated (not enough free device memory for the requested budget).
+    void reserve();
+
+    // called before every decode ubatch until activated: sizes the per-layer
+    // capacities from the observed routing profile and binds the cache tensors
+    // into the pool reserved by reserve()
     void maybe_activate();
 
     // cache layer owning `gate` (the ffn_gate_up_exps or ffn_gate_exps tensor),

@@ -846,7 +846,8 @@ void llama_hot_expert_cache::all_counts(std::vector<std::tuple<int, int32_t, uin
 }
 
 int32_t llama_hot_expert_cache::assign_global_capacity(uint64_t budget_bytes,
-        const std::vector<size_t> & bytes_per_layer, std::vector<int32_t> & out) const {
+        const std::vector<size_t> & bytes_per_layer,
+        const std::vector<size_t> & fixed_bytes, std::vector<int32_t> & out) const {
     std::lock_guard<std::mutex> lock(mu);
 
     if (budget_bytes == 0 || counts.empty()) {
@@ -854,7 +855,9 @@ int32_t llama_hot_expert_cache::assign_global_capacity(uint64_t budget_bytes,
     }
 
     // walk the global ranking by count descending; an expert is kept only if its
-    // whole cost still fits in the remaining budget (experts are indivisible)
+    // whole cost still fits in the remaining budget (experts are indivisible).
+    // Each layer also pays its one-time fixed cost (dummy slot + tables) when
+    // its first slot is granted, so the final layout always fits the budget.
     std::vector<std::tuple<uint64_t, int, int32_t>> all;
     all.reserve(counts.size());
     for (const auto & [key, count] : counts) {
@@ -864,18 +867,24 @@ int32_t llama_hot_expert_cache::assign_global_capacity(uint64_t budget_bytes,
         return std::get<0>(a) > std::get<0>(b);
     });
 
-    int32_t  assigned = 0;
-    uint64_t used     = 0;
+    int32_t            assigned = 0;
+    uint64_t           used     = 0;
+    std::vector<uint8_t> fixed_charged(out.size(), 0);
     for (const auto & [count, layer, expert] : all) {
         if (layer < 0 || layer >= (int) out.size()) {
             continue;
         }
         const size_t cost = bytes_per_layer[layer];
-        if (cost == 0 || used + cost > budget_bytes) {
+        if (cost == 0) {
+            continue;
+        }
+        const size_t extra = fixed_charged[layer] ? 0 : fixed_bytes[layer];
+        if (used + cost + extra > budget_bytes) {
             continue; // does not fit; a colder expert that does fit may take its place
         }
         out[layer]++;
-        used += cost;
+        used += cost + extra;
+        fixed_charged[layer] = 1;
         assigned++;
     }
     return assigned;

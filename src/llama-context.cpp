@@ -147,7 +147,6 @@ llama_context::llama_context(
     cparams.n_experts_stats_interval = params.n_experts_stats_interval;
     cparams.n_pin_hot_experts_decay_tokens   = params.n_pin_hot_experts_decay_tokens;
 
-    cparams.n_moe_cache_slots        = params.n_moe_cache_slots;
     cparams.n_moe_cache_budget_bytes = params.n_moe_cache_budget_bytes;
     cparams.n_moe_cache_inserts      = params.n_moe_cache_inserts;
     cparams.hot_experts_prefetch     = params.hot_experts_prefetch;
@@ -163,7 +162,6 @@ llama_context::llama_context(
     // ubatches are observed for the prefetch alone and never move the ranking;
     // a prefetch-only run needs no counts at all.
     const bool moe_requested =
-        cparams.n_moe_cache_slots > 0 ||
         cparams.n_moe_cache_budget_bytes > 0;
     const bool hot_experts_requested =
         cparams.n_pin_hot_experts > 0 ||
@@ -190,11 +188,13 @@ llama_context::llama_context(
         if (hot_experts) {
             // the VRAM tier feeds on the hot-expert cache's global ranking (it
             // sizes its per-layer capacities from the observed routing profile).
-            // Allocation is deferred until enough routing has been observed to
-            // size the per-layer capacities (see llama_moe_cache::maybe_activate)
+            // The device pool of the budget is reserved at the end of the
+            // constructor (see llama_moe_cache::reserve), so whether the budget
+            // fits is decided at load time; the per-layer capacities are still
+            // sized lazily once routing has been observed (maybe_activate).
             moe_cache = std::make_unique<llama_moe_cache>(
-                model, hot_experts.get(), cparams.n_moe_cache_slots,
-                cparams.n_moe_cache_budget_bytes, cparams.n_moe_cache_inserts);
+                model, hot_experts.get(), cparams.n_moe_cache_budget_bytes,
+                cparams.n_moe_cache_inserts);
         } else {
             LLAMA_LOG_WARN("%s: --moe-expert-cache* needs the router-observation engine, but a "
                             "custom cb_eval is in use; MoE expert cache disabled\n", __func__);
@@ -546,6 +546,13 @@ llama_context::llama_context(
         for (int i = 0; i < n_vocab; ++i) {
             sampling.token_ids_full_vocab[i] = i;
         }
+    }
+
+    // last allocation of the constructor: reserve the MoE expert cache device
+    // pool so whether the requested budget fits is answered here (with a clear
+    // error) instead of mid-generation, when the cache would be allocated lazily
+    if (moe_cache) {
+        moe_cache->reserve();
     }
 }
 
@@ -3829,7 +3836,6 @@ llama_context_params llama_context_default_params() {
         /*.n_pin_hot_experts_budget_bytes=*/ 0,
         /*.n_experts_stats_interval     =*/ 5,
         /*.n_pin_hot_experts_decay_tokens=*/ 0,
-        /*.n_moe_cache_slots           =*/ 0,
         /*.n_moe_cache_budget_bytes    =*/ 0,
         /*.n_moe_cache_inserts         =*/ 2,
         /*.type_k                      =*/ GGML_TYPE_F16,

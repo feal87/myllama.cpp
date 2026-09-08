@@ -125,11 +125,15 @@ class llama_hot_expert_cache {
 
     // hand a global BYTE budget to the globally hottest (layer, expert) pairs:
     // out[il] = slots for layer il (0 = none). bytes_per_layer[il] = cost of one
-    // expert of layer il; an expert is kept only while its whole cost fits, so
-    // hot layers end up with many slots and cold layers with none. Returns the
-    // number of slots assigned.
+    // expert of layer il; fixed_bytes[il] = one-time per-layer cost (the dummy
+    // slot plus the device tables), charged when the layer's first slot is
+    // granted, so the total device memory of the resulting layout (slots +
+    // dummy + tables) is bounded by budget_bytes. An expert is kept only while
+    // its whole cost fits, so hot layers end up with many slots and cold layers
+    // with none. Returns the number of slots assigned.
     int32_t assign_global_capacity(uint64_t budget_bytes,
-            const std::vector<size_t> & bytes_per_layer, std::vector<int32_t> & out) const;
+            const std::vector<size_t> & bytes_per_layer,
+            const std::vector<size_t> & fixed_bytes, std::vector<int32_t> & out) const;
 
     // decode tokens observed (single-token ubatches only; prefill ubatches do
     // not feed the ranking and do not advance its clock)

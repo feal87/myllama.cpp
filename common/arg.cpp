@@ -2922,35 +2922,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_HOTEXPERTS_PREFETCH"));
     add_opt(common_arg(
-        {"--moe-expert-cache"}, "N",
+        {"--moe-expert-cache-budget-mib"}, "N",
         string_format(
             "GPU-resident cache for the HOTTEST MoE experts, layered on top of the hot-expert\n"
             "cache (--pin-hot-experts, which is NOT required): both tiers are fed by the same\n"
             "global decayed routing ranking, the VRAM tier copies the top of it so those\n"
-            "expert reads are skipped during decode. N = per-layer capacity override, 0 =\n"
-            "derive per-layer capacities from the routing profile under\n"
-            "--moe-expert-cache-budget-mib (default: %d, 0 = disabled). With no pin settings\n"
-            "the ranking is still observed (counts/decay) but nothing is mlock'd. Activation\n"
-            "is lazy: the cache allocates VRAM once the first single-token decode tokens have\n"
-            "profiled the routing (the shared ranking is decode-only), so per-layer slot\n"
-            "counts reflect the routing mix that generation actually re-uses (hot layers get\n"
-            "many slots, cold layers none)",
-            params.n_moe_cache_slots
-        ),
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("error: --moe-expert-cache must be >= 0");
-            }
-            params.n_moe_cache_slots = value;
-        }
-    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE"));
-    add_opt(common_arg(
-        {"--moe-expert-cache-budget-mib"}, "N",
-        string_format(
-            "total device-memory cap, in MiB, for the MoE expert cache across ALL cached\n"
-            "layers (default: %" PRIu64 ", 0 = no cap). The budget is handed to the globally\n"
-            "hottest experts observed during decode, so per-layer capacity is top-heavy, not\n"
-            "uniform. The device must have this much free VRAM on top of the model",
+            "expert reads are skipped during decode. N = total device memory, in MiB, reserved\n"
+            "up-front for the whole cache (default: %" PRIu64 ", 0 = disabled): expert slots,\n"
+            "the per-layer dummy slot and the device tables. The pool is allocated at load\n"
+            "time, so whether the budget fits is decided there, and the per-layer slot counts\n"
+            "are then carved from it once the first single-token decode tokens have profiled\n"
+            "the routing (the shared ranking is decode-only): hot layers get many slots, cold\n"
+            "layers none. With no pin settings the ranking is still observed but nothing is\n"
+            "mlock'd",
             params.n_moe_cache_budget_mib
         ),
         [](common_params & params, int value) {
