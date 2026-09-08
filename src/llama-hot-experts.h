@@ -240,9 +240,10 @@ class llama_hot_expert_cache {
     void unpin_expert(int il, layer_state & ls, int32_t expert_id);
 
     // rebuild pinned_rank from the current counts (caller holds mu). Called at
-    // decay boundaries, in the stats report, and on demand just before an
-    // eviction decision: updating one ordered-set key per routed selection was
-    // pure churn on the decode thread, so the keys are refreshed lazily instead
+    // decay boundaries and in the stats report: updating one ordered-set key per
+    // routed selection was pure churn on the decode thread, so the keys are
+    // refreshed lazily instead; eviction decisions only heal the cold end of
+    // the set (see try_promote) rather than rebuilding it
     void rebuild_pinned_rank();
 
     // expected bytes grow_to() would lock for `expert_id` across all of the

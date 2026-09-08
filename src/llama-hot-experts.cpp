@@ -438,21 +438,44 @@ void llama_hot_expert_cache::try_promote(int il, layer_state & ls, int32_t exper
     }
 
     // all slots are committed: only take over if we just overtook the coldest
-    // pinned expert. The ordered set is refreshed lazily, so a stale key can
-    // only understate the true count: refresh before trusting the check below.
-    // The munlock of the victim is cheap (no page-in) and stays inline; only the
-    // mlock of the newcomer is deferred to the worker.
-    const auto coldest0 = pinned_rank.begin();
-    if (coldest0 != pinned_rank.end() && count > std::get<0>(*coldest0)) {
-        rebuild_pinned_rank();
-    }
-    const auto coldest = pinned_rank.begin();
-    if (coldest == pinned_rank.end() || count <= std::get<0>(*coldest)) {
-        return;
+    // pinned expert. The ordered-set keys are refreshed only at decay
+    // boundaries, so a routed expert's key can lag its true count (it never
+    // exceeds it). Instead of rebuilding the whole set per candidate, walk up
+    // from the cold end, healing stale keys and dropping VRAM-takeover ghosts,
+    // until an exact bottom key proves the true coldest: every other key is >=
+    // it and <= its own true count. Several takeovers in one token then share
+    // one heal pass over the cold end instead of one O(pinned) rebuild each.
+    // The munlock of the victim is cheap (no page-in) and stays inline; only
+    // the mlock of the newcomer is deferred to the worker.
+    std::tuple<uint64_t, int, int32_t> victim{};
+    for (;;) {
+        const auto it = pinned_rank.begin();
+        if (it == pinned_rank.end()) {
+            return;  // nothing pinned (all capacity in flight or released)
+        }
+        const uint64_t key_count = std::get<0>(*it);
+        if (count <= key_count) {
+            return;  // count <= every key <= every true count: no takeover
+        }
+        const int     mem_layer = std::get<1>(*it);
+        const int32_t mem_id    = std::get<2>(*it);
+        if (pinned.count(expert_key{ mem_layer, mem_id }) == 0) {
+            pinned_rank.erase(it);  // ghost entry from a VRAM takeover; drop it
+            continue;
+        }
+        const auto    cit = counts.find(expert_key{ mem_layer, mem_id });
+        const uint64_t true_count = cit == counts.end() ? 0 : cit->second;
+        if (key_count != true_count) {
+            pinned_rank.erase(it);  // stale-low key: heal it and re-check the bottom
+            pinned_rank.insert({ true_count, mem_layer, mem_id });
+            continue;
+        }
+        victim = *it;  // exact bottom key: the true coldest pinned expert
+        break;
     }
 
-    const int      evict_layer = std::get<1>(*coldest);
-    const int32_t  evict_id    = std::get<2>(*coldest);
+    const int      evict_layer = std::get<1>(victim);
+    const int32_t  evict_id    = std::get<2>(victim);
 
     // if the worker queue is already full the replacement cannot be queued, so
     // evicting the victim would only waste a resident expert: skip the takeover
@@ -471,7 +494,7 @@ void llama_hot_expert_cache::try_promote(int il, layer_state & ls, int32_t exper
         return;
     }
 
-    pinned_rank.erase(coldest);
+    pinned_rank.erase(victim);
 
     auto & evict_ls = layers[evict_layer];
     if (!evict_ls.resolved_tensors) {
