@@ -1671,18 +1671,6 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
-    // MoE routing observation for the llama GPU expert cache: report the routed
-    // ids of every host-resident gate mul_mat_id (fused gate_up or separate
-    // gate). Fired once per node on thread 0 only.
-    {
-        void * moe_obs_ud = NULL;
-        ggml_moe_obs_cb_t moe_obs_cb = ggml_get_moe_obs_callback(&moe_obs_ud);
-        if (ith == 0 && moe_obs_cb &&
-                (strstr(src0->name, "ffn_gate_up_exps") || strstr(src0->name, "ffn_gate_exps"))) {
-            moe_obs_cb(src0->name, ids, moe_obs_ud);
-        }
-    }
-
     // reset current_chunk
     for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
         atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);

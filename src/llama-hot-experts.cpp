@@ -230,14 +230,18 @@ void llama_hot_expert_cache::observe(int il, const struct ggml_tensor * t) {
         return;
     }
 
-    std::vector<int32_t> ids(n_ids);
+    // reuse one scratch for the routed ids (and one for the VRAM residency
+    // snapshot below): observation runs once per layer per ubatch on the compute
+    // thread, so per-call allocation is pure churn
+    obs_scratch.resize(n_ids);
+    int32_t * ids = obs_scratch.data();
     if (ggml_backend_buffer_is_host(t->buffer)) {
-        std::memcpy(ids.data(), t->data, n_ids * sizeof(int32_t));
+        std::memcpy(ids, t->data, n_ids * sizeof(int32_t));
     } else {
-        ggml_backend_tensor_get(t, ids.data(), 0, n_ids * sizeof(int32_t));
+        ggml_backend_tensor_get(t, ids, 0, n_ids * sizeof(int32_t));
     }
 
-    std::vector<std::pair<const void *, size_t>> ranges;  // rows to prefetch (filled under the lock)
+    prefetch_ranges.clear();
     {
         std::lock_guard<std::mutex> lock(mu);
 
@@ -251,25 +255,52 @@ void llama_hot_expert_cache::observe(int il, const struct ggml_tensor * t) {
 
         n_eval_calls++;
 
+        // snapshot this layer's VRAM residency ONCE per ubatch: the VRAM tier
+        // only publishes/evicts at the ubatch boundary (never mid-graph), so one
+        // flags copy per layer replaces a locked cross-cache query per routed id
+        vram_flags.clear();
+        if (vram_query) {
+            vram_query(vram_ud, il, vram_flags);
+        }
+        // only layers the VRAM tier actually caches carry a full flag table;
+        // everything else stays empty and reads as "not served from VRAM"
+        const bool vram_tier_layer = !vram_flags.empty();
+
+        auto is_served = [&](int32_t id) {
+            return (size_t) id < vram_flags.size() && vram_flags[(size_t) id] != 0;
+        };
+
         // update the shared ranking (and the pin set) for every routed selection.
         // Only pinning and the VRAM MoE tier read it, so prefetch-only runs skip
         // the loop entirely.
         if (track_rank) {
-            for (int32_t id : ids) {
+            for (int32_t id : obs_scratch) {
                 if (id < 0) {
                     continue;
                 }
-                // realized RAM-tier hit rate: a routed expert is a hit when its pages
-                // are already mlock'd at routing time. Experts served from VRAM are
-                // the MoE tier's business and are ignored entirely here.
-                if (!is_vram_resident(il, id)) {
+                const bool served = is_served(id);
+                if (served) {
+                    // decode-time VRAM-tier hit telemetry: a routed expert is a hit
+                    // when the VRAM copy served it and this host read was skipped.
+                    // Batch ubatches always read the host weights, so they are not
+                    // counted (mirrors the VRAM tier's old decode-only observation
+                    // hook, which this loop replaces)
+                    if (n_tokens == 1 && vram_tier_layer) {
+                        ls.n_vram_hit++;
+                    }
+                } else {
+                    // realized RAM-tier hit rate: a routed expert is a hit when its
+                    // pages are already mlock'd at routing time.
                     if (pinned.count(expert_key{ il, id }) != 0) {
                         n_route_hit++;
                     } else {
                         n_route_miss++;
                     }
+                    if (n_tokens == 1 && vram_tier_layer) {
+                        ls.n_vram_miss++;
+                    }
                 }
-                observe_expert(il, ls, id);
+                observe_expert(il, ls, id, served);
             }
         }
 
@@ -291,28 +322,32 @@ void llama_hot_expert_cache::observe(int il, const struct ggml_tensor * t) {
         // first: prompt-processing batches route hundreds of experts per layer
         // and a duplicate would append the same rows once per token.
         if (prefetch_enabled && n_tokens > 1) {
-            std::vector<int32_t> uniq = ids;
-            std::sort(uniq.begin(), uniq.end());
-            uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
-            for (int32_t id : uniq) {
+            // dedupe in place: prompt-processing batches route hundreds of experts
+            // per layer and a duplicate would append the same rows once per token
+            int32_t * b = obs_scratch.data();
+            int32_t * e = b + obs_scratch.size();
+            std::sort(b, e);
+            e = std::unique(b, e);
+            for (int32_t * p = b; p != e; ++p) {
+                const int32_t id = *p;
                 if (id < 0) {
                     continue;
                 }
                 expert_key key{ il, id };
-                if (track_rank && (pinned.count(key) != 0 || is_vram_resident(il, id))) {
+                if (track_rank && (pinned.count(key) != 0 || is_served(id))) {
                     continue;  // pinned or VRAM-served experts read no cold pages
                 }
-                add_expert_ranges(ls, id, ranges);
+                add_expert_ranges(ls, id, prefetch_ranges);
             }
         }
     }  // lock released here
 
-    if (prefetch_enabled && !ranges.empty()) {
+    if (prefetch_enabled && !prefetch_ranges.empty()) {
         n_prefetch_calls++;
-        for (const auto & range : ranges) {
+        for (const auto & range : prefetch_ranges) {
             n_prefetch_bytes += range.second;
         }
-        if (!llama_mmap::prefetch(ranges)) {
+        if (!llama_mmap::prefetch(prefetch_ranges)) {
             n_prefetch_failures++;
         }
     }
@@ -350,24 +385,23 @@ void llama_hot_expert_cache::resolve_tensors(int il, layer_state & ls) {
     }
 }
 
-void llama_hot_expert_cache::observe_expert(int il, layer_state & ls, int32_t expert_id) {
+void llama_hot_expert_cache::observe_expert(int il, layer_state & ls, int32_t expert_id, bool vram_resident) {
     expert_key key{ il, expert_id };
     counts[key]++;  // default-constructs to 0
 
-    try_promote(il, ls, expert_id, counts[key]);
+    try_promote(il, ls, expert_id, counts[key], vram_resident);
 }
 
-void llama_hot_expert_cache::try_promote(int il, layer_state & ls, int32_t expert_id, uint64_t count) {
+void llama_hot_expert_cache::try_promote(int il, layer_state & ls, int32_t expert_id, uint64_t count, bool vram_resident) {
     if (!ls.tensors_are_host || n_pin <= 0 || !llama_mlock::SUPPORTED) {
         return;  // stats-only mode, nothing to pin
     }
 
-    expert_key key{ il, expert_id };
-
-    if (is_vram_resident(il, expert_id)) {
+    if (vram_resident) {
         return;  // served by the VRAM tier; no mlock needed
     }
 
+    expert_key key{ il, expert_id };
     if (pinned.count(key)) {
         // already pinned: keep its ordered-set position up to date
         pinned_rank.erase({ count - 1, il, expert_id });
@@ -448,11 +482,14 @@ void llama_hot_expert_cache::try_promote(int il, layer_state & ls, int32_t exper
 }
 
 bool llama_hot_expert_cache::is_vram_resident(int il, int32_t expert_id) const {
-    // caller holds mu
+    // caller holds mu. Cold path (VRAM eviction re-admission): allocates its own
+    // snapshot rather than sharing the observation scratch
     if (vram_query == nullptr) {
         return false;
     }
-    return vram_query(vram_ud, il, expert_id);
+    std::vector<uint8_t> flags;
+    vram_query(vram_ud, il, flags);
+    return expert_id >= 0 && (size_t) expert_id < flags.size() && flags[(size_t) expert_id] != 0;
 }
 
 size_t llama_hot_expert_cache::expert_row_bytes(const layer_state & ls, int32_t expert_id) const {
@@ -687,19 +724,32 @@ void llama_hot_expert_cache::set_vram_query(vram_query_fn fn, void * ud) {
     vram_ud    = ud;
 }
 
+void llama_hot_expert_cache::vram_stats(int il, uint64_t & n_hit, uint64_t & n_miss) const {
+    std::lock_guard<std::mutex> lock(mu);
+
+    const auto it = layers.find(il);
+    if (it == layers.end()) {
+        n_hit  = 0;
+        n_miss = 0;
+        return;
+    }
+    n_hit  = it->second.n_vram_hit;
+    n_miss = it->second.n_vram_miss;
+}
+
 uint64_t llama_hot_expert_cache::content_tokens() const {
     std::lock_guard<std::mutex> lock(mu);
     return n_content_tokens;
 }
 
-void llama_hot_expert_cache::layer_counts(int il, std::vector<std::pair<int32_t, uint64_t>> & out) const {
+void llama_hot_expert_cache::all_counts(std::vector<std::tuple<int, int32_t, uint64_t>> & out) const {
     std::lock_guard<std::mutex> lock(mu);
 
     out.clear();
-    out.reserve(512);
+    out.reserve(counts.size());
     for (const auto & [key, count] : counts) {
-        if (key.layer == il && count > 0) {
-            out.emplace_back(key.expert_id, count);
+        if (count > 0) {
+            out.emplace_back(key.layer, key.expert_id, count);
         }
     }
 }
@@ -771,5 +821,5 @@ void llama_hot_expert_cache::promote_expert(int il, int32_t expert_id) {
     if (pinned.count(key) != 0 || pin_inflight.count(key) != 0) {
         return;  // already resident in RAM (or a pin for it is queued)
     }
-    try_promote(il, ls, expert_id, it->second);
+    try_promote(il, ls, expert_id, it->second, false);
 }

@@ -45,6 +45,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 struct llama_model;
 struct ggml_tensor;
@@ -107,16 +108,13 @@ class llama_moe_cache {
     // --experts-stats-interval cadence; also refreshes the churn snapshot.
     void print_stats();
 
-    // llama_hot_expert_cache::vram_query_fn-compatible: is this expert currently
-    // served from VRAM? (the RAM tier uses this to skip double-covering)
-    static bool vram_resident_cb(void * ud, int il, int32_t expert_id);
+    // llama_hot_expert_cache::vram_query_fn-compatible: fills `flags` with the
+    // 0/1 residency of every expert of layer `il` (empty when the layer has no
+    // device cache). The RAM tier uses it to skip double-covering residents and
+    // to feed this cache's decode-time hit/miss stats (see vram_stats).
+    static void vram_resident_cb(void * ud, int il, std::vector<uint8_t> & flags);
 
   private:
-    // ggml_moe_obs_cb_t-compatible entry point; reports routed experts so the
-    // cache can measure its own hit rate (decisions come from the hot cache's
-    // counts, this is telemetry only)
-    static void moe_obs_cb(const char * tensor_name, const struct ggml_tensor * ids, void * ud);
-
     // reconcile the residents with the current ranking (see llama-moecache.cpp)
     void rebalance();
 

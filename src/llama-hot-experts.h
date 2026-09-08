@@ -102,8 +102,11 @@ class llama_hot_expert_cache {
     // the shared decayed ranking to the VRAM tier and let it report residents so
     // the RAM tier does not waste slots double-covering them.
 
-    // all (expert_id, count) pairs of one layer with count > 0 (unsorted)
-    void layer_counts(int il, std::vector<std::pair<int32_t, uint64_t>> & out) const;
+    // (layer, expert_id, count) of every routed expert with count > 0, unsorted:
+    // one lock and one pass over the whole ranking (the VRAM tier rebalances
+    // all of its cached layers from one snapshot instead of asking per layer,
+    // which used to rescan the full table once per cached layer)
+    void all_counts(std::vector<std::tuple<int, int32_t, uint64_t>> & out) const;
 
     // hand a global BYTE budget to the globally hottest (layer, expert) pairs:
     // out[il] = slots for layer il (0 = none). bytes_per_layer[il] = cost of one
@@ -116,11 +119,19 @@ class llama_hot_expert_cache {
     // lifetime content tokens observed (all ubatches, prefill + generation)
     uint64_t content_tokens() const;
 
-    // experts currently served from VRAM are reported through this query so the
-    // RAM tier skips them (and prefetches nothing for them). Call with null to
-    // clear. The callback runs while the cache mutex is held.
-    using vram_query_fn = bool (*)(void * ud, int il, int32_t expert_id);
+    // The experts currently served from VRAM are reported through this query so
+    // the RAM tier skips them (and prefetches nothing for them). The callback
+    // fills `flags` with one 0/1 byte per expert id of layer `il` (empty when
+    // the layer has no device cache) and runs while this cache's mutex is held,
+    // once per observed layer per ubatch. Call with null to clear.
+    using vram_query_fn = void (*)(void * ud, int il, std::vector<uint8_t> & flags);
     void set_vram_query(vram_query_fn fn, void * ud);
+
+    // decode-time VRAM-tier hit/miss counters of one layer: a routed expert is a
+    // hit when its device copy served it (the host read was skipped), a miss when
+    // it was routed to the host experts. Kept by the shared observation while the
+    // VRAM tier is active; read by its stats report (both are 0 while inactive).
+    void vram_stats(int il, uint64_t & n_hit, uint64_t & n_miss) const;
 
     // an expert just became VRAM-resident: drop its RAM mlock (the VRAM copy
     // serves it; the mlock would only waste a RAM slot for a deeper expert)
@@ -183,6 +194,11 @@ class llama_hot_expert_cache {
 
         bool tensors_are_host = false;  // false => experts live on a non-CPU backend, pinning is a no-op
         bool resolved_tensors = false;
+
+        // decode-time VRAM-tier hit/miss of this layer (see vram_stats()); updated
+        // by observe() only while the VRAM tier serves this layer
+        uint64_t n_vram_hit  = 0;
+        uint64_t n_vram_miss = 0;
     };
 
     // -- tuning constants ----------------------------------------------------
@@ -205,11 +221,13 @@ class llama_hot_expert_cache {
 
     // called once per (layer, selected expert) observation; updates global counts and
     // pins/evicts on the fly against the global top-N set
-    void observe_expert(int il, layer_state & ls, int32_t expert_id);
+    void observe_expert(int il, layer_state & ls, int32_t expert_id, bool vram_resident);
 
     // pin/evict bookkeeping for one expert at its CURRENT count; shared by
-    // observe_expert (after a fresh count++) and promote_expert (VRAM eviction)
-    void try_promote(int il, layer_state & ls, int32_t expert_id, uint64_t count);
+    // observe_expert (after a fresh count++) and promote_expert (VRAM eviction).
+    // vram_resident is the result of this layer's residency snapshot, so the
+    // hot path never re-queries the VRAM tier per expert
+    void try_promote(int il, layer_state & ls, int32_t expert_id, uint64_t count, bool vram_resident);
 
     // is expert_id currently served by the VRAM tier? (caller holds mu)
     bool is_vram_resident(int il, int32_t expert_id) const;
@@ -278,6 +296,14 @@ class llama_hot_expert_cache {
     const bool     track_rank;       // rank feeds pinning/VRAM tier; false = prefetch-only mode
     uint64_t       n_tokens_seen = 0;  // tokens since the last decay
     int64_t        n_tokens_cur  = 0;  // tokens of the ubatch being computed (ask-phase gate)
+
+    // per-observation scratch, reused instead of per-call allocation: observe()
+    // runs once per layer per ubatch on the compute thread, so nothing here is
+    // shared across threads (ids are read on the compute thread, the residency
+    // flags and prefetch ranges under mu)
+    std::vector<int32_t>                                 obs_scratch;      // routed expert ids of the ubatch
+    std::vector<uint8_t>                                 vram_flags;       // per-layer VRAM residency snapshot
+    std::vector<std::pair<const void *, size_t>>         prefetch_ranges;  // rows to read ahead
 
     mutable std::mutex                   mu;
     std::unordered_map<int, layer_state> layers;

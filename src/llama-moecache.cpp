@@ -12,12 +12,12 @@
 #include <cinttypes>
 #include <condition_variable>
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
 #include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -40,11 +40,8 @@ struct llama_moe_cache::impl {
         // bookkeeping
         std::vector<int32_t> slot_expert;   // slots -> published resident expert (-1 = empty)
         std::vector<int32_t> slot_target;   // slots -> expert whose upload is in flight (-1 = none)
-        std::vector<char>    resident;      // n_expert -> currently served from VRAM (obs / hot query)
+        std::vector<uint8_t> resident;      // n_expert -> currently served from VRAM (hot query / stats)
         std::deque<int32_t>  pending_q;     // desired ids not yet resident/in flight, hottest first
-
-        uint64_t n_hit  = 0;
-        uint64_t n_miss = 0;
     };
 
     struct upload_job {
@@ -79,11 +76,11 @@ struct llama_moe_cache::impl {
     std::vector<upload_job>  done;
     bool                     stop = false;
 
-    // guards the bookkeeping above + the obs telemetry. Obs runs during graph
-    // compute, tick()/rebalance() between graphs, so contention is negligible;
-    // the hot cache may call vram_resident_cb() (holding its own mutex) while
-    // we hold this one - that is the only lock order (never take hot's mutex
-    // while holding this one).
+    // guards the bookkeeping above. The hot cache calls vram_resident_cb() (holding
+    // its own mutex) from the router observation, which runs during graph compute,
+    // while tick()/rebalance() run between graphs - so contention is negligible.
+    // hot.mu -> this mutex is the only lock order (never take hot's mutex while
+    // holding this one).
     std::mutex mtx;
 
     uint64_t n_content      = 0;
@@ -135,6 +132,25 @@ static size_t expert_slice_bytes(const ggml_tensor * w) {
     return w->nb[2];
 }
 
+// write one layer's full expert->slot table to both copies (device + host).
+// Batching every boundary change into one per-layer refresh keeps the device
+// traffic at a single small copy per changed layer instead of one 4-byte set
+// per expert. Caller holds the impl mutex; no graph is running.
+static void sync_tables(llama_moe_cache_layer & pub, const std::vector<int32_t> & slot_expert) {
+    const int32_t n_expert = (int32_t) pub.gate_src->ne[2];
+    const int32_t dummy    = pub.n_slots;
+
+    std::vector<int32_t> tbl(n_expert, dummy);
+    for (int32_t s = 0; s < pub.n_slots; ++s) {
+        const int32_t e = slot_expert[s];
+        if (e >= 0 && e < n_expert) {
+            tbl[e] = s;
+        }
+    }
+    ggml_backend_tensor_set(pub.dev_table,  tbl.data(), 0, n_expert*sizeof(int32_t));
+    ggml_backend_tensor_set(pub.host_table, tbl.data(), 0, n_expert*sizeof(int32_t));
+}
+
 llama_moe_cache::llama_moe_cache(const llama_model & model, llama_hot_expert_cache * hot,
                                  int32_t slots, uint64_t budget_bytes, int32_t max_inserts) {
     if (hot == nullptr || (slots <= 0 && budget_bytes == 0)) {
@@ -149,7 +165,6 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, llama_hot_expert_cac
 
 llama_moe_cache::~llama_moe_cache() {
     if (pimpl) {
-        ggml_set_moe_obs_callback(nullptr, nullptr);
         if (pimpl->hot) {
             pimpl->hot->set_vram_query(nullptr, nullptr);
         }
@@ -161,17 +176,20 @@ bool llama_moe_cache::is_active() const {
     return pimpl != nullptr && pimpl->activated;
 }
 
-bool llama_moe_cache::vram_resident_cb(void * ud, int il, int32_t expert_id) {
+// llama_hot_expert_cache::vram_query_fn: copy this layer's residency flags (one
+// 0/1 byte per expert) for the RAM tier's observation, which snapshots each layer
+// once per ubatch instead of querying per routed expert.
+void llama_moe_cache::vram_resident_cb(void * ud, int il, std::vector<uint8_t> & flags) {
     auto * self = static_cast<llama_moe_cache *>(ud);
     if (!self || !self->pimpl || !self->pimpl->activated) {
-        return false;
+        return;
     }
     std::lock_guard<std::mutex> lock(self->pimpl->mtx);
     auto * ls = self->pimpl->find_layer(il);
-    if (!ls || expert_id < 0 || expert_id >= (int32_t) ls->resident.size()) {
-        return false;
+    if (!ls) {
+        return;  // not a cached layer: leave `flags` empty
     }
-    return ls->resident[expert_id] != 0;
+    flags.assign(ls->resident.begin(), ls->resident.end());
 }
 
 void llama_moe_cache::maybe_activate() {
@@ -422,7 +440,6 @@ void llama_moe_cache::maybe_activate() {
         }
     });
 
-    ggml_set_moe_obs_callback(&llama_moe_cache::moe_obs_cb, this);
     p->hot->set_vram_query(&llama_moe_cache::vram_resident_cb, this);
 
     p->activated = true;
@@ -457,52 +474,6 @@ const llama_moe_cache_layer * llama_moe_cache::lookup(const ggml_tensor * gate) 
     return nullptr;
 }
 
-// ggml_moe_obs_cb_t: invoked from the CPU mul_mat_id of a host-resident gate
-// layer during decode. Telemetry only: measures the realized hit rate (an
-// expert counts as a hit when its host read is actually skipped because the
-// VRAM copy serves it). Content decisions live in the hot cache's counts.
-void llama_moe_cache::moe_obs_cb(const char * tensor_name, const struct ggml_tensor * ids, void * ud) {
-    auto * self = static_cast<llama_moe_cache *>(ud);
-    if (!self || !self->pimpl || !self->pimpl->activated) {
-        return;
-    }
-    auto * p = self->pimpl.get();
-
-    // "blk.<il>.ffn_gate_up_exps.weight" (or "...ffn_gate_exps.weight")
-    if (strncmp(tensor_name, "blk.", 4) != 0) {
-        return;
-    }
-    const int il = atoi(tensor_name + 4);
-
-    const int64_t n_ids    = ids->ne[0];
-    const int64_t n_tokens = ids->ne[1];
-    if (n_ids <= 0 || n_tokens != 1) {
-        return; // decode only: the cache graph is not built for batches/prefill
-    }
-    if (ids->type != GGML_TYPE_I32 || ids->data == nullptr) {
-        return;
-    }
-
-    std::lock_guard<std::mutex> lock(p->mtx);
-
-    auto * ls = p->find_layer(il);
-    if (!ls) {
-        return; // not a cached layer
-    }
-
-    const int32_t * data = (const int32_t *) ids->data;
-    for (int64_t i = 0; i < n_ids; ++i) {
-        const int32_t id = data[i];
-        if (id >= 0 && id < (int32_t) ls->resident.size()) {
-            if (ls->resident[id]) {
-                ls->n_hit++;
-            } else {
-                ls->n_miss++;
-            }
-        }
-    }
-}
-
 // rebalance the residents against the current ranking. No locks held when
 // entering (queries the hot cache, which locks its own mutex). Applies the
 // evictions/queues the additions under the local mutex, then re-admits the
@@ -512,25 +483,43 @@ void llama_moe_cache::rebalance() {
 
     // snapshot each cached layer's current counts and pick its top n_slots
     struct plan {
-        size_t              li;
+        size_t               li;
         std::vector<int32_t> desired; // top of the ranking, hottest first
     };
     std::vector<plan> plans;
     plans.reserve(p->layers.size());
 
+    // index the cached layers by transformer layer id, then walk the shared
+    // ranking ONCE: per-layer queries used to rescan the whole table once per
+    // cached layer (quadratic in the number of cached layers)
+    std::unordered_map<int, size_t> idx;
+    idx.reserve(p->layers.size());
+    for (size_t li = 0; li < p->layers.size(); ++li) {
+        idx.emplace(p->layers[li].pub.il, li);
+    }
+
+    std::vector<std::tuple<int, int32_t, uint64_t>> all;
+    p->hot->all_counts(all); // locks the hot cache's mutex
+
+    std::vector<std::vector<std::pair<int32_t, uint64_t>>> raw(p->layers.size());
+    for (const auto & [layer, expert, count] : all) {
+        const auto it = idx.find(layer);
+        if (it != idx.end()) {
+            raw[it->second].emplace_back(expert, count);
+        }
+    }
+
     for (size_t li = 0; li < p->layers.size(); ++li) {
         auto & ls = p->layers[li];
-        std::vector<std::pair<int32_t, uint64_t>> raw;
-        p->hot->layer_counts(ls.pub.il, raw); // locks the hot cache's mutex
 
-        std::sort(raw.begin(), raw.end(), [](const auto & a, const auto & b) {
+        std::sort(raw[li].begin(), raw[li].end(), [](const auto & a, const auto & b) {
             return a.second > b.second || (a.second == b.second && a.first < b.first);
         });
 
         plan pl;
         pl.li = li;
         pl.desired.reserve(ls.pub.n_slots);
-        for (const auto & [id, cnt] : raw) {
+        for (const auto & [id, cnt] : raw[li]) {
             if ((int32_t) pl.desired.size() >= ls.pub.n_slots) {
                 break;
             }
@@ -546,13 +535,13 @@ void llama_moe_cache::rebalance() {
         for (auto & pl : plans) {
             auto & ls = p->layers[pl.li];
             const int32_t n_slots = ls.pub.n_slots;
-            const int32_t dummy   = n_slots;
 
             auto in_desired = [&](int32_t e) {
                 return std::find(pl.desired.begin(), pl.desired.end(), e) != pl.desired.end();
             };
 
             // evict published residents that are no longer in the top set
+            bool changed = false;
             for (int32_t s = 0; s < n_slots; ++s) {
                 const int32_t e = ls.slot_expert[s];
                 if (e < 0) {
@@ -563,10 +552,11 @@ void llama_moe_cache::rebalance() {
                 }
                 ls.slot_expert[s] = -1;
                 ls.resident[e]    = 0;
-                const int32_t v = dummy;
-                ggml_backend_tensor_set(ls.pub.dev_table,  &v, (size_t) e*sizeof(int32_t), sizeof(int32_t));
-                ggml_backend_tensor_set(ls.pub.host_table, &v, (size_t) e*sizeof(int32_t), sizeof(int32_t));
                 evicted.emplace_back(ls.pub.il, e);
+                changed = true;
+            }
+            if (changed) {
+                sync_tables(ls.pub, ls.slot_expert);
             }
 
             // queue the additions (in ranking order) for the ticks to drain
@@ -611,16 +601,20 @@ void llama_moe_cache::tick(int64_t n_content_tokens) {
         p->n_content += (uint64_t) std::max<int64_t>(0, n_content_tokens);
         p->n_ticks++;
 
+        std::vector<char> dirty(p->layers.size(), 0);
         for (const auto & j : p->done) {
             auto & ls = p->layers[j.layer_idx];
-            ls.slot_expert[j.slot]    = j.expert;
-            ls.slot_target[j.slot]    = -1;
-            ls.resident[j.expert]     = 1;
-
-            const int32_t v = j.slot;
-            ggml_backend_tensor_set(ls.pub.dev_table,  &v, (size_t) j.expert*sizeof(int32_t), sizeof(int32_t));
-            ggml_backend_tensor_set(ls.pub.host_table, &v, (size_t) j.expert*sizeof(int32_t), sizeof(int32_t));
+            ls.slot_expert[j.slot] = j.expert;
+            ls.slot_target[j.slot] = -1;
+            ls.resident[j.expert]  = 1;
+            dirty[j.layer_idx]     = 1;
             became_resident.emplace_back(ls.pub.il, j.expert);
+        }
+        // publish the new mappings in one table refresh per changed layer
+        for (size_t li = 0; li < p->layers.size(); ++li) {
+            if (dirty[li]) {
+                sync_tables(p->layers[li].pub, p->layers[li].slot_expert);
+            }
         }
         p->done.clear();
     }
@@ -702,7 +696,7 @@ void llama_moe_cache::print_stats() {
         n_ticks = p->n_ticks;
         report.reserve(p->layers.size());
         for (auto & ls : p->layers) {
-            layer_report r = { ls.pub.il, ls.pub.n_slots, 0, ls.n_hit, ls.n_miss };
+            layer_report r = { ls.pub.il, ls.pub.n_slots, 0, 0, 0 };
             for (int32_t e : ls.slot_expert) {
                 if (e < 0) {
                     continue;
@@ -715,8 +709,6 @@ void llama_moe_cache::print_stats() {
             }
             n_slots_total += (size_t) r.n_slots;
             n_res_total   += (size_t) r.n_res;
-            n_hit_total   += r.n_hit;
-            n_miss_total  += r.n_miss;
             report.push_back(r);
         }
 
@@ -730,6 +722,15 @@ void llama_moe_cache::print_stats() {
                 }
             }
         }
+    }
+
+    // decode-time VRAM-tier hit/miss telemetry: the hot cache's router
+    // observation replaced this cache's own decode hook, so read the counters
+    // back here (after the locks, keeping the hot.mu -> impl.mtx lock order)
+    for (auto & r : report) {
+        p->hot->vram_stats(r.il, r.n_hit, r.n_miss);
+        n_hit_total  += r.n_hit;
+        n_miss_total += r.n_miss;
     }
 
     const uint64_t t_total = n_hit_total + n_miss_total;
