@@ -196,26 +196,18 @@ bool llama_hot_expert_cache::eval_callback(struct ggml_tensor * t, bool ask, voi
     return true;
 }
 
-// ask phase. Layers with experts offloaded to a device cannot be observed, and
-// layers that this ubatch's sampling pattern skips return false, so the
-// scheduler does not chunk the graph at their topk tensor. Everything host-resident
-// is observed whenever the ubatch has work for the engine: single-token decode
-// ubatches feed the ranking (pinning / VRAM MoE tier), multi-token batch/prefill
-// ubatches drive the prefetch alone.
+// ask phase, multi-token (batch/prefill) ubatches only. llama_context installs
+// the eval callback only when the ubatch is multi-token AND --hot-experts-prefetch
+// is on: the read-ahead is the only reason to break the graph mid-ubatch. Decode
+// ubatches never reach this callback - they feed the ranking post-compute via
+// observe_decode(). Layers with experts offloaded to a device cannot be prefetched
+// and return false, so the scheduler does not chunk the graph at their topk.
 bool llama_hot_expert_cache::wants_observe(int il) {
-    std::lock_guard<std::mutex> lock(mu);
-
-    // single-token decode ubatches feed the ranking whenever a consumer exists
-    // (pinning / VRAM MoE tier); multi-token (batch/prefill) ubatches are only
-    // observed for the prefetch, and only when it is enabled. A prefill never
-    // sees the counts or the pinned set move (see the class comment).
-    if (n_tokens_cur == 1) {
-        if (!track_rank) {
-            return false;  // prefetch-only mode: decode ubatches never prefetch
-        }
-    } else if (!prefetch_enabled) {
-        return false;  // batch/prefill ubatches are only useful for the prefetch
+    if (!prefetch_enabled || n_tokens_cur <= 1) {
+        return false;
     }
+
+    std::lock_guard<std::mutex> lock(mu);
 
     layer_state & ls = layers[il];
     if (!ls.resolved_tensors) {
@@ -238,6 +230,12 @@ void llama_hot_expert_cache::observe(int il, const struct ggml_tensor * t) {
     const int64_t n_ids         = n_expert_used * n_tokens;
 
     if (n_ids <= 0) {
+        return;
+    }
+
+    // only the multi-token (batch/prefill) prefetch runs through the eval
+    // callback: decode ubatches feed the ranking post-compute (observe_decode)
+    if (!prefetch_enabled || n_tokens <= 1) {
         return;
     }
 
@@ -265,54 +263,6 @@ void llama_hot_expert_cache::observe(int il, const struct ggml_tensor * t) {
         }
 
         n_eval_calls++;
-
-        // single-token decode ubatch: update the shared ranking and the pin set
-        // from every routed selection. Only the decode routing mix predicts what
-        // generation keeps routing, so batch/prefill ubatches (n_tokens > 1)
-        // never reach this branch: their wide one-shot expert set would churn
-        // both tiers without any decode payoff (the prefetch below is what
-        // serves their reads). Only pinning and the VRAM MoE tier consume the
-        // ranking, so prefetch-only runs skip the branch as well.
-        if (track_rank && n_tokens == 1) {
-            // snapshot this layer's VRAM residency ONCE per ubatch: the VRAM tier
-            // only publishes/evicts at the ubatch boundary (never mid-graph), so one
-            // flags copy per layer replaces a locked cross-cache query per routed id
-            vram_flags.clear();
-            if (vram_query) {
-                vram_query(vram_ud, il, vram_flags);
-            }
-            // only layers the VRAM tier actually caches carry a full flag table;
-            // everything else stays empty and reads as "not served from VRAM"
-            const bool vram_tier_layer = !vram_flags.empty();
-
-            auto is_served = [&](int32_t id) {
-                return (size_t) id < vram_flags.size() && vram_flags[(size_t) id] != 0;
-            };
-
-            for (int32_t id : obs_scratch) {
-                if (id < 0) {
-                    continue;
-                }
-                const bool served = is_served(id);
-                if (served) {
-                    // decode-time VRAM-tier hit: the VRAM copy served the expert
-                    // and this host read was skipped
-                    ls.n_vram_hit++;
-                } else {
-                    // realized RAM-tier hit rate: a routed expert is a hit when its
-                    // pages are already mlock'd at routing time.
-                    if (pinned.count(expert_key{ il, id }) != 0) {
-                        n_route_hit++;
-                    } else {
-                        n_route_miss++;
-                    }
-                    if (vram_tier_layer) {
-                        ls.n_vram_miss++;
-                    }
-                }
-                observe_expert(il, ls, id, served);
-            }
-        }
 
         // (A per-token reorder to put pinned experts first was tried here and
         // removed: the CPU mul_mat_id batches each expert across the whole ubatch
@@ -355,13 +305,97 @@ void llama_hot_expert_cache::observe(int il, const struct ggml_tensor * t) {
         }
     }  // lock released here
 
-    if (prefetch_enabled && !prefetch_ranges.empty()) {
+    if (!prefetch_ranges.empty()) {
         n_prefetch_calls++;
         for (const auto & range : prefetch_ranges) {
             n_prefetch_bytes += range.second;
         }
         if (!llama_mmap::prefetch(prefetch_ranges)) {
             n_prefetch_failures++;
+        }
+    }
+}
+
+void llama_hot_expert_cache::observe_decode(const std::vector<ggml_tensor *> & topk) {
+    // one pass over the layers of the decode graph that just finished computing:
+    // read each layer's routed top-k ids from its kept-alive graph tensor
+    // (registered and flagged GGML_TENSOR_FLAG_OUTPUT by llama_context at graph
+    // build time) and feed the shared ranking exactly as the old mid-graph
+    // observation did - without chunking the decode graph at every MoE layer and
+    // without walking every node through the eval callback
+    for (int il = 0; il < (int) topk.size(); ++il) {
+        const ggml_tensor * t = topk[il];
+        if (t == nullptr || t->type != GGML_TYPE_I32) {
+            continue;
+        }
+
+        const int64_t n_expert_used = t->ne[0];
+        const int64_t n_tokens      = t->ne[1];
+        const int64_t n_ids         = n_expert_used * n_tokens;
+
+        if (n_ids <= 0 || n_tokens != 1) {
+            continue;  // decode graphs route a single token per ubatch
+        }
+
+        layer_state & ls = layers[il];
+        if (!ls.resolved_tensors) {
+            resolve_tensors(il, ls);
+        }
+        if (!ls.tensors_are_host) {
+            continue;  // experts offloaded to a device: nothing to count or pin
+        }
+
+        // reuse the per-observation scratch: this runs once per layer per decode
+        // ubatch on the decode thread, so per-call allocation is pure churn
+        obs_scratch.resize(n_ids);
+        int32_t * ids = obs_scratch.data();
+        if (ggml_backend_buffer_is_host(t->buffer)) {
+            std::memcpy(ids, t->data, n_ids * sizeof(int32_t));
+        } else {
+            ggml_backend_tensor_get(t, ids, 0, n_ids * sizeof(int32_t));
+        }
+
+        std::lock_guard<std::mutex> lock(mu);
+
+        n_eval_calls++;
+
+        // snapshot this layer's VRAM residency: the VRAM tier only publishes and
+        // evicts at the ubatch boundary (tick), never during a graph, so the flags
+        // read here describe exactly what the decode graph just used
+        vram_flags.clear();
+        if (vram_query) {
+            vram_query(vram_ud, il, vram_flags);
+        }
+        // only layers the VRAM tier actually caches carry a full flag table;
+        // everything else stays empty and reads as "not served from VRAM"
+        const bool vram_tier_layer = !vram_flags.empty();
+
+        auto is_served = [&](int32_t id) {
+            return (size_t) id < vram_flags.size() && vram_flags[(size_t) id] != 0;
+        };
+
+        for (int32_t id : obs_scratch) {
+            if (id < 0) {
+                continue;
+            }
+            const bool served = is_served(id);
+            if (served) {
+                // decode-time VRAM-tier hit: the VRAM copy served the expert
+                // and this host read was skipped
+                ls.n_vram_hit++;
+            } else {
+                // realized RAM-tier hit rate: a routed expert is a hit when its
+                // pages are already mlock'd at routing time
+                if (pinned.count(expert_key{ il, id }) != 0) {
+                    n_route_hit++;
+                } else {
+                    n_route_miss++;
+                }
+                if (vram_tier_layer) {
+                    ls.n_vram_miss++;
+                }
+            }
+            observe_expert(il, ls, id, served);
         }
     }
 }

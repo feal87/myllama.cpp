@@ -293,6 +293,17 @@ private:
     // (null when disabled or when the model has no cacheable layer)
     std::unique_ptr<llama_moe_cache> moe_cache;
 
+    // single-token decode ubatches feed the hot-expert ranking (RAM pin tier /
+    // VRAM MoE tier), so their top-k expert selection is observed after the
+    // graph compute instead of through the mid-graph eval callback
+    bool hot_observe_decode = false;
+
+    // ffn_moe_topk-<il> tensors of the current decode graph, kept alive
+    // (GGML_TENSOR_FLAG_OUTPUT) so llama_hot_expert_cache::observe_decode can
+    // read the routed ids after the compute. Indexed by layer id; null when the
+    // layer has no registered MoE topk in the last decode graph build
+    std::vector<ggml_tensor *> hot_topk_tensors;
+
     // last time the periodic expert-tier stats report was printed (us)
     int64_t t_experts_stats_us = 0;
 

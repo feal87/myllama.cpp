@@ -127,6 +127,7 @@ llama_context::llama_context(
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
     embd_layer_inp.resize(hparams.n_layer() + 1);
+    hot_topk_tensors.resize(hparams.n_layer(), nullptr);
 
     cparams.ctx_type          = params.ctx_type;
     cparams.rope_scaling_type = params.rope_scaling_type;
@@ -163,6 +164,11 @@ llama_context::llama_context(
     // a prefetch-only run needs no counts at all.
     const bool moe_requested =
         cparams.n_moe_cache_budget_bytes > 0;
+
+    // decode ubatches feed the hot-expert ranking whenever pinning or the VRAM
+    // MoE tier can consume it (matches the track_rank the engine was built with)
+    hot_observe_decode = cparams.n_pin_hot_experts > 0 || moe_requested;
+
     const bool hot_experts_requested =
         cparams.n_pin_hot_experts > 0 ||
         moe_requested ||
@@ -1460,6 +1466,32 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        // register the decode graph's top-k expert-id tensors so their values can
+        // be read after the compute to feed the hot-expert ranking. They are kept
+        // alive for the whole graph (GGML_TENSOR_FLAG_OUTPUT), which replaces the
+        // mid-graph eval callback that used to chunk the decode graph at every MoE
+        // layer (see llama_hot_expert_cache::observe_decode).
+        std::fill(hot_topk_tensors.begin(), hot_topk_tensors.end(), nullptr);
+        if (hot_experts && hot_observe_decode && ubatch.n_tokens == 1) {
+            static const char topk_prefix[] = "ffn_moe_topk-";
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                struct ggml_tensor * node = ggml_graph_node(gf, i);
+                if (strncmp(node->name, topk_prefix, sizeof(topk_prefix) - 1) != 0) {
+                    continue;
+                }
+                const char * p  = node->name + sizeof(topk_prefix) - 1;
+                int          il = 0;
+                for (; *p >= '0' && *p <= '9'; ++p) {
+                    il = il * 10 + (*p - '0');
+                }
+                if (*p != '\0' || il < 0 || il >= (int) hot_topk_tensors.size()) {
+                    continue;
+                }
+                ggml_set_output(node);
+                hot_topk_tensors[il] = node;
+            }
+        }
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -1483,6 +1515,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         hot_experts->on_ubatch_begin(ubatch.n_tokens);
     }
 
+    // The mid-graph eval callback is only needed for the multi-token
+    // (batch/prefill) prefetch read-ahead. Decode ubatches are observed after the
+    // compute from the registered top-k tensors (observe_decode), so running the
+    // callback here would chunk the decode graph at every MoE layer and probe
+    // every node for nothing. Applied every ubatch (also on graph reuse).
+    if (hot_experts) {
+        const bool need_eval_cb = ubatch.n_tokens > 1 && cparams.hot_experts_prefetch;
+        ggml_backend_sched_set_eval_callback(sched.get(),
+                need_eval_cb ? llama_hot_expert_cache::eval_callback : nullptr,
+                need_eval_cb ? hot_experts.get() : nullptr);
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
@@ -1491,6 +1535,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     ret = GGML_STATUS_SUCCESS;
+
+    // feed the ranking from the decode graph that just computed: reads the
+    // kept-alive top-k tensors registered at build time. The graph compute is
+    // async on device backends, so synchronize first (the top-k tensors live in
+    // the CUDA compute buffer for layers whose router runs on the GPU). Runs
+    // before the VRAM tier's tick so its rebalance sees the refreshed counts
+    // (same ordering as the old mid-graph observation).
+    if (hot_experts && hot_observe_decode && ubatch.n_tokens == 1) {
+        ggml_backend_sched_synchronize(sched.get());
+        hot_experts->observe_decode(hot_topk_tensors);
+    }
 
     // graph boundary: publish the completed MoE expert-cache uploads and schedule
     // new ones (evictions + table updates are only safe between graph executions).

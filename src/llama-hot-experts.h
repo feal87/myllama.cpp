@@ -6,9 +6,14 @@
 // (mlock()/VirtualLock()) IN PLACE inside the model's own weight tensors, so the
 // OS cannot evict them. Ranking is GLOBAL across all layers: total capacity is
 // N x num_moe_layers slots and the set is maintained online from the actual
-// router decisions (observed via the ggml_backend_sched eval callback on the
-// "ffn_moe_topk-<il>" nodes). Only experts that live in host (CPU) memory can be
-// pinned; experts offloaded to a device buffer are skipped entirely.
+// router decisions. Single-token decode graphs are observed AFTER their compute:
+// llama_context keeps each layer's "ffn_moe_topk-<il>" tensor alive
+// (GGML_TENSOR_FLAG_OUTPUT) and llama_hot_expert_cache::observe_decode reads the
+// routed ids once per decode ubatch - no mid-graph eval callback, so the decode
+// graph is never chunked at every MoE layer. Only the multi-token prefetch still
+// observes mid-graph through the ggml_backend_sched eval callback. Only experts
+// that live in host (CPU) memory can be pinned; experts offloaded to a device
+// buffer are skipped entirely.
 //
 // The ranking is fed ONLY by single-token decode ubatches: the tiers exist to
 // accelerate generation, and the decode routing mix is what predicts which
@@ -104,9 +109,23 @@ class llama_hot_expert_cache {
     llama_hot_expert_cache(const llama_hot_expert_cache &)             = delete;
     llama_hot_expert_cache & operator=(const llama_hot_expert_cache &) = delete;
 
-    // ggml_backend_sched_eval_callback-compatible entry point.
-    // Pass `this` as user_data when installing.
+    // ggml_backend_sched_eval_callback-compatible entry point. Only engaged for
+    // multi-token (batch/prefill) ubatches with --hot-experts-prefetch: the
+    // prefetch must read the routed rows while the ubatch still computes. Decode
+    // ubatches are observed post-compute via observe_decode() instead, so no
+    // eval callback is installed for them (it would chunk the graph at every MoE
+    // layer and probe every node for nothing). Pass `this` as user_data when
+    // installing.
     static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data);
+
+    // Feed the ranking from a single-token decode graph that just finished
+    // computing. `topk` maps layer id -> its ffn_moe_topk tensor (null for layers
+    // with no registered MoE topk). llama_context registers the tensors at graph
+    // build time and keeps them alive (GGML_TENSOR_FLAG_OUTPUT), so their routed
+    // ids are read here, after the compute, instead of mid-graph through the eval
+    // callback - which chunked and synchronized the decode graph at every MoE
+    // layer. Runs once per decode ubatch, before the VRAM tier's tick.
+    void observe_decode(const std::vector<ggml_tensor *> & topk);
 
     // true if `expert_id` in layer `il` is currently mlock'd in place
     bool is_pinned(int il, int32_t expert_id) const;

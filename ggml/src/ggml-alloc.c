@@ -468,6 +468,7 @@ struct tensor_alloc {
     int buffer_id;
     struct buffer_address addr;
     size_t size_max; // 0 = pre-allocated, unused, or view
+    bool is_output;  // GGML_TENSOR_FLAG_OUTPUT at layout-reserve time; a change forces a re-reserve
 };
 
 struct leaf_alloc {
@@ -857,6 +858,7 @@ static bool ggml_gallocr_reserve_n_impl(
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
+        node_alloc->dst.is_output  = (node->flags & GGML_TENSOR_FLAG_OUTPUT) != 0;
         if (node->view_src || node->data) {
             node_alloc->dst.buffer_id = -1;
             node_alloc->dst.addr = GGML_BUFFER_ADDRESS_INVALID;
@@ -1028,6 +1030,17 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst)) {
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: node %s is not valid\n", __func__, node->name);
+#endif
+            return true;
+        }
+
+        // the cached layout keeps GGML_TENSOR_FLAG_OUTPUT tensors alive until the
+        // end of the graph, so a tensor whose output flag differs from the one the
+        // layout was reserved with must trigger a re-reserve (e.g. an app flags a
+        // mid-graph tensor as output after the reserve graph was built)
+        if (((node->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) != node_alloc->dst.is_output) {
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: node %s output flag changed, re-reserving\n", __func__, node->name);
 #endif
             return true;
         }
