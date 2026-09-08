@@ -26,7 +26,7 @@
 // decode tokens of routing to collect before the VRAM tier sizes itself from
 // the profile (the first decode tokens of the first request: the shared ranking
 // is fed by single-token decode ubatches only, see llama-hot-experts.h)
-static constexpr uint64_t kMinProfileContentTokens = 256;
+static constexpr uint64_t kMinProfileContentTokens = 512;
 
 // content tokens between content rebalances (each rebalance reconciles the
 // residents with the current global ranking)
