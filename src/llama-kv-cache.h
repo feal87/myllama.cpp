@@ -162,6 +162,7 @@ public:
     //
 
     uint32_t get_size()     const;
+    uint32_t get_size_target() const;  // final cell capacity after a lazy in-flight downshift (== get_size() otherwise)
     uint32_t get_n_stream() const;
 
     bool get_has_shift() const;
@@ -192,8 +193,10 @@ public:
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    // use_target: size the view for the final lazy format (larger type after the in-flight
+    // downshift); used by the worst-case graph reserve so it never has to grow mid-session
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, bool use_target = false) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, bool use_target = false) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -481,4 +484,8 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    // worst-case graph reserve: size the graphs against the final lazy format, so the
+    // scheduler buffer covers the cache even after an in-flight downshift expands it
+    bool reserve = false;
 };

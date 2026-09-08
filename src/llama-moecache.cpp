@@ -22,8 +22,9 @@
 #include <utility>
 #include <vector>
 
-// content tokens of routing to collect before the VRAM tier sizes itself from
-// the profile (the prefill of the first request)
+// decode tokens of routing to collect before the VRAM tier sizes itself from
+// the profile (the first decode tokens of the first request: the shared ranking
+// is fed by single-token decode ubatches only, see llama-hot-experts.h)
 static constexpr uint64_t kMinProfileContentTokens = 256;
 
 // content tokens between content rebalances (each rebalance reconciles the
@@ -247,8 +248,8 @@ void llama_moe_cache::maybe_activate() {
     }
     auto * p = pimpl.get();
 
-    // wait until enough routing has been observed to size the layers from a
-    // real profile (the uniform-override mode does not need a profile, but it
+    // wait until enough decode routing has been observed to size the layers from
+    // a real profile (the uniform-override mode does not need a profile, but it
     // still only makes sense once generation starts)
     if (p->slots_override <= 0 && p->hot->content_tokens() < kMinProfileContentTokens) {
         return;

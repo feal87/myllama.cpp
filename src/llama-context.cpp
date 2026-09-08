@@ -157,10 +157,11 @@ llama_context::llama_context(
     // N), the row read-ahead (--hot-experts-prefetch) and the VRAM MoE tier
     // (--moe-expert-cache*). It runs when pinning, the MoE tier or the prefetch
     // is requested (prefetch alone = read-ahead of the routed rows, no mlock);
-    // mlock'ing itself stays gated on n_pin_hot_experts. The observed ranking is
-    // tracked only while pinning or the MoE tier can consume it (track_rank); a
-    // prefetch-only run needs no counts, so it skips them and observes multi-token
-    // ubatches only.
+    // mlock'ing itself stays gated on n_pin_hot_experts. The ranking is tracked
+    // only while pinning or the MoE tier can consume it (track_rank) and is fed
+    // by single-token decode ubatches only, so multi-token (batch/prefill)
+    // ubatches are observed for the prefetch alone and never move the ranking;
+    // a prefetch-only run needs no counts at all.
     const bool moe_requested =
         cparams.n_moe_cache_slots > 0 ||
         cparams.n_moe_cache_budget_bytes > 0;
@@ -1485,8 +1486,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     ret = GGML_STATUS_SUCCESS;
 
     // graph boundary: publish the completed MoE expert-cache uploads and schedule
-    // new ones (evictions + table updates are only safe between graph executions)
-    if (moe_cache) {
+    // new ones (evictions + table updates are only safe between graph executions).
+    // Runs on single-token decode ubatches only: the VRAM tier serves decode
+    // graphs only, and its tick must not move residents or RAM pins (publishing
+    // an upload drops the mlock of the expert via vram_takeover) underneath a
+    // batch/prefill ubatch that reads the host rows of those same experts.
+    if (moe_cache && ubatch.n_tokens == 1) {
         moe_cache->tick(ubatch.n_tokens);
     }
 

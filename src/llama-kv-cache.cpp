@@ -1374,6 +1374,10 @@ uint32_t llama_kv_cache::get_size() const {
     return cells.size();
 }
 
+uint32_t llama_kv_cache::get_size_target() const {
+    return target.size;
+}
+
 uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
@@ -1435,12 +1439,12 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
-ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, bool use_target) const {
     const int32_t ikv = map_layer_ids.at(il);
 
-    auto * k = layers[ikv].k;
+    auto * k = use_target ? layers[ikv].k_target : layers[ikv].k;
 
-    const uint64_t kv_size      = get_size();
+    const uint64_t kv_size      = use_target ? get_size_target() : get_size();
     const uint64_t n_embd_k_gqa = k->ne[0];
 
     assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
@@ -1455,12 +1459,12 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
 }
 
-ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, bool use_target) const {
     const int32_t ikv = map_layer_ids.at(il);
 
-    auto * v = layers[ikv].v;
+    auto * v = use_target ? layers[ikv].v_target : layers[ikv].v;
 
-    const uint64_t kv_size      = get_size();
+    const uint64_t kv_size      = use_target ? get_size_target() : get_size();
     const uint64_t n_embd_v_gqa = v->ne[0];
 
     // [TAG_V_CACHE_VARIABLE]
@@ -2871,7 +2875,13 @@ llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : sta
 
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
-    n_kv = kv->get_size();
+    // worst-case reserve: with lazy KV quantization the cache can still expand to its final
+    // format in flight (the downshift enlarges the cells, and every graph built after it is
+    // sized for the larger extent). Reserve against that final extent up front so the scheduler
+    // buffer never has to grow mid-session: a re-reserve after the downshift would otherwise
+    // allocate a bigger buffer exactly when the device is tight and OOM.
+    reserve = kv->get_has_lazy_quant();
+    n_kv = reserve ? kv->get_size_target() : kv->get_size();
 
     const uint32_t n_stream = kv->get_n_stream();
 
@@ -2953,11 +2963,11 @@ ggml_type llama_kv_cache_context::type_v() const {
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
-    return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
+    return kv->get_k(ctx, il, n_kv, sinfos[i_cur], reserve);
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
-    return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+    return kv->get_v(ctx, il, n_kv, sinfos[i_cur], reserve);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {

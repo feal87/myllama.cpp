@@ -2889,7 +2889,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--pin-hot-experts-decay-tokens"}, "N",
         string_format(
-            "halve all hot-expert usage counts every N tokens of content, prefill and generation alike\n"
+            "halve all hot-expert usage counts every N single-token decode tokens (prefill tokens\n"
+            "neither count nor age the ranking, so a big prefill cannot wipe or decay the pin set)\n"
             "(default: %" PRIu64 ", 0 = disabled). With aging, the pin set tracks the RECENT routing mix\n"
             "instead of letting experts that were hot at the start of a long session occupy slots after they\n"
             "drifted cold. Roughly one decay per phase length of interest works well\n"
@@ -2907,11 +2908,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--hot-experts-prefetch"},
         {"--no-hot-experts-prefetch"},
         string_format(
-            "batch/prefill read-ahead of the MoE experts that were just routed but are\n"
-            "neither mlock'd (--pin-hot-experts) nor served from VRAM (--moe-expert-cache*):\n"
-            "issued per layer right before its FFN reads them on multi-token ubatches, so\n"
-            "prefill does not demand-page every expert row (default: %s, opt-in). Skipped\n"
-            "on single-token decode, which re-reads the same pinned/VRAM-resident experts\n"
+            "batch/prefill read-ahead of the MoE experts that were just routed but are not\n"
+            "mlock'd (--pin-hot-experts): issued per layer right before its FFN reads them on\n"
+            "multi-token ubatches, so prefill does not demand-page every expert row\n"
+            "(default: %s, opt-in). VRAM-resident experts are prefetched like any other: prefill\n"
+            "reads their host rows too (the VRAM tier serves decode graphs only). Skipped on\n"
+            "single-token decode, which re-reads the same pinned/VRAM-resident experts\n"
             "every token. Fully independent: no pinning and no VRAM cache needed",
             params.hot_experts_prefetch ? "enabled" : "disabled"
         ),
@@ -2929,8 +2931,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "derive per-layer capacities from the routing profile under\n"
             "--moe-expert-cache-budget-mib (default: %d, 0 = disabled). With no pin settings\n"
             "the ranking is still observed (counts/decay) but nothing is mlock'd. Activation\n"
-            "is lazy: the cache allocates VRAM after the first prefill so the per-layer slot\n"
-            "counts reflect the actual routing mix (hot layers get many slots, cold layers none)",
+            "is lazy: the cache allocates VRAM once the first single-token decode tokens have\n"
+            "profiled the routing (the shared ranking is decode-only), so per-layer slot\n"
+            "counts reflect the routing mix that generation actually re-uses (hot layers get\n"
+            "many slots, cold layers none)",
             params.n_moe_cache_slots
         ),
         [](common_params & params, int value) {
@@ -2945,7 +2949,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "total device-memory cap, in MiB, for the MoE expert cache across ALL cached\n"
             "layers (default: %" PRIu64 ", 0 = no cap). The budget is handed to the globally\n"
-            "hottest experts observed during prefill, so per-layer capacity is top-heavy, not\n"
+            "hottest experts observed during decode, so per-layer capacity is top-heavy, not\n"
             "uniform. The device must have this much free VRAM on top of the model",
             params.n_moe_cache_budget_mib
         ),

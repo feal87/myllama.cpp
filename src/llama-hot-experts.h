@@ -10,6 +10,15 @@
 // "ffn_moe_topk-<il>" nodes). Only experts that live in host (CPU) memory can be
 // pinned; experts offloaded to a device buffer are skipped entirely.
 //
+// The ranking is fed ONLY by single-token decode ubatches: the tiers exist to
+// accelerate generation, and the decode routing mix is what predicts which
+// experts the coming decode steps keep re-routing. Multi-token (batch/prefill)
+// ubatches never update the counts nor the pinned set - their wide, one-shot
+// expert sweep would churn both tiers and leave generation with a stale hot set
+// that then has to be re-learned from scratch; the prefetch below is what keeps
+// prefill reads fast instead. The decay clock ticks on the same decode ubatches,
+// so a prefill neither ages nor decays the ranking.
+//
 // This is also the ranking engine behind the VRAM MoE tier (llama_moe_cache)
 // and the standalone prefetch (--hot-experts-prefetch): the same router
 // observation maintains the decayed global counts it sizes itself from. The
@@ -25,8 +34,10 @@
 // mostly-unpinned expert set per layer that would otherwise be demand-paged one
 // fault at a time, so each observation of a topk tensor asynchronously
 // prefetches (PrefetchVirtualMemory on Windows, posix_madvise WILLNEED on
-// POSIX) the rows the layer just routed that are neither pinned nor served from
-// VRAM, right before that layer's FFN reads them. Single-token decode is
+// POSIX) the rows the layer just routed that are not pinned, right before that
+// layer's FFN reads them. VRAM-served experts are prefetched like any other:
+// multi-token graphs never use the VRAM tier (its chain is single-token only),
+// so a prefill reads their host rows too. Single-token decode is
 // deliberately left alone: it re-reads the same few experts every token, which
 // are pinned and/or VRAM-resident after warm-up, so per-token prefetch is pure
 // syscall/page-cache churn (it measurably regressed decode). Bulk-prefetching
@@ -35,10 +46,11 @@
 // prefetch per layer at its topk keeps the reads pipelined inside the ubatch.
 //
 // Optional knobs:
-//  - aging (--pin-hot-experts-decay-tokens N): every N tokens of content all
-//    usage counts are halved, so the pin set tracks the RECENT routing mix
-//    instead of lifetime leaders (a long session otherwise lets first-past-the-
-//    post experts occupy slots after they drifted cold).
+//  - aging (--pin-hot-experts-decay-tokens N): every N single-token decode
+//    tokens all usage counts are halved, so the pin set tracks the RECENT
+//    routing mix instead of lifetime leaders (a long session otherwise lets
+//    first-past-the-post experts occupy slots after they drifted cold). Prefill
+//    tokens never advance the clock: they neither feed nor age the ranking.
 //
 // Pinning bookkeeping runs on the decode thread, but the mlock()/VirtualLock()
 // syscalls themselves - the only step that can fault a long-cold expert's pages
@@ -70,14 +82,17 @@ class llama_hot_expert_cache {
     //                    total global capacity = N * num_moe_layers, ranked globally. 0 = ranking-only
     //                    mode (observe the routing for llama_moe_cache / prefetch, pin nothing)
     // budget_bytes:      hard cap on total bytes locked across ALL layers combined (0 = unlimited, NOT recommended)
-    // decay_interval:    halve all usage counts every N tokens (0 = disabled, lifetime counts)
-    //                    (tokens of content: prefill and generation both count)
+    // decay_interval:    halve all usage counts every N decode tokens (0 = disabled, lifetime
+    //                    counts); prefill tokens neither count nor age the ranking
     // prefetch_enabled:  read-ahead (madvise WILLNEED / PrefetchVirtualMemory) the rows of the
-    //                    experts a layer just routed that are neither pinned nor served from VRAM,
-    //                    so their next read does not page-fault (--hot-experts-prefetch)
+    //                    experts a layer just routed that are not pinned, so their next read does
+    //                    not page-fault (--hot-experts-prefetch). Engages on multi-token
+    //                    (batch/prefill) ubatches only; VRAM-served experts are still prefetched
+    //                    (multi-token graphs never use the VRAM tier and read their host rows)
     // track_rank:        true when pinning or the VRAM MoE tier consumes the usage ranking; false in
-    //                    prefetch-only runs, where the count bookkeeping is skipped entirely and
-    //                    single-token decode ubatches (which never prefetch) are not observed
+    //                    prefetch-only runs, where the count bookkeeping is skipped entirely. The
+    //                    ranking is fed by single-token decode ubatches only: batch/prefill ubatches
+    //                    are observed for the prefetch alone and never move the counts or the pins
     llama_hot_expert_cache(const llama_model & model,
                            int32_t             n_pin_experts,
                            uint64_t            budget_bytes,
@@ -116,7 +131,8 @@ class llama_hot_expert_cache {
     int32_t assign_global_capacity(uint64_t budget_bytes,
             const std::vector<size_t> & bytes_per_layer, std::vector<int32_t> & out) const;
 
-    // lifetime content tokens observed (all ubatches, prefill + generation)
+    // decode tokens observed (single-token ubatches only; prefill ubatches do
+    // not feed the ranking and do not advance its clock)
     uint64_t content_tokens() const;
 
     // The experts currently served from VRAM are reported through this query so
@@ -143,7 +159,8 @@ class llama_hot_expert_cache {
 
     // Called by llama_context right before every graph compute (one call per
     // ubatch). Advances the ubatch counter and optionally decays the usage
-    // counts once every `decay_interval` tokens of content.
+    // counts once every `decay_interval` decode tokens (single-token ubatches
+    // only: prefill ubatches neither count nor age the ranking).
     void on_ubatch_begin(int64_t n_tokens);
 
     // Prints the periodic stats report (pinned vs capacity, realized RAM-tier hit
@@ -342,7 +359,7 @@ class llama_hot_expert_cache {
     uint64_t n_prefetch_bytes    = 0;
     uint64_t n_prefetch_failures = 0;
     uint64_t n_decays            = 0;
-    uint64_t n_content_tokens    = 0;  // lifetime content tokens (all ubatches)
+    uint64_t n_content_tokens    = 0;  // decode tokens observed (see content_tokens())
     uint64_t n_route_hit         = 0;  // routed expert selections served by the pinned (RAM) tier
     uint64_t n_route_miss        = 0;  // routed selections not pinned (VRAM-served experts are skipped)
 
