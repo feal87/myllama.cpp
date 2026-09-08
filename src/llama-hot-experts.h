@@ -231,6 +231,13 @@ class llama_hot_expert_cache {
     // sit ahead of a newer, hotter expert, so a large (or missing) budget cannot
     // be consumed by reservations for a backlog of colder pins
     static constexpr uint64_t pin_queue_max_bytes = 1ULL << 30; // 1 GiB
+    // hysteresis for full-set takeovers (see try_promote), so single-token count
+    // noise at the cold edge cannot keep swapping two near-equal-heat experts:
+    // a routed expert must lead the coldest pinned one by takeover_min_lead
+    // counts, and an expert that was itself just evicted stays out until
+    // evict_grace_tokens decode tokens have passed
+    static constexpr uint64_t takeover_min_lead  = 4;
+    static constexpr uint64_t evict_grace_tokens = 256;
 
     // -- observation ---------------------------------------------------------
     // ask phase: would the layer's topk data be useful this ubatch?
@@ -247,8 +254,14 @@ class llama_hot_expert_cache {
     // pin/evict bookkeeping for one expert at its CURRENT count; shared by
     // observe_expert (after a fresh count++) and promote_expert (VRAM eviction).
     // vram_resident is the result of this layer's residency snapshot, so the
-    // hot path never re-queries the VRAM tier per expert
-    void try_promote(int il, layer_state & ls, int32_t expert_id, uint64_t count, bool vram_resident);
+    // hot path never re-queries the VRAM tier per expert. apply_hysteresis is
+    // true on the routing path: full-set takeovers then need takeover_min_lead
+    // and the challenger cannot return within evict_grace_tokens of its own
+    // eviction, so count noise cannot swap two near-equal experts back and
+    // forth. The VRAM eviction handoff (promote_expert) passes false: that
+    // decision was already made on a full set recompute and must stay prompt
+    void try_promote(int il, layer_state & ls, int32_t expert_id, uint64_t count, bool vram_resident,
+                     bool apply_hysteresis);
 
     // is expert_id currently served by the VRAM tier? (caller holds mu)
     bool is_vram_resident(int il, int32_t expert_id) const;
@@ -348,6 +361,11 @@ class llama_hot_expert_cache {
     // pinned set at the previous stats report; diffed against the current one to
     // measure the list churn (expert replaced since the last report)
     std::unordered_set<expert_key, expert_key_hash> pinned_prev;
+    // decode-token time of the last takeover eviction of each expert (see the
+    // evict_grace_tokens constant): a freshly evicted expert is refused a slot
+    // until its grace expires, so it cannot immediately re-take the slot it
+    // just lost (the A/B ping-pong behind the steady churn in the reports)
+    std::unordered_map<expert_key, uint64_t, expert_key_hash> evicted_at;
 
     uint64_t n_ubatches     = 0;   // graph computes (ubatch chunks) seen
     uint64_t n_eval_calls   = 0;   // topk tensors actually observed
@@ -359,6 +377,7 @@ class llama_hot_expert_cache {
     uint64_t n_prefetch_bytes    = 0;
     uint64_t n_prefetch_failures = 0;
     uint64_t n_decays            = 0;
+    uint64_t n_hysteresis_holds  = 0;  // takeovers refused by the margin/grace guards
     uint64_t n_content_tokens    = 0;  // decode tokens observed (see content_tokens())
     uint64_t n_route_hit         = 0;  // routed expert selections served by the pinned (RAM) tier
     uint64_t n_route_miss        = 0;  // routed selections not pinned (VRAM-served experts are skipped)

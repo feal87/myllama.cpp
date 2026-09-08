@@ -152,9 +152,10 @@ void llama_hot_expert_cache::print_stats() {
                    n_bytes_locked / (1024.0 * 1024.0), n_lock_calls, n_lock_slow, n_pin_failures);
 
     LLAMA_LOG_CONT(" | obs=%" PRIu64 " ub=%" PRIu64 " | distinct (layer,expert) seen=%zu"
-                   " | prefetch calls=%" PRIu64 " bytes=%.2f MiB failures=%" PRIu64 " | decays=%" PRIu64,
+                   " | prefetch calls=%" PRIu64 " bytes=%.2f MiB failures=%" PRIu64
+                   " | decays=%" PRIu64 " takeover holds=%" PRIu64,
                    n_eval_calls, n_ubatches, total_distinct_seen, n_prefetch_calls,
-                   n_prefetch_bytes / (1024.0 * 1024.0), n_prefetch_failures, n_decays);
+                   n_prefetch_bytes / (1024.0 * 1024.0), n_prefetch_failures, n_decays, n_hysteresis_holds);
 
     if (!pinned_rank.empty()) {
         LLAMA_LOG_CONT(" | pinned count range=[%" PRIu64 ", %" PRIu64 "]", global_coldest_count, global_hottest_count);
@@ -401,10 +402,11 @@ void llama_hot_expert_cache::observe_expert(int il, layer_state & ls, int32_t ex
     expert_key key{ il, expert_id };
     counts[key]++;  // default-constructs to 0
 
-    try_promote(il, ls, expert_id, counts[key], vram_resident);
+    try_promote(il, ls, expert_id, counts[key], vram_resident, true);
 }
 
-void llama_hot_expert_cache::try_promote(int il, layer_state & ls, int32_t expert_id, uint64_t count, bool vram_resident) {
+void llama_hot_expert_cache::try_promote(int il, layer_state & ls, int32_t expert_id, uint64_t count, bool vram_resident,
+                                         bool apply_hysteresis) {
     if (!ls.tensors_are_host || n_pin <= 0 || !llama_mlock::SUPPORTED) {
         return;  // stats-only mode, nothing to pin
     }
@@ -466,6 +468,15 @@ void llama_hot_expert_cache::try_promote(int il, layer_state & ls, int32_t exper
         if (count <= key_count) {
             return;  // count <= every key <= every true count: no takeover
         }
+        // hysteresis: on the routing path a takeover needs a real lead, not the
+        // one-count overtake that near-equal experts at the cold edge cross by
+        // pure noise (the steady churn in the reports). Stale-low keys only make
+        // this stricter. The VRAM eviction handoff skips it: that path already
+        // re-decided the whole set and must stay prompt
+        if (apply_hysteresis && count < key_count + takeover_min_lead) {
+            n_hysteresis_holds++;
+            return;
+        }
         const int     mem_layer = std::get<1>(*it);
         const int32_t mem_id    = std::get<2>(*it);
         if (pinned.count(expert_key{ mem_layer, mem_id }) == 0) {
@@ -485,6 +496,22 @@ void llama_hot_expert_cache::try_promote(int il, layer_state & ls, int32_t exper
 
     const int      evict_layer = std::get<1>(victim);
     const int32_t  evict_id    = std::get<2>(victim);
+
+    // hysteresis: an expert that was itself just evicted stays out for
+    // evict_grace_tokens decode tokens, or the takeover victim would climb right
+    // back on its next routes and take the slot from its own replacement (A/B
+    // ping-pong). Its count keeps rising while it is out, so the guard only
+    // spaces genuine re-takeovers apart
+    if (apply_hysteresis) {
+        auto ev = evicted_at.find(key);
+        if (ev != evicted_at.end()) {
+            if (n_content_tokens - ev->second < evict_grace_tokens) {
+                n_hysteresis_holds++;
+                return;
+            }
+            evicted_at.erase(ev);  // grace expired: admission allowed again
+        }
+    }
 
     // if the worker queue is already full the replacement cannot be queued, so
     // evicting the victim would only waste a resident expert: skip the takeover
@@ -510,6 +537,10 @@ void llama_hot_expert_cache::try_promote(int il, layer_state & ls, int32_t exper
         resolve_tensors(evict_layer, evict_ls);
     }
     unpin_expert(evict_layer, evict_ls, evict_id);
+
+    // remember the eviction: the victim must not immediately take a slot back
+    // (the grace guard above holds it out for evict_grace_tokens decode tokens)
+    evicted_at[expert_key{ evict_layer, evict_id }] = n_content_tokens;
 
     if (!enqueue_pin(job)) {
         // only possible if the queue filled or the budget was exhausted between
@@ -676,6 +707,7 @@ void llama_hot_expert_cache::pin_worker_main() {
         }
         pinned.emplace(key, std::move(pe));
         pinned_rank.insert({ c, job.il, job.expert_id });
+        evicted_at.erase(key);  // pinned again: the grace bookkeeping is moot
     }
 }
 
@@ -880,5 +912,5 @@ void llama_hot_expert_cache::promote_expert(int il, int32_t expert_id) {
     if (pinned.count(key) != 0 || pin_inflight.count(key) != 0) {
         return;  // already resident in RAM (or a pin for it is queued)
     }
-    try_promote(il, ls, expert_id, it->second, false);
+    try_promote(il, ls, expert_id, it->second, false, false);
 }
