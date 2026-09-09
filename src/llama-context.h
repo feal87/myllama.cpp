@@ -304,6 +304,13 @@ private:
     // layer has no registered MoE topk in the last decode graph build
     std::vector<ggml_tensor *> hot_topk_tensors;
 
+    // n_tokens of the previous ubatch processed by process_ubatch (0 = none
+    // yet). In the llama-server np = 1 flow decode ubatches are strictly
+    // single-token, so a decode ubatch followed by a multi-token (prefill)
+    // ubatch marks the start of a new prompt: the expert tiers are then reset
+    // for it (see llama_hot_expert_cache::on_prompt_begin / llama_moe_cache)
+    int64_t prev_ubatch_n_tokens = 0;
+
     // last time the periodic expert-tier stats report was printed (us)
     int64_t t_experts_stats_us = 0;
 

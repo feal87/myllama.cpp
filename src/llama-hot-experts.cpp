@@ -968,6 +968,41 @@ void llama_hot_expert_cache::decay_counts() {
     n_decays++;
 }
 
+void llama_hot_expert_cache::on_prompt_begin() {
+    std::lock_guard<std::mutex> lock(mu);
+
+    if (!track_rank) {
+        return;  // prefetch-only mode: no usage counts are maintained
+    }
+
+    // A new prompt defines new routing priorities (its decode ubatches start
+    // feeding the ranking right after this): divide every usage count by four
+    // immediately (same floor-at-1 rounding as the periodic halving), so the
+    // pin/VRAM sets can re-converge on the new prompt's expert mix instead of
+    // letting the previous prompt's lifetime leaders hold their slots.
+    for (auto & [il, ls] : layers) {
+        (void) il;
+        if (!ls.resolved_tensors) {
+            continue;
+        }
+        for (uint64_t & c : ls.counts) {
+            const uint64_t new_count = (c + 3) / 4;  // divide by 4, floor at 1
+            if (new_count != c) {
+                c = new_count;
+            }
+        }
+    }
+
+    // the counts the pinned experts are ranked by changed: rebuild the ordered
+    // set once instead of patching one key per pinned expert
+    rebuild_pinned_rank();
+
+    // fresh epoch for the periodic decay clock (do not fire a scheduled halving
+    // right on top of this one)
+    n_tokens_seen = 0;
+    n_decays++;
+}
+
 bool llama_hot_expert_cache::is_pinned(int il, int32_t expert_id) const {
     std::lock_guard<std::mutex> lock(mu);
 

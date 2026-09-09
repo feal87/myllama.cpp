@@ -196,6 +196,14 @@ class llama_hot_expert_cache {
     // only: prefill ubatches neither count nor age the ranking).
     void on_ubatch_begin(int64_t n_tokens);
 
+    // A new prompt has begun (llama_context detects the decode -> prefill
+    // transition of the ubatch stream, llama-server runs np = 1): divide every
+    // usage count by four immediately, so the shared ranking (and the RAM pin
+    // set / VRAM MoE layout it drives) can re-converge on the new prompt's
+    // routing mix instead of carrying the previous prompt's leaders. No-op in
+    // prefetch-only mode (no counts are maintained there).
+    void on_prompt_begin();
+
     // Prints the periodic stats report (pinned vs capacity, realized RAM-tier hit
     // rate, list churn since the previous report, locked bytes, per-layer pinned
     // breakdown) via LLAMA_LOG_INFO (verbosity 4). Called by llama_context at the

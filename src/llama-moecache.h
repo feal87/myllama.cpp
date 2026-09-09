@@ -27,6 +27,13 @@
 //    hot cache re-mlock's them) and winners are uploaded asynchronously and
 //    published between graphs. The LRU-free design means a super-expert that
 //    keeps being routed is never displaced by a merely-recent one.
+//  - a new prompt (llama_context detects the decode -> prefill transition)
+//    decays the shared ranking by 4x and re-arms the profile window; once the
+//    new prompt produced its own 512 decode tokens the whole LAYOUT is rebuilt
+//    (maybe_activate re-runs the sizing + carving: residents return to the RAM
+//    pin tier, per-layer slot counts are re-derived from the new ranking, and
+//    the decode graphs are rebuilt via the layout generation), so a prompt with
+//    a different topic can re-shape which layers/experts get VRAM slots.
 //
 // Memory accounting: budget_bytes is the exact total device footprint of the
 // cache (expert slots + the per-layer dummy slot + the device tables). The
@@ -113,8 +120,26 @@ class llama_moe_cache {
 
     // called before every decode ubatch until activated: sizes the per-layer
     // capacities from the observed routing profile and binds the cache tensors
-    // into the pool reserved by reserve()
+    // into the pool reserved by reserve(). Also called once per new prompt once
+    // the prompt's own first kMinProfileContentTokens decode tokens refreshed
+    // the ranking: the layout is then fully rebuilt from the new profile (same
+    // sizing + carving as the initial activation) so a change of prompt topic
+    // can re-shape which layers/experts get VRAM slots. The old layout keeps
+    // serving until the rebuild (llama_context re-arms the profile window with
+    // on_prompt_begin()).
     void maybe_activate();
+
+    // a new prompt has begun (called by llama_context at the decode -> prefill
+    // transition of the ubatch stream): start a fresh 512-token profile window
+    // for this prompt. The existing layout keeps serving normally until the
+    // window elapses and maybe_activate() rebuilds it from the new ranking.
+    void on_prompt_begin();
+
+    // number of layout builds so far (initial activation + per-prompt rebuilds).
+    // Decode graphs embed the cache tensors (and the per-layer slot counts), so
+    // the graph-reuse check compares this generation to force a decode graph
+    // rebuild whenever the layout changed (see llm_graph_params).
+    uint32_t layout_generation() const;
 
     // cache layer owning `gate` (the ffn_gate_up_exps or ffn_gate_exps tensor),
     // or nullptr when the cache is inactive or the layer has no slots

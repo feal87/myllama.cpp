@@ -112,6 +112,69 @@ struct llama_moe_cache::impl {
     // current residents to measure list churn (key = (uint32 layer << 32) | expert)
     std::unordered_set<uint64_t> prev_resident;
 
+    // per-prompt epoch: the layout is rebuilt once per new prompt, after its
+    // first kMinProfileContentTokens decode tokens refreshed the ranking.
+    // epoch_content is the hot cache's decode-token count at the prompt start
+    // (set by on_prompt_begin()); the initial activation is the same decision
+    // with the epoch anchored at context start, so no extra flags are needed.
+    uint64_t epoch_content   = 0;   // hot->content_tokens() at the prompt boundary
+    bool     epoch_rebuilt   = false; // layout (re)built for the current prompt
+
+    // bumped on every layout (re)build: decode graphs embed the cache tensors,
+    // so the graph-reuse check compares this to force a rebuild (see
+    // llama_context::graph_params / llm_graph_params::allow_reuse)
+    uint32_t layout_gen = 0;
+
+    // contexts of a layout that was just replaced. The decode graph that still
+    // referenced them is reset on the same ubatch as the rebuild, so they are
+    // freed at the next graph boundary (tick) rather than immediately (the
+    // rebuild itself runs before the graph reset). ctxs_retired_gen records the
+    // layout generation they were built at: they are only freed once a strictly
+    // newer layout is live, so a failed rebuild (which retires the still-current
+    // tensors without bumping the generation) can never free contexts a cached
+    // decode graph still references.
+    std::vector<ggml_context *> ctxs_retired;
+    ggml_context        * ctx_host_retired = nullptr;
+    ggml_backend_buffer_t buf_host_retired = nullptr;
+    uint32_t              ctxs_retired_gen = 0;
+
+    void free_retired() {
+        for (auto * ctx : ctxs_retired) {
+            ggml_free(ctx);
+        }
+        ctxs_retired.clear();
+        if (buf_host_retired) {
+            ggml_backend_buffer_free(buf_host_retired);
+            buf_host_retired = nullptr;
+        }
+        if (ctx_host_retired) {
+            ggml_free(ctx_host_retired);
+            ctx_host_retired = nullptr;
+        }
+    }
+
+    // free the retired contexts when no live decode graph can still reference
+    // them (only once a newer layout generation has been built and executed)
+    void free_retired_if_safe() {
+        if (!ctxs_retired.empty() && ctxs_retired_gen < layout_gen) {
+            free_retired();
+        }
+    }
+
+    // move the current layout's tensor contexts into the retired set (the
+    // caller has stopped the upload worker and is about to carve the pool anew)
+    void retire_layout() {
+        ctxs_retired_gen = layout_gen;
+        for (auto * ctx : ctxs_dev) {
+            ctxs_retired.push_back(ctx);
+        }
+        ctxs_dev.clear();
+        ctx_host_retired = ctx_host;
+        ctx_host         = nullptr;
+        buf_host_retired = buf_host;
+        buf_host         = nullptr;
+    }
+
     impl(const llama_model & model_, llama_hot_expert_cache * hot_,
          uint64_t budget_, int32_t inserts_) :
         model(model_), hot(hot_), budget_bytes(budget_), max_inserts(inserts_) {}
@@ -146,6 +209,8 @@ struct llama_moe_cache::impl {
         if (ctx_host) {
             ggml_free(ctx_host);
         }
+        // leftover contexts of a layout that was rebuilt but never ticked
+        free_retired();
     }
 };
 
@@ -363,7 +428,7 @@ void llama_moe_cache::reserve() {
 }
 
 void llama_moe_cache::maybe_activate() {
-    if (!pimpl || pimpl->activated || pimpl->failed) {
+    if (!pimpl || pimpl->failed) {
         return;
     }
     auto * p = pimpl.get();
@@ -378,9 +443,24 @@ void llama_moe_cache::maybe_activate() {
 
     // wait until enough decode routing has been observed to size the layers
     // from a real profile (the shared ranking is decode-only)
-    if (p->hot->content_tokens() < kMinProfileContentTokens) {
+    if (p->activated) {
+        // already active: rebuild the layout once per new prompt, after the
+        // first kMinProfileContentTokens decode tokens of that prompt refreshed
+        // the ranking. on_prompt_begin() re-arms the epoch at every prompt
+        // boundary (see llama-context.cpp), and the old layout keeps serving
+        // the first 512 tokens of the new prompt untouched. A rebuild can shrink
+        // or grow the per-layer slot counts, so the cache tensors are re-carved
+        // below exactly like the initial activation.
+        if (p->epoch_rebuilt) {
+            return;
+        }
+        if (p->hot->content_tokens() - p->epoch_content < kMinProfileContentTokens) {
+            return;
+        }
+    } else if (p->hot->content_tokens() < kMinProfileContentTokens) {
         return;
     }
+    const bool relayout = p->activated;
 
     // Per-layer VRAM slot capacities, derived from the observed routing profile:
     // hand the GLOBAL byte budget to the globally hottest experts (top of the
@@ -399,9 +479,70 @@ void llama_moe_cache::maybe_activate() {
         fixed_bytes[c.il]    = c.nbytes_1slot + (size_t) c.n_expert*sizeof(int32_t) + 4*align;
     }
     if (p->hot->assign_global_capacity(p->budget_bytes, bytes_per_layer, fixed_bytes, caps) <= 0) {
-        LLAMA_LOG_WARN("%s: no routing observed yet - MoE expert cache stays disabled\n", __func__);
-        p->failed = true;
+        if (relayout) {
+            // keep the old layout serving rather than tearing it down for a
+            // profile that gives no layer any slot
+            LLAMA_LOG_WARN("%s: relayout skipped - the new prompt profile gives no layer any VRAM slot\n", __func__);
+            p->epoch_rebuilt = true;
+        } else {
+            LLAMA_LOG_WARN("%s: no routing observed yet - MoE expert cache stays disabled\n", __func__);
+            p->failed = true;
+        }
         return;
+    }
+
+    // full per-prompt layout rebuild: pull every published VRAM resident back
+    // into the RAM pin tier (their mlock was dropped when the VRAM copy took
+    // over), then retire the old layout's tensor contexts. The decode graph that
+    // still references those tensors is reset on this same ubatch - the layout
+    // generation bump below forces the graph rebuild - so the retired contexts
+    // are freed at the next tick() instead of here. The pool itself is kept and
+    // re-carved below (it is a fixed reservation, not tied to the old tensors).
+    if (relayout) {
+        {
+            std::lock_guard<std::mutex> wlk(p->wmtx);
+            p->stop = true;
+            p->todo.clear();
+            p->done.clear();
+        }
+        p->wcv.notify_all();
+        if (p->worker.joinable()) {
+            p->worker.join();
+        }
+
+        // retire the old layout's tensor contexts. The decode graph that still
+        // references them is reset on this same ubatch - the layout generation
+        // bump below forces the graph rebuild - so they are freed once a newer
+        // layout is live (free_retired_if_safe at the tick boundary) or by the
+        // destructor. The pool itself is kept and re-carved below: it is a fixed
+        // reservation, not tied to the old tensors.
+        std::vector<std::pair<int, int32_t>> evicted;
+        {
+            std::lock_guard<std::mutex> lock(p->mtx);
+            for (auto & ls : p->layers) {
+                for (int32_t s = 0; s < (int32_t) ls.slot_expert.size(); ++s) {
+                    const int32_t e = ls.slot_expert[s];
+                    if (e < 0) {
+                        continue;
+                    }
+                    ls.slot_expert[s] = -1;
+                    ls.resident[(size_t) e] = 0;
+                    evicted.emplace_back(ls.pub.il, e);
+                }
+                std::fill(ls.slot_target.begin(), ls.slot_target.end(), -1);
+                ls.pending_q.clear();
+            }
+            p->layers.clear();
+            p->retire_layout();
+        }
+        // re-admit the evicted experts to the RAM tier: their mlock was dropped
+        // when the VRAM copy took over, so they must be mlock'd again before the
+        // VRAM copies below are rebuilt. No impl lock held here - the hot cache
+        // locks its own mutex and re-enters this one through the VRAM residency
+        // query (hot.mu -> impl.mtx is the documented lock order).
+        for (const auto & [il, e] : evicted) {
+            p->hot->promote_expert(il, e);
+        }
     }
 
     // shared host context for the CPU-side tables
@@ -413,7 +554,10 @@ void llama_moe_cache::maybe_activate() {
         };
         p->ctx_host = ggml_init(ip);
         if (!p->ctx_host) {
-            p->failed = true;
+            // a failed relayout has already retired the old layout: fall back to
+            // host-only decoding (exact) rather than serving a broken layout
+            p->activated = false;
+            p->failed    = true;
             return;
         }
     }
@@ -441,7 +585,8 @@ void llama_moe_cache::maybe_activate() {
         };
         ggml_context * ctx_dev = ggml_init(ip);
         if (!ctx_dev) {
-            p->failed = true;
+            p->activated = false;
+            p->failed    = true;
             return;
         }
         p->ctxs_dev.push_back(ctx_dev);
@@ -477,9 +622,10 @@ void llama_moe_cache::maybe_activate() {
             size_t sz = ggml_backend_buffer_get_alloc_size(p->pool, t);
             sz = (sz + align - 1) & ~(align - 1);
             if (off + sz > pool_size) {
-                LLAMA_LOG_ERROR("%s: MoE cache layout exceeds the reserved pool (%zu > %zu bytes) - MoE expert cache stays disabled\n",
+                LLAMA_LOG_ERROR("%s: MoE cache layout exceeds the reserved pool (%zu > %zu bytes) - MoE expert cache disabled\n",
                         __func__, off + sz, pool_size);
-                p->failed = true;
+                p->activated = false;
+                p->failed    = true;
                 return;
             }
             ggml_backend_tensor_alloc(p->pool, t, pool_base + off);
@@ -496,8 +642,9 @@ void llama_moe_cache::maybe_activate() {
     }
 
     if (n_cached == 0) {
-        LLAMA_LOG_WARN("%s: no layer earned any VRAM slot from the routing profile - MoE expert cache stays disabled\n", __func__);
-        p->failed = true;
+        LLAMA_LOG_WARN("%s: no layer earned any VRAM slot from the routing profile - MoE expert cache disabled\n", __func__);
+        p->activated = false;
+        p->failed    = true;
         return;
     }
 
@@ -509,7 +656,8 @@ void llama_moe_cache::maybe_activate() {
     p->buf_host = ggml_backend_alloc_ctx_tensors_from_buft(p->ctx_host, ggml_backend_cpu_buffer_type());
     if (!p->buf_host) {
         LLAMA_LOG_WARN("%s: failed to allocate the CPU-side MoE cache tables - disabled\n", __func__);
-        p->failed = true;
+        p->activated = false;
+        p->failed    = true;
         return;
     }
 
@@ -519,6 +667,14 @@ void llama_moe_cache::maybe_activate() {
         std::vector<int32_t> dummy(n_expert, ls.pub.n_slots);
         ggml_backend_tensor_set(ls.pub.dev_table,  dummy.data(), 0, n_expert*sizeof(int32_t));
         ggml_backend_tensor_set(ls.pub.host_table, dummy.data(), 0, n_expert*sizeof(int32_t));
+    }
+
+    // (re)start the upload worker: a per-prompt relayout stopped it above, so
+    // clear the stop flag before the new thread starts (activation leaves it
+    // cleared from the constructor)
+    {
+        std::lock_guard<std::mutex> wlk(p->wmtx);
+        p->stop = false;
     }
 
     // async upload worker
@@ -561,6 +717,16 @@ void llama_moe_cache::maybe_activate() {
     p->hot->set_vram_query(&llama_moe_cache::vram_resident_cb, this);
 
     p->activated = true;
+    // decode graphs embed the cache tensors and the per-layer slot counts, so
+    // the graph-reuse check compares this generation: every (re)build forces a
+    // decode graph rebuild on the same ubatch (the initial activation also
+    // flips the moe_cache pointer in the graph params from null to non-null)
+    p->layout_gen++;
+
+    // one (re)build per prompt: anchor the epoch so this prompt does not rebuild
+    // again; the next on_prompt_begin() re-arms it at the following boundary
+    p->epoch_content = p->hot->content_tokens();
+    p->epoch_rebuilt = true;
 
     {
         std::string layers_str;
@@ -572,8 +738,9 @@ void llama_moe_cache::maybe_activate() {
             }
             layers_str += "L" + std::to_string(ls.pub.il) + "=" + std::to_string(ls.pub.n_slots);
         }
-        LLAMA_LOG_INFO("%s: MoE expert cache enabled: %d layer(s), %zu VRAM slots total (%.1f of the reserved %.1f MiB pool used), up to %d uploads queued (global); profile: %s\n",
-                __func__, n_cached, n_slots_total, off/(1024.0*1024.0), p->budget_bytes/(1024.0*1024.0), p->max_inserts, layers_str.c_str());
+        LLAMA_LOG_INFO("%s: MoE expert cache %s: %d layer(s), %zu VRAM slots total (%.1f of the reserved %.1f MiB pool used), up to %d uploads queued (global); profile: %s\n",
+                __func__, relayout ? "layout rebuilt for the new prompt" : "enabled",
+                n_cached, n_slots_total, off/(1024.0*1024.0), p->budget_bytes/(1024.0*1024.0), p->max_inserts, layers_str.c_str());
     }
 
     // seed the content from the current ranking immediately, then kick the
@@ -584,6 +751,24 @@ void llama_moe_cache::maybe_activate() {
         fill_upload_queue(p);
     }
     p->wcv.notify_one();
+}
+
+// a new prompt has begun (llama_context detects the decode -> prefill
+// transition): start a fresh 512-token profile window for this prompt. The
+// existing layout keeps serving normally until the window elapses and
+// maybe_activate() rebuilds it from the new prompt's routing mix.
+void llama_moe_cache::on_prompt_begin() {
+    if (!pimpl || pimpl->failed) {
+        return;
+    }
+    auto * p = pimpl.get();
+    std::lock_guard<std::mutex> lock(p->mtx);
+    p->epoch_content = p->hot->content_tokens();
+    p->epoch_rebuilt = false;
+}
+
+uint32_t llama_moe_cache::layout_generation() const {
+    return pimpl ? pimpl->layout_gen : 0;
 }
 
 const llama_moe_cache_layer * llama_moe_cache::lookup(const ggml_tensor * gate) const {
@@ -716,6 +901,10 @@ void llama_moe_cache::tick(int64_t n_content_tokens) {
         return;
     }
     auto * p = pimpl.get();
+
+    // free the tensor contexts of a layout a per-prompt rebuild replaced, now
+    // that the decode graph referencing them was reset on that same ubatch
+    p->free_retired_if_safe();
 
     // 1) publish completed uploads (sync point: no graph is executing)
     std::vector<std::pair<int, int32_t>> became_resident;

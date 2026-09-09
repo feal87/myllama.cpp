@@ -1422,6 +1422,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // llama-server runs np = 1, where decode ubatches are strictly single-token
+    // and every new prompt starts with a multi-token (prefill) ubatch: that
+    // decode -> prefill transition is the prompt boundary. Reset the expert
+    // tiers for the new prompt - the RAM/VRAM hot sets must re-learn its
+    // routing priorities (the hot cache divides all counts by 4) and the VRAM
+    // MoE layout rebuilds once the new prompt produced its own 512-token
+    // profile, while the old layout keeps serving that warm-up window.
+    if (hot_experts && prev_ubatch_n_tokens == 1 && ubatch.n_tokens > 1) {
+        hot_experts->on_prompt_begin();
+        if (moe_cache) {
+            moe_cache->on_prompt_begin();
+        }
+    }
+    prev_ubatch_n_tokens = ubatch.n_tokens;
+
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
 
@@ -2676,6 +2691,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ (moe_cache && moe_cache->is_active()) ? moe_cache.get() : nullptr,
+        /*.moe_cache_gen =*/ (moe_cache && moe_cache->is_active()) ? moe_cache->layout_generation() : 0,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),

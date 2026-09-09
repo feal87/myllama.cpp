@@ -788,6 +788,11 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache = nullptr; // GPU MoE expert cache (null when disabled)
+    // layout build count of moe_cache (0 when disabled/inactive): decode graphs
+    // embed the cache tensors and the per-layer slot counts, so a per-prompt
+    // layout rebuild must invalidate the graph reuse even though the moe_cache
+    // pointer itself is unchanged
+    uint32_t moe_cache_gen = 0;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -882,7 +887,13 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            // the MoE expert cache changes the graph topology: activation (cache
+            // goes from inactive to active) and every per-prompt layout rebuild add
+            // the VRAM mul_mat_id chain / change the cache tensor shapes, so a
+            // reused decode graph would keep running the stale (or freed) chain
+            moe_cache == other.moe_cache &&
+            moe_cache_gen == other.moe_cache_gen;
     }
 };
 
