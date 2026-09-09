@@ -3954,13 +3954,10 @@ static void ggml_compute_forward_rms_norm_f32(
             for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
                 const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
 
-                ggml_float sum = 0.0;
-                // worth switching to explicit SIMD?
-                for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    sum += (ggml_float)(x[i00] * x[i00]);
-                }
+                float sumf = 0.0f;
+                ggml_vec_dot_f32(ne00, &sumf, sizeof(float), x, sizeof(float), x, sizeof(float), 1);
 
-                const float mean  = sum/ne00;
+                const float mean  = sumf/ne00;
                 const float scale = 1.0f/sqrtf(mean + eps);
 
                 // if you hit this, likely you got an inf somewhere earlier
@@ -4060,13 +4057,11 @@ static void ggml_compute_forward_rms_norm_back_f32(
                 const float * dz = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
                 const float * x  = (float *) ((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13);
 
-                ggml_float sum_xx  = 0.0;
-                ggml_float sum_xdz = 0.0;
+                float sum_xx  = 0.0f;
+                float sum_xdz = 0.0f;
 
-                for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    sum_xx  += (ggml_float)(x[i00] * x[i00]);
-                    sum_xdz += (ggml_float)(x[i00] * dz[i00]);
-                }
+                ggml_vec_dot_f32(ne00, &sum_xx,  sizeof(float), x,  sizeof(float), x,  sizeof(float), 1);
+                ggml_vec_dot_f32(ne00, &sum_xdz, sizeof(float), x,  sizeof(float), dz, sizeof(float), 1);
 
                 //const float mean     = (float)(sum_xx)/ne00;
                 const float mean_eps = (float)(sum_xx)/ne00 + eps;
@@ -4324,10 +4319,14 @@ static void ggml_compute_forward_l2_norm_f32(
             for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
                 const char * x = (const char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03;
 
-                ggml_float sum = 0.0;
-                for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    const float xi = *(const float *) (x + i00*nb00);
-                    sum += (ggml_float)(xi * xi);
+                float sum = 0.0f;
+                if (nb00 == sizeof(float)) {
+                    ggml_vec_dot_f32(ne00, &sum, sizeof(float), (const float *) x, sizeof(float), (const float *) x, sizeof(float), 1);
+                } else {
+                    for (int64_t i00 = 0; i00 < ne00; i00++) {
+                        const float xi = *(const float *) (x + i00*nb00);
+                        sum += xi * xi;
+                    }
                 }
 
                 const float scale = 1.0f/fmaxf(sqrtf(sum), eps);
