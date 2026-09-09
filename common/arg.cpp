@@ -2874,6 +2874,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PIN_HOTEXPERTS_DECAY_TOKENS"));
     add_opt(common_arg(
+        {"--pin-hot-experts-min-count"}, "N",
+        string_format(
+            "minimum usage count an expert needs before --pin-hot-experts will mlock it, so a\n"
+            "one-off route (count 1, pure routing noise) can never grab a slot or flip-flap the\n"
+            "pin set (default: %" PRIu64 ", 0 = pin any routed expert as soon as a slot is free).\n"
+            "Counts grow by one per decode token that routes the expert and are halved every\n"
+            "--pin-hot-experts-decay-tokens, so with aging this reads as a minimum route count\n"
+            "per decay window: scale it down for short decay and up when decay is disabled\n"
+            "(lifetime counts there, so genuinely hot experts carry much larger counts)",
+            params.n_pin_hot_experts_min_count
+        ),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --pin-hot-experts-min-count must be >= 0");
+            }
+            params.n_pin_hot_experts_min_count = (uint64_t) value;
+        }
+    ).set_env("LLAMA_ARG_PIN_HOTEXPERTS_MIN_COUNT"));
+    add_opt(common_arg(
         {"--hot-experts-prefetch"},
         {"--no-hot-experts-prefetch"},
         string_format(

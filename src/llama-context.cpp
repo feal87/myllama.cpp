@@ -147,6 +147,7 @@ llama_context::llama_context(
     cparams.n_pin_hot_experts_budget_bytes = params.n_pin_hot_experts_budget_bytes;
     cparams.n_experts_stats_interval = params.n_experts_stats_interval;
     cparams.n_pin_hot_experts_decay_tokens   = params.n_pin_hot_experts_decay_tokens;
+    cparams.n_pin_hot_experts_min_count      = params.n_pin_hot_experts_min_count;
 
     cparams.n_moe_cache_budget_bytes = params.n_moe_cache_budget_bytes;
     cparams.n_moe_cache_inserts      = params.n_moe_cache_inserts;
@@ -182,7 +183,7 @@ llama_context::llama_context(
         } else {
             hot_experts = std::make_unique<llama_hot_expert_cache>(
                 model, cparams.n_pin_hot_experts, cparams.n_pin_hot_experts_budget_bytes,
-                cparams.n_pin_hot_experts_decay_tokens,
+                cparams.n_pin_hot_experts_decay_tokens, cparams.n_pin_hot_experts_min_count,
                 cparams.hot_experts_prefetch,
                 cparams.n_pin_hot_experts > 0 || moe_requested);
             cparams.cb_eval           = llama_hot_expert_cache::eval_callback;
@@ -3915,6 +3916,7 @@ llama_context_params llama_context_default_params() {
         /*.n_pin_hot_experts_budget_bytes=*/ 0,
         /*.n_experts_stats_interval     =*/ 5,
         /*.n_pin_hot_experts_decay_tokens=*/ 0,
+        /*.n_pin_hot_experts_min_count   =*/ 8,
         /*.n_moe_cache_budget_bytes    =*/ 0,
         /*.n_moe_cache_inserts         =*/ 2,
         /*.type_k                      =*/ GGML_TYPE_F16,

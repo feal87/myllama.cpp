@@ -73,6 +73,9 @@ struct llama_cparams {
     uint64_t n_experts_stats_interval;
     // halve all usage counts every N tokens (0 = disabled, lifetime counts)
     uint64_t n_pin_hot_experts_decay_tokens;
+    // minimum usage count an expert must reach before it is pinned (0 = any routed
+    // expert); with aging the counts shrink, so scale this with the decay window
+    uint64_t n_pin_hot_experts_min_count;
 
     // GPU-resident MoE expert cache, VRAM tier on top of the hot-expert cache
     // (see llama-moecache.h). The shared routing ranking is observed by the

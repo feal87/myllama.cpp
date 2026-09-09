@@ -482,6 +482,13 @@ struct common_params {
     // halve all usage counts every N tokens (0 = disabled). See
     // --pin-hot-experts-decay-tokens.
     uint64_t n_pin_hot_experts_decay_tokens = 0;
+    // minimum usage count an expert must reach before --pin-hot-experts will
+    // mlock it (0 = any routed expert). A count is one decode token that routed
+    // the expert, halved every n_pin_hot_experts_decay_tokens, so with aging
+    // this reads as a minimum route count per decay window: scale it down for
+    // short decay, up when decay is disabled (lifetime counts). See
+    // --pin-hot-experts-min-count.
+    uint64_t n_pin_hot_experts_min_count = 8;
     // batch/prefill read-ahead (madvise WILLNEED / PrefetchVirtualMemory) of the
     // MoE experts that were just routed but are neither pinned nor served from
     // VRAM. Multi-token ubatches only: single-token decode is skipped (it reads

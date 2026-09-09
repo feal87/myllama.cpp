@@ -56,6 +56,10 @@
 //    routing mix instead of lifetime leaders (a long session otherwise lets
 //    first-past-the-post experts occupy slots after they drifted cold). Prefill
 //    tokens never advance the clock: they neither feed nor age the ranking.
+//  - minimum-usage floor (--pin-hot-experts-min-count N): an expert is only
+//    mlock'd once its usage count reaches N, so a one-off route (count 1) is
+//    never pinned and cannot grab a slot or flip-flap the set. With aging the
+//    counts shrink as the decay window does, so scale N with the window.
 //
 // Pinning bookkeeping runs on the decode thread, but the mlock()/VirtualLock()
 // syscalls themselves - the only step that can fault a long-cold expert's pages
@@ -90,6 +94,9 @@ class llama_hot_expert_cache {
     // budget_bytes:      hard cap on total bytes locked across ALL layers combined (0 = unlimited, NOT recommended)
     // decay_interval:    halve all usage counts every N decode tokens (0 = disabled, lifetime
     //                    counts); prefill tokens neither count nor age the ranking
+    // min_pin_count:     usage-count floor below which an expert is never mlock'd: a one-off
+    //                    route is noise, not heat (0 = pin any routed expert). Counts are
+    //                    halved every decay_interval, so scale this with the decay window
     // prefetch_enabled:  read-ahead (madvise WILLNEED / PrefetchVirtualMemory) the rows of the
     //                    experts a layer just routed that are not pinned, so their next read does
     //                    not page-fault (--hot-experts-prefetch). Engages on multi-token
@@ -103,6 +110,7 @@ class llama_hot_expert_cache {
                            int32_t             n_pin_experts,
                            uint64_t            budget_bytes,
                            uint64_t            decay_interval,
+                           uint64_t            min_pin_count,
                            bool                prefetch_enabled,
                            bool                track_rank);
     ~llama_hot_expert_cache();
@@ -401,6 +409,7 @@ class llama_hot_expert_cache {
     int32_t        n_pin_total = 0;  // N * num_moe_layers (global cap)
     const uint64_t budget_bytes;     // 0 = unlimited
     const uint64_t decay_interval;   // 0 = lifetime counts (no aging)
+    const uint64_t min_pin_count;    // usage-count floor for pinning (0 = any routed expert)
     const bool     prefetch_enabled; // read-ahead routed-but-unpinned expert rows (--hot-experts-prefetch)
     const bool     track_rank;       // rank feeds pinning/VRAM tier; false = prefetch-only mode
     uint64_t       n_tokens_seen = 0;  // tokens since the last decay
@@ -471,6 +480,7 @@ class llama_hot_expert_cache {
     uint64_t n_prefetch_failures = 0;
     uint64_t n_decays            = 0;
     uint64_t n_hysteresis_holds  = 0;  // takeovers refused by the margin/grace guards
+    uint64_t n_min_count_holds   = 0;  // pins refused by the minimum-usage floor
     uint64_t n_content_tokens    = 0;  // decode tokens observed (see content_tokens())
     uint64_t n_route_hit         = 0;  // routed expert selections served by the pinned (RAM) tier
     uint64_t n_route_miss        = 0;  // routed selections not pinned (VRAM-served experts are skipped)

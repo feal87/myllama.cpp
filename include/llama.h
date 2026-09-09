@@ -419,6 +419,15 @@ extern "C" {
         // session occupy slots after they drifted cold.
         uint64_t n_pin_hot_experts_decay_tokens;
 
+        // minimum usage count an expert must reach before the RAM tier mlock's
+        // it (0 = pin any routed expert as soon as a slot is free). A count is
+        // one single-token decode ubatch that routed the expert, halved every
+        // n_pin_hot_experts_decay_tokens, so with aging the floor reads as
+        // "routes in roughly the last decay window": a one-off route is noise,
+        // not heat, and must not churn the pin set. Scale it with the decay
+        // window (shorter window, lower counts -> lower floor).
+        uint64_t n_pin_hot_experts_min_count;
+
         // GPU-resident cache for host-offloaded MoE expert weights, VRAM tier on
         // top of the hot-expert cache (--pin-hot-experts). Decode on a
         // host-offloaded MoE layer is host-RAM-bandwidth bound; this serves the

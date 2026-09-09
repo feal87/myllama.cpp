@@ -16,12 +16,14 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
                                                int32_t             n_pin_experts,
                                                uint64_t            budget_bytes,
                                                uint64_t            decay_interval,
+                                               uint64_t            min_pin_count,
                                                bool                prefetch_enabled,
                                                bool                track_rank) :
     model(model),
     n_pin(n_pin_experts),
     budget_bytes(budget_bytes),
     decay_interval(decay_interval),
+    min_pin_count(min_pin_count),
     prefetch_enabled(prefetch_enabled),
     track_rank(track_rank) {
     // Count MoE layers by checking which layers have ffn_down_exps.weight
@@ -81,6 +83,10 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
         // ahead; nothing is counted or pinned
         LLAMA_LOG_INFO("%s: prefetching routed expert rows on batch/prefill ubatches, "
                        "no usage tracking\n", __func__);
+    }
+    if (n_pin > 0 && min_pin_count > 0) {
+        LLAMA_LOG_INFO("%s: pinning only experts with usage count >= %" PRIu64 " (--pin-hot-experts-min-count)\n",
+                       __func__, min_pin_count);
     }
     if (decay_interval > 0) {
         LLAMA_LOG_INFO("%s: halving all usage counts every %" PRIu64 " decode tokens\n", __func__, decay_interval);
@@ -159,9 +165,10 @@ void llama_hot_expert_cache::print_stats() {
 
     LLAMA_LOG_CONT(" | obs=%" PRIu64 " ub=%" PRIu64 " | distinct (layer,expert) seen=%zu"
                    " | prefetch calls=%" PRIu64 " bytes=%.2f MiB failures=%" PRIu64
-                   " | decays=%" PRIu64 " takeover holds=%" PRIu64,
+                   " | decays=%" PRIu64 " takeover holds=%" PRIu64 " min-count holds=%" PRIu64,
                    n_eval_calls, n_ubatches, total_distinct_seen, n_prefetch_calls,
-                   n_prefetch_bytes / (1024.0 * 1024.0), n_prefetch_failures, n_decays, n_hysteresis_holds);
+                   n_prefetch_bytes / (1024.0 * 1024.0), n_prefetch_failures, n_decays, n_hysteresis_holds,
+                   n_min_count_holds);
 
     if (!pinned_rank.empty()) {
         LLAMA_LOG_CONT(" | pinned count range=[%" PRIu64 ", %" PRIu64 "]", global_coldest_count, global_hottest_count);
@@ -573,6 +580,13 @@ void llama_hot_expert_cache::try_promote(int il, layer_state & ls, int32_t exper
 
     if (vram_resident) {
         return;  // served by the VRAM tier; no mlock needed
+    }
+
+    // below the usage floor: a one-off route (count 1) is routing noise, not a
+    // real signal, and mlock'ing it (a page-in) just to evict it later is churn
+    if (count < min_pin_count) {
+        n_min_count_holds++;
+        return;
     }
 
     // the flat pin-state mirror is the hot-path membership check (the pin map
