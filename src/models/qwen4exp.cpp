@@ -463,6 +463,10 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
                 LLAMA_LOG_INFO("%s: PLE direct read enabled: %" PRId64 " rows of %zu bytes at file offset %zu, %d threads\n",
                         __func__, ple_rows, ple_reader->row_size, ple_w->offs, n_threads);
+
+                // the reader serves this tensor itself, so the file needs no
+                // mapping and the tensor is never materialized at load
+                ml.lazy.set_direct(ple_w->idx, ple_name);
 #ifdef _WIN32
                 direct_handle.handle = INVALID_HANDLE_VALUE;
 #endif

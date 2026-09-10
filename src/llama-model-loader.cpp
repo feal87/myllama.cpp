@@ -1431,8 +1431,10 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
             // map a file only when it actually needs a mapping: everything when
             // use_mmap, otherwise just the files holding lazy tensors. A file left
-            // unmapped keeps its unbuffered reads at full speed.
-            const bool need_map = use_mmap || !lazy.for_file(idx).empty();
+            // unmapped keeps its unbuffered reads at full speed. A lazy tensor with
+            // a direct reader maps nothing (the arch reads its rows itself).
+            const bool need_map = use_mmap ||
+                    (!lazy.for_file(idx).empty() && !lazy.is_direct_file(idx));
 
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
                     lazy.for_file(idx), need_map);
@@ -1459,6 +1461,11 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
     *first = mapping->size();
     *last  = 0;
     *addr = mapping->addr();
+    if (mapping->size() == 0) {
+        // no section for this file: a lazy tensor on it is served by a direct
+        // reader, so there is no range to hand to a host-pointer buffer
+        return;
+    }
     for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
         const auto * weight = get_weight(ggml_get_name(tensor));
         if (!weight || weight->idx != idx) {
@@ -1646,6 +1653,14 @@ bool llama_model_loader::load_all_data(
         // streamed weights are never read at load: the graph reads them from the
         // disk-backed substitute tensors (staging slab / decode cache)
         if (cur->buffer != nullptr && llama_disk_buft_is(ggml_backend_buffer_get_type(cur->buffer))) {
+            size_done += n_size;
+            continue;
+        }
+
+        // a direct-read lazy tensor (--lazy-mode on-direct) is served by the
+        // arch's own reader, so it is not materialized here and its file is not
+        // mapped either
+        if (lazy.is_direct_tensor(ggml_get_name(cur))) {
             size_done += n_size;
             continue;
         }

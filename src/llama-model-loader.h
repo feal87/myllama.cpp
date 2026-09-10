@@ -113,12 +113,29 @@ struct llama_model_loader {
             return it == ranges.end() ? none : it->second;
         }
 
+        // with --lazy-mode on-direct the arch reads the rows itself, so its file
+        // needs no mapping and the tensor must not be materialized at load
+        void set_direct(uint32_t file_idx, const std::string & name) {
+            direct_files.insert(file_idx);
+            direct_tensors.insert(name);
+        }
+
+        bool is_direct_file(uint32_t idx) const {
+            return direct_files.count(idx) > 0;
+        }
+
+        bool is_direct_tensor(const std::string & name) const {
+            return direct_tensors.count(name) > 0;
+        }
+
         // lazy tensors are gathered on the host, so no offload setting applies to them
         static ggml_backend_buffer_type_t buft();
 
     private:
         std::map<uint32_t, llama_mmap::ranges> ranges;
         std::set<std::string>                  tensors;
+        std::set<uint32_t>                     direct_files;
+        std::set<std::string>                  direct_tensors;
     } lazy;
 
     llama_files files;

@@ -258,17 +258,22 @@ Open follow-up: none; the configuration is covered by B.
    are kept across tokens and only new ids are read into transient slots. A
    promotion is mapping-only - `fill_cache` reads the expert when it is next
    routed - so an expert is read from disk once, never twice (see item 13).
-9. Layers 0-1 at 3.5-3.9 GB/s: the PLE reader itself does NOT mmap. With
-   `--lazy-mode on-direct` the qwen4exp arch opens its own handle
-   (`FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_OVERLAPPED`, buffered, explicit offset
-   reads) and never touches a mapping. But shard 1 still gets one, because
-   `init_mappings` maps every file that holds a lazy tensor
-   (`need_map = use_mmap || !lazy.for_file(idx).empty()`) and the PLE table is
-   lazy. That mapping is unused with `on-direct`, yet it is live, and a live
-   data section caps that file's unbuffered reads (the root cause above). That
-   is the whole layers 0-1 penalty. Removing it needs the loader to skip files
-   whose only lazy tensors will be served by a direct reader, with a fallback
-   if the direct open fails. Effect is about 2-3% of a full prefill.
+9. Layers 0-1 at 3.5-3.9 GB/s. The first hypothesis - that the shard-1 mapping
+   (kept for the lazy PLE) caps that file's unbuffered reads - was WRONG. The
+   loader now skips mapping a file whose only lazy tensor is served by a direct
+   reader (qwen4exp PLE calls `llama_model_loader::lazy_read::set_direct`),
+   which also removes a spurious 37 GiB host-pointer buffer over a null address
+   (`get_mapping_range` returns first=0 from the zero-size mapping and last=tensor
+   end, so the host-ptr branch used to build it anyway). With that in place
+   shard 1 has no section, yet the fills are unchanged: 3.9 and 3.4 GB/s for
+   layers 0-1, and layer 2 (already never mapped, it is shard 2) is also slow at
+   4.8, while layer 3+ AND layer 25 (first read of the never-mapped shard 3) run
+   at 7.4. iodiag on the same file measures 7.47 GB/s without a mapping and 3.07
+   with one, so the mapping really is gone. The PLE gather is 0.2-2.0 ms, so it
+   is not the cause either. What remains is a START-OF-UBATCH effect on the
+   first ~3 layer reads; the likely causes are the reader thread being
+   CPU-starved while the main thread runs ubatch setup, or the drive queue not
+   yet ramped. Not yet isolated.
 9b. The ranking can be slower than the old first-come fill on SHORT runs (the
     first-come set is already close to hot, and the policy pays a warm-up plus
     churn). A long baseline is needed to see whether it wins; see item 13. The
