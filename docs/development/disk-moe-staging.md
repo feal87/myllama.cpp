@@ -5,10 +5,33 @@
 
 Status: prefill and decode both work. Prefill streams the whole layer slab at
 7.4 GB/s; decode serves the routed experts from a per-layer RAM cache filled by
-the same unbuffered reader. Under greedy decoding the generated text is
-byte-identical to the proven `--load-mode mmap+pin` path. What remains is the
-budget flag, performance and cleanup below. Everything here is the working tree,
-not a merged feature.
+the same unbuffered reader, with a per-layer ranking that keeps the hottest
+experts resident. Under greedy decoding the generated text is byte-identical to
+the earlier cache path and to `--load-mode mmap+pin` on the shorter prompts.
+What remains is performance and cleanup below.
+
+## Current state
+
+Branch `disk-moe-staging`, three commits, not pushed:
+
+```
+82a8c5836 llama : rank the disk decode cache per layer and drop its env vars
+781fcf8ae llama : size the disk decode cache from --pin-hot-experts
+fe37bf459 llama : stream MoE experts from disk with unbuffered reads
+```
+
+Configuration (no environment variables any more):
+
+```
+llama-server -m <model> --load-mode dio -ngl 99 -c <ctx> \
+  --pin-hot-experts-budget-mib <MiB> [--pin-hot-experts <N> ...]
+```
+
+`--load-mode dio` alone enables the streaming and no longer faults on decode:
+the stage is created only when the model really has Disk-buffer weights, so
+`mmap` mode is untouched, and the minimal decode cache is built even with no
+budget flag. The next measurement to take is a real `llama-server` baseline in a
+clean environment (see the note under item 13 about short-run numbers).
 
 ## Goal
 
@@ -91,30 +114,40 @@ Decode cache (always built when disk streaming is active; sized by
 
 - `llama_disk_stage_cache_layer { gate, up, down, table, n_slots }`
 - One compact slot array per layer plus an I32 `table[n_expert]` mapping expert
-  id -> slot.
-- Geometry: `slots_per_layer = (cache_mib << 20) / (n_layer * per_expert)`,
-  `n_trans = min(n_expert_used, n_expert)`, `n_resident = slots - n_trans`.
-  The first `n_resident` distinct experts seen become resident (first-come,
-  filled once); later non-resident experts use the `n_trans` transient slots.
-- `fill_cache(il, ids, n_ids)` reads only the routed experts into slots (same
-  aligned-slack read as `fill`) and updates the table. Weight bytes are read in
-  place from the slot; there is no copy.
+  id -> slot. `n_trans = min(n_expert_used, n_expert)` slots are transient, the
+  rest (`n_resident`) are hot slots.
+- Geometry: `slots_per_layer` comes from `--pin-hot-experts-budget-mib` and/or
+  `--pin-hot-experts`, capped by `n_expert`; see the cache sizing under Key
+  facts. With neither flag it falls back to `n_trans + 1` and warns.
+- Residency is ranking-driven per layer (see the hot-expert wiring below).
+  `resident_add(il, id)` only RESERVES a slot and marks it unfilled;
+  `resident_remove(il, id)` frees it. No I/O happens on promotion.
+- `fill_cache(il, ids, n_ids)` is the only reader in decode. For each routed
+  expert: if it is resident and filled, reuse the slot; if it is resident but
+  not yet filled, read it into the slot (this is the read-once promotion read);
+  otherwise read it into a transient slot. All of the layer's reads go in one
+  batch, and the table is updated before the graph reads it.
 - The slot stride inside each cache tensor is padded by one alignment unit
   (`ct->nb[2] = stride + 4096`). An expert read starts `head` bytes before its
   slot to stay sector-aligned, so without the pad a batch of adjacent slots
   would clobber the tail of the previous slot's expert (see the bugs below).
-- `is_active()`, `supported()`.
+- All cache state is under `cache_mu`, but every caller is on the decode thread
+  now; `io_mu` just serializes read batches as a guard.
+- `is_active()`, `supported()`, `resident_capacity()`.
 
 ### Graph wiring (`src/llama-graph.cpp`, `src/llama-hot-experts.*`)
 
 - `llm_graph_context` holds `const llama_disk_stage * disk_stage`.
-- `build_moe_ffn` substitutes `gate_exps/up_exps/down_exps` with the layer's
-  staging tensors for multi-token ubatches, so the host->VRAM offload copy
-  sources resident memory instead of faulting the mapping.
+- `build_moe_ffn` substitutes `gate_exps/up_exps/down_exps`: with the layer's
+  staging tensors on a multi-token ubatch (so the host->VRAM offload copy sources
+  resident memory instead of faulting the mapping), and with the compact cache
+  tensors on a single-token ubatch (with the ids remapped through the layer's
+  table).
 - The fill happens mid-graph through the hot-expert eval callback:
   `eval_callback` watches tensors named `ffn_moe_topk-<il>`, `wants_observe(il)`
   decides whether to break the graph there, and `observe(il, t)` copies the ids
-  and calls `disk_stage->fill(il)`.
+  and calls `disk_stage->fill(il)` (multi-token) or `fill_cache(il, ids, n)`
+  (single-token).
 - `llama_context` installs the callback for multi-token ubatches when
   `--hot-experts-prefetch` is on, and for every ubatch when the disk stage is
   active (single-token decode needs the fill too). Single-token ubatches also
@@ -131,9 +164,9 @@ Decode cache (always built when disk streaming is active; sized by
   the lazy PLE (per-file cap, see above).
 - All 48 layers fill and prefill completes.
 - Single-token decode completes through the RAM cache: 16 GiB gives 89 slots per
-  layer (79 resident, 10 transient), and greedy output matches `mmap+pin` byte
-  for byte. Throughput on this machine is about 4.5-7 t/s depending on how warm
-  the resident set is.
+  layer (79 resident, 10 transient), and the greedy output matches the older
+  cache path byte for byte. Throughput on this machine is about 3-7 t/s
+  depending on how warm the resident set is and on which policy filled it.
 - The resident set is ranking-driven per layer (`--pin-hot-experts N` /
   `--pin-hot-experts-budget-mib`): over 96 decode tokens the set filled to
   3160/3792 slots with a 48% routed-expert hit rate, and the greedy output was
@@ -159,6 +192,13 @@ Decode cache (always built when disk streaming is active; sized by
    batch meant each read overwrote the last `head` bytes of the previous slot's
    expert (visible as a cache mismatch exactly `stride - head` bytes in). Fixed
    by padding the slot stride in the cache tensor.
+5. All reads go through one I/O completion port. When the promotion worker and
+   the decode fill both reaped it, they stole each other's completions
+   (`fails=36`, then a fatal `unbuffered read failed`). Fixed by serializing the
+   batches with a mutex; the read-once promotion (item 13) then removed the
+   worker's reads entirely, so only the decode thread reads now and the guard is
+   no longer contended. Anyone who reintroduces a second reader must bring its
+   own completion port and handle set.
 
 ## Remaining work
 
@@ -190,22 +230,24 @@ Open follow-up: none; the configuration is covered by B.
    minimal `n_expert_used + 1` slots per layer and warns, so single-token decode
    works instead of faulting on the unmapped tensors.
 
-   Still open: the resident set is first-come, so `--pin-hot-experts` sizes the
-   set but does not yet choose the hottest experts in dio mode. See item 13.
-
 ### C. Performance
 
 6. Slab fill: skip resident experts (memcpy from the cache) instead of re-reading
    them from disk.
 7. Double buffering: read layer `i+1` while layer `i` computes and copies.
 8. Decode already reads only the experts missing from the cache: resident slots
-   are kept across tokens and only new ids are read into transient slots. The
-   remaining decode cost is the warm-up, when most ids are still new.
+   are kept across tokens and only new ids are read into transient slots. A
+   promotion is mapping-only - `fill_cache` reads the expert when it is next
+   routed - so an expert is read from disk once, never twice (see item 13).
 9. Layers 0-1 at 3.5-3.9 GB/s: shard 1 stays mapped for the lazy PLE
    (`per_layer_token_embd`, 35.76 GiB, buffered ~170-byte rows via
    `ple_direct_reader` / `qwen4exp.cpp`). Either unmap shard 1 after the PLE
    table is no longer needed, or read PLE rows unbuffered, to lift them to
    7.4 GB/s.
+9b. The ranking can be slower than the old first-come fill on SHORT runs (the
+    first-come set is already close to hot, and the policy pays a warm-up plus
+    churn). A long baseline is needed to see whether it wins; see item 13. The
+    obvious knobs are `--pin-hot-experts-min-count` and the decay window.
 
 ### D. Cleanup
 
@@ -218,30 +260,41 @@ Open follow-up: none; the configuration is covered by B.
 
 ### E. Correctness and robustness
 
-13. Done. The disk decode cache's resident set is now ranking-driven, per layer:
-    `llama_context` builds the hot-expert engine even in dio mode, with a per-layer
-    capacity equal to the cache's resident slots. When the disk stage is attached,
-    `try_promote` takes a per-layer path (`try_promote_layer`): fill up to `n_pin`
-    residents for the layer, then take over that layer's coldest resident, with the
-    same min-count floor, `takeover_min_lead` and `evict_grace_tokens` as the mlock
-    tier. A "pin" is a copy into a resident slot (`llama_disk_stage::pin`), an
-    eviction frees the slot (`unpin`); the slot is published only after the read
-    completes, so the graph can never read a half-filled slot. The mlock path keeps
-    its global ranking, so mmap mode is unchanged.
+13. Done. The disk decode cache's resident set is ranking-driven, per layer.
+    `llama_context` builds the hot-expert engine even in dio mode, with a
+    per-layer capacity equal to the cache's resident slots. When the disk stage is
+    attached, `try_promote` takes a per-layer path (`try_promote_layer`): fill up
+    to `n_pin` residents for the layer, then take over that layer's coldest
+    resident, with the same min-count floor, `takeover_min_lead` and
+    `evict_grace_tokens` as the mlock tier.
 
-    The promotion worker and the decode fill share one I/O completion port, so
-    their reads are serialized by a mutex (two concurrent reapers corrupt each
-    other). On short runs this makes the ranking-driven cache slower than the old
-    first-come fill (about 3.3 vs 4.4 t/s here), because the first-come set was
-    already close to the hot set and the per-layer policy pays a warm-up plus the
-    promotion reads. Over long sessions the ranking should win, since it does not
-    keep stale first-seen experts. A dedicated completion port and handle set for
-    the worker would remove the serialization.
+    Promotion is mapping-only: `resident_add` reserves a slot and marks it
+    unfilled, and `fill_cache` reads the expert into it the next time that expert
+    is routed, in the same batch as the transients. So a promoted expert is read
+    from disk exactly once - the earlier design read it as a transient and then
+    read it AGAIN in the promotion worker, which also meant a shared IOCP needed
+    its reapers serialized. There is no promotion read and no worker in the disk
+    path now; all disk reads happen on the decode thread (`fill` in prefill,
+    `fill_cache` in decode), so the `io_mu` guard is no longer contended. The mlock
+    worker still starts in dio mode (`n_pin > 0`) but receives no jobs.
+
+    The mlock path keeps its global ranking, so mmap mode is unchanged (verified:
+    `pinned=573/768 (N=16 x 48)` with skew and real lock calls).
+
+    Performance note: on SHORT runs the per-layer ranking measured slower than the
+    old first-come fill (about 3.3 vs 4.4 t/s here, and 2.9 t/s once in a 32-token
+    run with `--pin-hot-experts-min-count 4`). The first-come set happened to sit
+    close to the hot set, while the policy pays a warm-up (min-count) plus churn.
+    These numbers are noisy and from a machine with other load; a long
+    `llama-server` baseline is the real measurement. Knobs to try:
+    `--pin-hot-experts-min-count`, `--pin-hot-experts-decay-tokens`, and a larger
+    budget.
 14. Confirm the cache `table` tensor always stays host-allocated (written by the
     callback, read by the graph right after the chunk boundary).
-15. Done: greedy output over 32 tokens is byte-identical to `--load-mode
-    mmap+pin` for the same prompt. Worth repeating on a longer generation and on
-    a second model before trusting it broadly.
+15. Done: greedy output over 32 tokens is byte-identical within dio to the
+    earlier cache path, and matched `mmap+pin` on the prompts where the prefill
+    happened to batch the same way (see the cross-load-mode gotcha). Worth
+    repeating on a longer generation and on a second model.
 16. Decide how the reserved address space relates to the scheduler: it exists so
     the graph allocator ignores disk tensors. Revisit if a cleaner marker appears.
 
@@ -266,16 +319,26 @@ Model: `Qwen3.8-Flash-Next-Uncensored-Q5_K_M` (arch `qwen4exp`), 48 layers,
 - Expert slices are sector-aligned in this model (e.g. gate stride 1,126,400 =
   275 x 4096), but do not rely on it; use the alignment slack.
 
-Cache capacity (`--pin-hot-experts-budget-mib` targets):
+Cache sizing (`--pin-hot-experts-budget-mib`):
 
-| budget | experts | share |
-|--------|---------|-------|
-| 40 GB  | 11491   | 46.8% |
-| 45 GB  | 12928   | 52.6% |
-| 50 GB  | 14364   | 58.4% |
-| 58 GB  | 16662   | 67.8% |
+`slots_per_layer = budget / (n_layer * ref_bytes_per_expert)`, where
+`ref_bytes_per_expert` is taken from the first stageable layer and is the largest
+variant (Q8_0 down, 3,993,600 bytes). Resident slots = slots - `n_expert_used`
+(the transient slots). Because most layers in this model have a smaller Q5_1
+down, the ACTUAL allocation lands below the budget (measured 8192 MiB -> 7.38 GiB
+/ 44 slots, 16384 MiB -> 14.92 GiB / 89 slots); 40960 MiB would give 224 slots
+and about 37 GiB actual. Each slot carries a 4096-byte alignment pad on top of the
+expert stride (see the padded slot stride in the bugs list).
 
-Machine: 63.6 GB RAM, ~56.7 GB free; RTX 4060 Ti 8 GB (7.07 GB free).
+Total RAM for streaming:
+
+- decode cache: at most the budget, about 93% of it here
+- staging slab pool: 1950 MiB, one layer's worth (3 regions aliased across all
+  layers), not per layer
+- so about `1.9 GiB + cache`, plus 1-2 GB for the context and non-expert tensors
+
+Machine: 63.6 GB RAM (~45-57 GB free depending on other load); RTX 4060 Ti 8 GB
+(~4.7-7.1 GB free depending on other load).
 
 Prefill budget scaling: IQ4_XS about 54 GB per 4096 tokens (200 t/s),
 Q4_K_M about 82 GB (110 t/s), Q5_K_M about 138 GB (72 t/s) at ~2.4 GB/s cold.
@@ -374,11 +437,25 @@ shard 1 once; it was restored).
   ninja); a plain `cmake --build` fails with `nvcc fatal : Cannot find compiler
   'cl.exe' in PATH` as soon as a `.cu` object is out of date.
 - `bin/llama.dll` fails to link while `llama-server` is running. Stop it first.
+- If other software holds VRAM, the `--fit` probe can fail with
+  `CUDA error: out of memory ... ggml_backend_cuda_buffer_clear` during load, at
+  ~3 seconds, before any tensor is read. `-fit off` skips the probe; on a clean
+  machine it is not needed.
+- Comparing `dio` against `mmap+pin` byte-for-byte is not guaranteed: the two
+  load modes can split the prefill ubatches differently, and a different
+  numerical reduction order can flip an early greedy token even though the
+  weights are identical. Compare within one load mode (or accept that the
+  divergence is in the first token).
+- The in-dio A/B switch (`LLAMA_DISK_STAGE_DECODE_FULL`, which ran single-token
+  decode through the full slab) was removed with the other env vars. To re-check
+  the cache against the slab, temporarily restore the `decode_full()` branch in
+  `build_moe_ffn`, `wants_observe` and `observe`.
 - `init_mappings` / `get_mapping_range` dereference `mappings.at(idx)`, so a
   "not mapped" file must still have an entry (hence the `map` flag, not a
   skipped vector slot).
-- `llama_disk_stage` requires the eval callback, which requires
-  `--hot-experts-prefetch`, or it disables itself with a warning.
+- Disk streaming installs its own eval callback, so it no longer needs
+  `--hot-experts-prefetch`; it only disables itself if a custom `cb_eval` is
+  already in use and no hot-expert engine can be built.
 - The reserved region must never be touched by a correct graph; doing so is an
   access violation, and that is the intended failure mode for a missed
   substitution.
