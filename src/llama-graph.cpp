@@ -2262,9 +2262,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (mc) {
-            // host chain: skip the experts served by the VRAM cache (zero dst rows)
-            gate_up->src[3]       = mc->host_table;
-            gate_up->op_params[0] = mc->n_slots;
+            // host chain: skip the experts served by the VRAM cache. In dio the
+            // ids are disk slots, so the skip table must be slot-indexed
+            // (host_table is expert-indexed and would be read out of range)
+            gate_up->src[3]       = dc != nullptr ? dc->slot_skip : mc->host_table;
+            gate_up->op_params[0] = dc != nullptr ? 0 : mc->n_slots;
         }
 
         if (up_exps_s) {
@@ -2287,8 +2289,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
 
         if (mc) {
-            up->src[3]       = mc->host_table;
-            up->op_params[0] = mc->n_slots;
+            up->src[3]       = dc != nullptr ? dc->slot_skip : mc->host_table;
+            up->op_params[0] = dc != nullptr ? 0 : mc->n_slots;
         }
 
         if (up_exps_s) {
@@ -2305,8 +2307,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(cur, "ffn_moe_gate", il);
 
             if (mc) {
-                cur->src[3]       = mc->host_table;
-                cur->op_params[0] = mc->n_slots;
+                cur->src[3]       = dc != nullptr ? dc->slot_skip : mc->host_table;
+                cur->op_params[0] = dc != nullptr ? 0 : mc->n_slots;
             }
         } else {
             cur = up;
@@ -2411,8 +2413,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(experts, "ffn_moe_down", il);
 
     if (mc) {
-        experts->src[3]       = mc->host_table;
-        experts->op_params[0] = mc->n_slots;
+        experts->src[3]       = dc != nullptr ? dc->slot_skip : mc->host_table;
+        experts->op_params[0] = dc != nullptr ? 0 : mc->n_slots;
 
         // device-side chain over the cached experts, mirroring the host
         // activation (plain swiglu_split - clamp layers never reach here)

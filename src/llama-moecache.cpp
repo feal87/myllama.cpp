@@ -1,5 +1,6 @@
 #include "llama-moecache.h"
 
+#include "llama-disk-stage.h"
 #include "llama-hot-experts.h"
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -43,15 +44,32 @@ struct llama_moe_cache::impl {
         const ggml_tensor * up_src   = nullptr; // fused: gate_src again, else ffn_up_exps
         const ggml_tensor * d_src    = nullptr; // ffn_down_exps
         const ggml_tensor * router   = nullptr; // ffn_gate_inp: gives the device pool's buft
+        // disk mode only: the decode cache tensors that replace gate_src/up_src
+        // in the graph, so lookup() can find the layer by the pointer the graph
+        // actually passes (the host source stays the model tensor for sizing)
+        const ggml_tensor * key_gate = nullptr;
+        const ggml_tensor * key_up   = nullptr;
         int64_t n_expert = 0;
         size_t  nbytes_1slot = 0;   // one expert across all of the layer's cache tensors
+    };
+
+    // one host->device expert slice copy: source is the model tensor
+    // (mmap+pin) or the disk decode cache's RAM slot (dio, `role`)
+    struct upload_src {
+        ggml_tensor *       dst = nullptr;
+        const ggml_tensor * src = nullptr;
+        int                 role = -1; // 0 gate, 1 up, 2 down; -1 = use src->data
     };
 
     struct layer_state {
         llama_moe_cache_layer pub;
 
-        // (cache tensor, source tensor) pairs copied on upload
-        std::vector<std::pair<ggml_tensor *, const ggml_tensor *>> uploads;
+        // (cache tensor, source) pairs copied on upload
+        std::vector<upload_src> uploads;
+
+        // disk mode: the pointers lookup() also matches against
+        const ggml_tensor * key_gate = nullptr;
+        const ggml_tensor * key_up   = nullptr;
 
         // bookkeeping
         std::vector<int32_t> slot_expert;   // slots -> published resident expert (-1 = empty)
@@ -64,10 +82,16 @@ struct llama_moe_cache::impl {
         size_t  layer_idx;
         int32_t expert;
         int32_t slot;
+        bool    failed = false; // source unavailable; do not publish
+        // dio only: private copy of the disk cache rows (gate, up, down, in
+        // uploads order), so the worker never reads a slot the hot tier may reuse
+        std::shared_ptr<std::vector<char>> snap;
     };
 
     const llama_model & model;
     llama_hot_expert_cache * const hot;
+    llama_disk_stage * disk = nullptr; // set by set_disk_stage() before reserve()
+    bool disk_mode = false;            // == disk != nullptr
     const uint64_t budget_bytes;   // total device footprint of the cache, reserved up-front as one pool
     const int32_t  max_inserts;
 
@@ -273,8 +297,27 @@ void llama_moe_cache::fill_upload_queue(llama_moe_cache::impl * p) {
                 continue; // published meanwhile (or bad id)
             }
 
+            // dio: snapshot the disk cache's RAM rows now, under the cache lock
+            // (resident_copy), so the worker reads a private copy and the hot
+            // tier is free to evict/reuse the slot while the upload runs
+            std::shared_ptr<std::vector<char>> snap;
+            if (p->disk_mode) {
+                size_t sz[3] = { 0, 0, 0 };
+                size_t total = 0;
+                for (const auto & u : ls.uploads) {
+                    if (u.role >= 0 && u.role < 3) {
+                        sz[u.role] = u.src->nb[2];
+                        total    += u.src->nb[2];
+                    }
+                }
+                snap = std::make_shared<std::vector<char>>(total);
+                if (!p->disk->resident_copy(ls.pub.il, e, sz, snap->data(), total)) {
+                    continue; // no longer a filled RAM resident
+                }
+            }
+
             ls.slot_target[slot] = e;
-            p->todo.push_back({ li, e, slot });
+            p->todo.push_back({ li, e, slot, false, std::move(snap) });
             pushed = true;
             if ((int32_t) p->todo.size() >= p->max_inserts) {
                 break;
@@ -309,6 +352,14 @@ llama_moe_cache::~llama_moe_cache() {
 
 bool llama_moe_cache::is_active() const {
     return pimpl != nullptr && pimpl->activated;
+}
+
+void llama_moe_cache::set_disk_stage(llama_disk_stage * disk) {
+    if (!pimpl || pimpl->disk != nullptr) {
+        return;
+    }
+    pimpl->disk      = disk;
+    pimpl->disk_mode = disk != nullptr;
 }
 
 // llama_hot_expert_cache::vram_query_fn: copy this layer's residency flags (one
@@ -384,6 +435,17 @@ void llama_moe_cache::reserve() {
             continue; // down already on a device
         }
 
+        // dio: the graph feeds the disk decode cache tensors to the host chain,
+        // so those are the pointers lookup() sees (the model tensors stay the
+        // sizing source). A layer the disk stage does not stage has no VRAM tier
+        const llama_disk_stage_cache_layer * dcl = nullptr;
+        if (p->disk_mode) {
+            dcl = p->disk->cache_layer((int) il);
+            if (dcl == nullptr || dcl->gate == nullptr) {
+                continue;
+            }
+        }
+
         impl::candidate c;
         c.il           = (int) il;
         c.fused        = fused;
@@ -392,6 +454,10 @@ void llama_moe_cache::reserve() {
         c.d_src        = l.ffn_down_exps;
         c.router       = l.ffn_gate_inp;
         c.n_expert     = gate->ne[2];
+        if (dcl != nullptr) {
+            c.key_gate = dcl->gate;
+            c.key_up   = dcl->up;
+        }
         c.nbytes_1slot = expert_slice_bytes(l.ffn_down_exps);
         c.nbytes_1slot += fused ? expert_slice_bytes(gate) : expert_slice_bytes(gate) + expert_slice_bytes(up);
         p->cands.push_back(c);
@@ -491,6 +557,18 @@ void llama_moe_cache::maybe_activate() {
         return;
     }
 
+    // dio: the VRAM residents are a subset of the disk decode cache's RAM
+    // residents, so a layer cannot hold more VRAM slots than the RAM tier can
+    // supply (the RAM set is uniform across layers)
+    if (p->disk_mode) {
+        const int32_t cap = p->disk->resident_capacity();
+        for (auto & v : caps) {
+            if (v > cap) {
+                v = cap;
+            }
+        }
+    }
+
     // full per-prompt layout rebuild: pull every published VRAM resident back
     // into the RAM pin tier (their mlock was dropped when the VRAM copy took
     // over), then retire the old layout's tensor contexts. The decode graph that
@@ -508,6 +586,12 @@ void llama_moe_cache::maybe_activate() {
         p->wcv.notify_all();
         if (p->worker.joinable()) {
             p->worker.join();
+        }
+        // the job the worker was copying when stop was set lands in done after
+        // the clear above; drop it too, or the rebuilt layout would publish it
+        {
+            std::lock_guard<std::mutex> wlk(p->wmtx);
+            p->done.clear();
         }
 
         // retire the old layout's tensor contexts. The decode graph that still
@@ -536,11 +620,16 @@ void llama_moe_cache::maybe_activate() {
             p->retire_layout();
         }
         // re-admit the evicted experts to the RAM tier: their mlock was dropped
-        // when the VRAM copy took over, so they must be mlock'd again before the
-        // VRAM copies below are rebuilt. No impl lock held here - the hot cache
-        // locks its own mutex and re-enters this one through the VRAM residency
-        // query (hot.mu -> impl.mtx is the documented lock order).
+        // when the VRAM copy took over, so they must be resident again before the
+        // VRAM copies below are rebuilt. The disk tier must also stop skipping
+        // them (vram_release), or the rebuilt device table would not serve them
+        // while the host chain still skips them. No impl lock held here - the hot
+        // cache locks its own mutex and re-enters this one through the VRAM
+        // residency query (hot.mu -> impl.mtx is the documented lock order).
         for (const auto & [il, e] : evicted) {
+            if (p->disk_mode) {
+                p->disk->vram_release(il, e);
+            }
             p->hot->promote_expert(il, e);
         }
     }
@@ -600,19 +689,21 @@ void llama_moe_cache::maybe_activate() {
         pub.gate_src = c.gate_src;
         pub.up_src   = c.up_src;
         pub.d_src    = c.d_src;
+        ls.key_gate  = c.key_gate;
+        ls.key_up    = c.key_up;
 
         pub.c_gate = ggml_new_tensor_3d(ctx_dev, c.gate_src->type, c.gate_src->ne[0], c.gate_src->ne[1], n_slots + 1);
         ggml_format_name(pub.c_gate, "moe_cache_gate.%d", c.il);
-        ls.uploads.emplace_back(pub.c_gate, c.gate_src);
+        ls.uploads.push_back({pub.c_gate, c.gate_src, 0});
 
         if (!c.fused) {
             pub.c_up = ggml_new_tensor_3d(ctx_dev, c.up_src->type, c.up_src->ne[0], c.up_src->ne[1], n_slots + 1);
             ggml_format_name(pub.c_up, "moe_cache_up.%d", c.il);
-            ls.uploads.emplace_back(pub.c_up, c.up_src);
+            ls.uploads.push_back({pub.c_up, c.up_src, 1});
         }
         pub.c_down = ggml_new_tensor_3d(ctx_dev, c.d_src->type, c.d_src->ne[0], c.d_src->ne[1], n_slots + 1);
         ggml_format_name(pub.c_down, "moe_cache_down.%d", c.il);
-        ls.uploads.emplace_back(pub.c_down, c.d_src);
+        ls.uploads.push_back({pub.c_down, c.d_src, 2});
 
         pub.dev_table = ggml_new_tensor_2d(ctx_dev, GGML_TYPE_I32, 1, c.n_expert);
         ggml_format_name(pub.dev_table, "moe_cache_tbl.%d", c.il);
@@ -698,18 +789,35 @@ void llama_moe_cache::maybe_activate() {
             }
 
             auto & ls = p->layers[j.layer_idx];
-            for (const auto & [dst_c, src] : ls.uploads) {
-                const size_t sz = src->nb[2];
-                if ((size_t) j.expert*sz + sz <= ggml_nbytes(src) &&
-                        (size_t) j.slot*sz + sz <= ggml_nbytes(dst_c)) {
-                    ggml_backend_tensor_set(dst_c,
-                            (const char *) src->data + (size_t) j.expert*sz,
-                            (size_t) j.slot*sz, sz);
+            bool ok = true;
+            size_t snap_off = 0;
+            for (const auto & u : ls.uploads) {
+                const size_t sz = u.src->nb[2];
+                if ((size_t) j.slot*sz + sz > ggml_nbytes(u.dst)) {
+                    ok = false;
+                    break;
                 }
+                const char * src_data;
+                if (j.snap) {
+                    if (snap_off + sz > j.snap->size()) {
+                        ok = false;
+                        break;
+                    }
+                    src_data = j.snap->data() + snap_off;
+                    snap_off += sz;
+                } else {
+                    if ((size_t) j.expert*sz + sz > ggml_nbytes(u.src)) {
+                        ok = false;
+                        break;
+                    }
+                    src_data = (const char *) u.src->data + (size_t) j.expert*sz;
+                }
+                ggml_backend_tensor_set(u.dst, src_data, (size_t) j.slot*sz, sz);
             }
+            j.failed = !ok;
             {
                 std::lock_guard<std::mutex> lk(p->wmtx);
-                p->done.push_back(j);
+                p->done.push_back(std::move(j));
             }
         }
     });
@@ -776,7 +884,8 @@ const llama_moe_cache_layer * llama_moe_cache::lookup(const ggml_tensor * gate) 
         return nullptr;
     }
     for (const auto & ls : pimpl->layers) {
-        if (ls.pub.gate_src == gate) {
+        if (ls.pub.gate_src == gate || ls.pub.up_src == gate ||
+                ls.key_gate == gate || ls.key_up == gate) {
             return &ls.pub;
         }
     }
@@ -874,6 +983,11 @@ void llama_moe_cache::rebalance() {
                 if (ls.resident[e]) {
                     continue;
                 }
+                // dio: the upload source is the disk decode cache's RAM slot,
+                // so only a filled RAM resident can be promoted to VRAM
+                if (p->disk_mode && !p->disk->resident_filled(ls.pub.il, e)) {
+                    continue;
+                }
                 // skip ids whose upload is already in flight
                 bool inflight = false;
                 for (int32_t s = 0; s < n_slots; ++s) {
@@ -890,8 +1004,11 @@ void llama_moe_cache::rebalance() {
     }
 
     // the evicted experts are still recent-hot: hand them back to the RAM tier
-    // so they stay mlock'd while VRAM no longer serves them
+    // so they stay resident while VRAM no longer serves them
     for (const auto & [il, e] : evicted) {
+        if (p->disk_mode) {
+            p->disk->vram_release(il, e);
+        }
         p->hot->promote_expert(il, e);
     }
 }
@@ -917,8 +1034,11 @@ void llama_moe_cache::tick(int64_t n_content_tokens) {
         std::vector<char> dirty(p->layers.size(), 0);
         for (const auto & j : p->done) {
             auto & ls = p->layers[j.layer_idx];
-            ls.slot_expert[j.slot] = j.expert;
             ls.slot_target[j.slot] = -1;
+            if (j.failed) {
+                continue; // source was gone; retried by the next rebalance
+            }
+            ls.slot_expert[j.slot] = j.expert;
             ls.resident[j.expert]  = 1;
             dirty[j.layer_idx]     = 1;
             became_resident.emplace_back(ls.pub.il, j.expert);
@@ -932,8 +1052,13 @@ void llama_moe_cache::tick(int64_t n_content_tokens) {
         p->done.clear();
     }
 
-    // residents are served from VRAM now: drop their RAM-tier mlock
+    // residents are served from VRAM now: the host chain skips them (its disk
+    // table entry becomes the sentinel and its RAM slot is freed for the next
+    // promotion) and the RAM-tier mlock is dropped
     for (const auto & [il, e] : became_resident) {
+        if (p->disk_mode) {
+            p->disk->vram_commit(il, e);
+        }
         p->hot->vram_takeover(il, e);
     }
 

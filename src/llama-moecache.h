@@ -64,6 +64,7 @@
 struct llama_model;
 struct ggml_tensor;
 class llama_hot_expert_cache;
+class llama_disk_stage;
 
 // per-layer view read by the graph builder (build_moe_ffn)
 struct llama_moe_cache_layer {
@@ -108,6 +109,13 @@ class llama_moe_cache {
     llama_moe_cache & operator=(const llama_moe_cache &) = delete;
 
     bool is_active() const;
+
+    // attach the direct-read disk stage (--load-mode dio). Must be called before
+    // reserve(). In this mode the host source of an upload is the disk decode
+    // cache's RAM slot, and a published resident's RAM slot is freed for the
+    // next promotion (the two tiers never hold the same expert). No-op if the
+    // disk stage is null or one was already attached
+    void set_disk_stage(llama_disk_stage * disk);
 
     // called once at context creation (after the model, KV and graph buffers
     // are in place): scans the host-resident MoE layers and reserves the device

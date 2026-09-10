@@ -190,12 +190,15 @@ struct llama_disk_stage::impl {
         ggml_tensor * up    = nullptr;
         ggml_tensor * down  = nullptr;
         ggml_tensor * table = nullptr; // I32 [n_expert]
+        ggml_tensor * slot_skip = nullptr; // I32 [n_slots + 1], 1 at the sentinel
         char *        data[3] = { nullptr, nullptr, nullptr };
         cache_slot_region r[3];
         int32_t n_slots    = 0;
         int32_t n_resident = 0;
+        int32_t sentinel   = 0; // spare slot for VRAM-served experts
         std::vector<int32_t> resident_slot; // expert id -> slot, -1 when not resident
         std::vector<uint8_t> resident_filled; // expert id -> its slot holds this expert's data
+        std::vector<uint8_t> vram;           // expert id -> served by the VRAM cache (host chain skips it)
         std::vector<int32_t> free_slots;    // resident slots with no expert (LIFO)
         llama_disk_stage_cache_layer pub;    // public view returned by cache_layer()
     };
@@ -547,9 +550,10 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                     // rounded up to the sector size, which can overrun the last slot
                     for (const auto & role : roles) {
                         const size_t stride = (size_t) src[il].t[role.slot]->nb[2];
-                        cache_bytes += align_up(src[il].r[role.slot].head + (size_t) slots_per_layer * (stride + disk_stage_align) + disk_stage_align, disk_stage_align);
+                        cache_bytes += align_up(src[il].r[role.slot].head + (size_t) (slots_per_layer + 1) * (stride + disk_stage_align) + disk_stage_align, disk_stage_align);
                     }
                     cache_bytes += align_up((size_t) n_expert * sizeof(int32_t), disk_stage_align);
+                    cache_bytes += align_up((size_t) (slots_per_layer + 1) * sizeof(int32_t), disk_stage_align);
                 }
 
                 // the decode cache is read by the CPU mul_mat_id only: decode
@@ -569,7 +573,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                     char * cbase = (char *) align_up((uintptr_t) ggml_backend_buffer_get_base(p.cache_pool), disk_stage_align);
 
                     ggml_init_params cip = {
-                        /*.mem_size   =*/ ggml_tensor_overhead() * (size_t) (n_layer * 4 + 16),
+                        /*.mem_size   =*/ ggml_tensor_overhead() * (size_t) (n_layer * 5 + 16),
                         /*.mem_buffer =*/ nullptr,
                         /*.no_alloc   =*/ true,
                     };
@@ -585,8 +589,10 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                             impl::cache_layer & c = p.cache[il];
                             c.n_slots    = slots_per_layer;
                             c.n_resident = n_resident;
+                            c.sentinel   = slots_per_layer;
                             c.resident_slot.assign((size_t) n_expert, -1);
                             c.resident_filled.assign((size_t) n_expert, 0);
+                            c.vram.assign((size_t) n_expert, 0);
                             c.free_slots.resize((size_t) n_resident);
                             for (int32_t s = 0; s < n_resident; ++s) {
                                 c.free_slots[(size_t) s] = s;
@@ -595,7 +601,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                             ggml_tensor * tensors[3] = { nullptr, nullptr, nullptr };
                             for (const auto & role : roles) {
                                 const ggml_tensor * s = src[il].t[role.slot];
-                                ggml_tensor * ct = ggml_new_tensor_3d(p.cache_ctx, s->type, s->ne[0], s->ne[1], slots_per_layer);
+                                ggml_tensor * ct = ggml_new_tensor_3d(p.cache_ctx, s->type, s->ne[0], s->ne[1], slots_per_layer + 1);
                                 ggml_format_name(ct, "disk_cache_%s.%d", role.suffix, il);
                                 // pad the slot stride: an expert read starts `head` bytes
                                 // before its slot to stay sector-aligned, so with adjacent
@@ -611,7 +617,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                     break;
                                 }
                                 c.data[role.slot] = (char *) ct->data;
-                                off += align_up(src[il].r[role.slot].head + (size_t) slots_per_layer * ct->nb[2] + disk_stage_align, disk_stage_align);
+                                off += align_up(src[il].r[role.slot].head + (size_t) (slots_per_layer + 1) * ct->nb[2] + disk_stage_align, disk_stage_align);
                                 tensors[role.slot] = ct;
                             }
                             if (p.cache_pool == nullptr) {
@@ -627,15 +633,28 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                             std::memset(tab->data, 0, (size_t) n_expert * sizeof(int32_t));
                             off += align_up((size_t) n_expert * sizeof(int32_t), disk_stage_align);
 
+                            // slot-indexed skip table for the host mul_mat_id: 1 at
+                            // the sentinel, so a VRAM-served expert (whose table
+                            // entry is the sentinel) is skipped instead of read
+                            ggml_tensor * skip = ggml_new_tensor_2d(p.cache_ctx, GGML_TYPE_I32, 1, slots_per_layer + 1);
+                            ggml_format_name(skip, "disk_cache_skip.%d", il);
+                            ggml_backend_tensor_alloc(p.cache_pool, skip, cbase + off);
+                            std::memset(skip->data, 0, (size_t) (slots_per_layer + 1) * sizeof(int32_t));
+                            ((int32_t *) skip->data)[slots_per_layer] = 1;
+                            off += align_up((size_t) (slots_per_layer + 1) * sizeof(int32_t), disk_stage_align);
+
                             c.gate  = tensors[0];
                             c.up    = tensors[1];
                             c.down  = tensors[2];
                             c.table = tab;
+                            c.slot_skip = skip;
                             c.pub.gate    = c.gate;
                             c.pub.up      = c.up;
                             c.pub.down    = c.down;
                             c.pub.table   = c.table;
+                            c.pub.slot_skip = c.slot_skip;
                             c.pub.n_slots = c.n_slots;
+                            c.pub.sentinel = c.sentinel;
                             n_cache++;
                         }
                         if (p.cache_pool != nullptr) {
@@ -822,6 +841,13 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
                 continue;
             }
 
+            // served by the VRAM cache: point the table at the sentinel so the
+            // host mul_mat_id skips it, and read nothing
+            if (c.vram[id]) {
+                table[id] = c.sentinel;
+                continue;
+            }
+
             // a resident slot is only valid once this expert's bytes have been
             // read into it; that first read happens here, in the same batch as
             // the transients
@@ -898,6 +924,9 @@ bool llama_disk_stage::resident_add(int il, int32_t id) {
     }
 
     std::lock_guard<std::mutex> lock(p.cache_mu);
+    if (c.vram[id]) {
+        return false;  // served by the VRAM cache: never a RAM resident
+    }
     if (c.resident_slot[id] >= 0) {
         return true;  // already resident
     }
@@ -930,6 +959,9 @@ void llama_disk_stage::resident_remove(int il, int32_t id) {
     }
 
     std::lock_guard<std::mutex> lock(p.cache_mu);
+    if (c.vram[id]) {
+        return;  // already belongs to the VRAM cache
+    }
     const int32_t slot = c.resident_slot[id];
     if (slot < 0) {
         return;
@@ -940,5 +972,139 @@ void llama_disk_stage::resident_remove(int il, int32_t id) {
 #else
     GGML_UNUSED(il);
     GGML_UNUSED(id);
+#endif
+}
+
+bool llama_disk_stage::resident_filled(int il, int32_t id) const {
+#if defined(_WIN32)
+    impl & p = *pimpl;
+    if (!p.active || il < 0 || il >= (int) p.cache.size()) {
+        return false;
+    }
+    const impl::cache_layer & c = p.cache[il];
+    if (c.gate == nullptr || id < 0 || id >= (int32_t) c.resident_slot.size()) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(p.cache_mu);
+    return !c.vram[id] && c.resident_slot[id] >= 0 && c.resident_filled[id] != 0;
+#else
+    GGML_UNUSED(il);
+    GGML_UNUSED(id);
+    return false;
+#endif
+}
+
+bool llama_disk_stage::resident_copy(int il, int32_t id, const size_t sz[3], void * dst, size_t dst_cap) const {
+#if defined(_WIN32)
+    impl & p = *pimpl;
+    if (!p.active || il < 0 || il >= (int) p.cache.size() || dst == nullptr) {
+        return false;
+    }
+    const impl::cache_layer & c = p.cache[il];
+    if (c.gate == nullptr || id < 0 || id >= (int32_t) c.resident_slot.size()) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(p.cache_mu);
+    const int32_t slot = c.resident_slot[id];
+    if (slot < 0 || c.vram[id] || c.resident_filled[id] == 0) {
+        return false;
+    }
+
+    size_t off = 0;
+    char * out = (char *) dst;
+    for (int role = 0; role < 3; ++role) {
+        const size_t len = c.r[role].stride;
+        if (len == 0 || c.r[role].slot_stride == 0) {
+            continue;
+        }
+        if (len > sz[role] || off + len > dst_cap) {
+            return false;  // caller buffer too small for this role
+        }
+        std::memcpy(out + off, c.data[role] + (size_t) slot * c.r[role].slot_stride, len);
+        off += len;
+    }
+    return true;
+#else
+    GGML_UNUSED(il);
+    GGML_UNUSED(id);
+    GGML_UNUSED(sz);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(dst_cap);
+    return false;
+#endif
+}
+
+void llama_disk_stage::vram_commit(int il, int32_t id) {
+#if defined(_WIN32)
+    impl & p = *pimpl;
+    if (!p.active || il < 0 || il >= (int) p.cache.size()) {
+        return;
+    }
+    impl::cache_layer & c = p.cache[il];
+    if (c.gate == nullptr || id < 0 || id >= (int32_t) c.resident_slot.size()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(p.cache_mu);
+    if (c.vram[id]) {
+        return;
+    }
+    c.vram[id] = 1;
+    ((int32_t *) c.table->data)[id] = c.sentinel;
+
+    // the RAM copy is redundant now: free the slot for the next promotion (it
+    // may already be gone: the hot tier can have evicted it during the upload)
+    const int32_t slot = c.resident_slot[id];
+    if (slot >= 0) {
+        c.resident_slot[id]   = -1;
+        c.resident_filled[id] = 0;
+        c.free_slots.push_back(slot);
+    }
+#else
+    GGML_UNUSED(il);
+    GGML_UNUSED(id);
+#endif
+}
+
+void llama_disk_stage::vram_release(int il, int32_t id) {
+#if defined(_WIN32)
+    impl & p = *pimpl;
+    if (!p.active || il < 0 || il >= (int) p.cache.size()) {
+        return;
+    }
+    impl::cache_layer & c = p.cache[il];
+    if (c.gate == nullptr || id < 0 || id >= (int32_t) c.resident_slot.size()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(p.cache_mu);
+    c.vram[id] = 0;
+    // the table entry stays at the sentinel; the next fill_cache() reassigns it
+    // (the expert is not a RAM resident any more, so it takes a transient slot)
+#else
+    GGML_UNUSED(il);
+    GGML_UNUSED(id);
+#endif
+}
+
+bool llama_disk_stage::is_vram(int il, int32_t id) const {
+#if defined(_WIN32)
+    impl & p = *pimpl;
+    if (!p.active || il < 0 || il >= (int) p.cache.size()) {
+        return false;
+    }
+    const impl::cache_layer & c = p.cache[il];
+    if (c.gate == nullptr || id < 0 || id >= (int32_t) c.resident_slot.size()) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(p.cache_mu);
+    return c.vram[id] != 0;
+#else
+    GGML_UNUSED(il);
+    GGML_UNUSED(id);
+    return false;
 #endif
 }

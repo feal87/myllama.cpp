@@ -223,14 +223,22 @@ llama_context::llama_context(
         }
     }
 
-    if (moe_requested && disk_active) {
-        // the experts are Disk tensors: their data pointers sit in the reserved,
-        // never-committed address range, so the VRAM tier has no host bytes to
-        // upload, and the disk decode cache already owns the decode substitution.
-        // Activating it would segfault on the first upload.
-        LLAMA_LOG_WARN("%s: --moe-expert-cache* is ignored with --load-mode dio; "
-                        "the disk decode cache is the RAM tier\n", __func__);
-    } else if (moe_requested) {
+    // the disk stage fills through the eval callback, so it needs the hot-expert
+    // engine; attach it now that both exist, and before the MoE cache is built
+    // (the VRAM tier sources its uploads from the disk decode cache's RAM slots
+    // in dio, and frees them once published)
+    if (disk_active) {
+        if (hot_experts) {
+            hot_experts->set_disk_stage(disk_stage.get());
+            LLAMA_LOG_INFO("%s: disk decode cache is the RAM tier, %d resident experts per layer\n",
+                           __func__, disk_stage->resident_capacity());
+        } else {
+            LLAMA_LOG_WARN("%s: disk streaming needs the eval callback (--hot-experts-prefetch); disabled\n", __func__);
+            disk_stage.reset();
+        }
+    }
+
+    if (moe_requested) {
         if (hot_experts) {
             // the VRAM tier feeds on the hot-expert cache's global ranking (it
             // sizes its per-layer capacities from the observed routing profile).
@@ -241,22 +249,12 @@ llama_context::llama_context(
             moe_cache = std::make_unique<llama_moe_cache>(
                 model, hot_experts.get(), cparams.n_moe_cache_budget_bytes,
                 cparams.n_moe_cache_inserts);
+            if (moe_cache && disk_stage != nullptr) {
+                moe_cache->set_disk_stage(disk_stage.get());
+            }
         } else {
             LLAMA_LOG_WARN("%s: --moe-expert-cache* needs the router-observation engine, but a "
                             "custom cb_eval is in use; MoE expert cache disabled\n", __func__);
-        }
-    }
-
-    // the disk stage fills through the eval callback, so it needs the hot-expert
-    // engine; attach it now that both exist
-    if (disk_active) {
-        if (hot_experts) {
-            hot_experts->set_disk_stage(disk_stage.get());
-            LLAMA_LOG_INFO("%s: disk decode cache is the RAM tier, %d resident experts per layer\n",
-                           __func__, disk_stage->resident_capacity());
-        } else {
-            LLAMA_LOG_WARN("%s: disk streaming needs the eval callback (--hot-experts-prefetch); disabled\n", __func__);
-            disk_stage.reset();
         }
     }
 
