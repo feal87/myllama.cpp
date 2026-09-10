@@ -86,7 +86,9 @@ across layers, so about one layer's worth, not the sum over all layers):
   the tensor expects it (no bounce copy).
 - Reader: single-thread windowed IOCP, queue depth 32.
 
-Decode cache (off unless `LLAMA_DISK_STAGE_CACHE_MIB` is set):
+Decode cache (always built; sized by `--pin-hot-experts` /
+`--pin-hot-experts-budget-mib`, with `LLAMA_DISK_STAGE_CACHE_MIB` as a
+fallback):
 
 - `llama_disk_stage_cache_layer { gate, up, down, table, n_slots }`
 - One compact slot array per layer plus an I32 `table[n_expert]` mapping expert
@@ -176,12 +178,19 @@ Kept here as a record. The changes that made single-token generation work:
 Open follow-up: the cache budget is still the env-only
 `LLAMA_DISK_STAGE_CACHE_MIB`; see B.
 
-### B. Cache budget as a real flag
+### B. Cache budget as a real flag (done)
 
-5. Replace `LLAMA_DISK_STAGE_CACHE_MIB` with `--pin-hot-experts-budget-mib`
-   (`common/arg.cpp` already defines the flag, currently unused for this) and
-   retire the mlock-in-place RAM tier. `--pin-hot-experts` must become a filled,
-   DIO-backed copied cache, not a locked mapping.
+5. Done. `--pin-hot-experts-budget-mib` is the disk decode cache budget and
+   `--pin-hot-experts N` its resident experts per layer; `LLAMA_DISK_STAGE_CACHE_MIB`
+   is kept as a fallback for scripts. When disk staging is active the hot-expert
+   engine is built ranking-only (`n_pin_experts = 0`), so nothing is mlock'd in
+   place and the copied disk cache is the RAM tier; its counts still drive the
+   VRAM tier and the prefetch. With neither flag given the cache falls back to a
+   minimal `n_expert_used + 1` slots per layer and warns, so single-token decode
+   works instead of faulting on the unmapped tensors.
+
+   Still open: the resident set is first-come, so `--pin-hot-experts` sizes the
+   set but does not yet choose the hottest experts in dio mode. See item 13.
 
 ### C. Performance
 
@@ -208,8 +217,15 @@ Open follow-up: the cache budget is still the env-only
 
 ### E. Correctness and robustness
 
-13. Resident set is first-come with no eviction or promotion. Feed the hot-expert
-    usage counts in so resident slots follow actual hotness.
+13. The disk decode cache's resident set is first-come: the first `n_resident`
+    experts seen per layer keep their slots. Make it ranking-driven so it holds
+    the actual hottest experts (`--pin-hot-experts` currently only sizes the
+    set). Sketch: `llama_context` periodically snapshots
+    `llama_hot_expert_cache::all_counts()`, picks the `n_resident` hottest ids per
+    layer and hands the target to `llama_disk_stage`; the stage refills or frees
+    resident slots lazily at that layer's next `fill_cache`, with a churn guard
+    (swap only when the challenger clearly leads) like the mlock tier's
+    hysteresis.
 14. Confirm the cache `table` tensor always stays host-allocated (written by the
     callback, read by the graph right after the chunk boundary).
 15. Done: greedy output over 32 tokens is byte-identical to `--load-mode
@@ -272,8 +288,8 @@ Disk staging (Windows only):
 - `LLAMA_DISK_STAGE=1` - enable.
 - `LLAMA_DISK_STAGE_PIN` - default on; use the device's pinned host buffer for
   the staging pool. `0` forces the plain CPU buffer.
-- `LLAMA_DISK_STAGE_CACHE_MIB` - decode cache budget in MiB; off by default.
-  To be replaced by `--pin-hot-experts-budget-mib`.
+- `LLAMA_DISK_STAGE_CACHE_MIB` - decode cache budget in MiB; fallback, used only
+  when neither `--pin-hot-experts` nor `--pin-hot-experts-budget-mib` is given.
 - `LLAMA_DISK_STAGE_SELFTEST=1` - run the reader over one contiguous span as a
   control.
 - `LLAMA_DISK_STAGE_DECODE_FULL=1` - diagnostic: run single-token decode through
@@ -284,8 +300,9 @@ Existing knobs:
 - `LLAMA_MMAP_CACHE_HINT` (default `random`).
 - `LLAMA_PREFETCH_LAYER_AHEAD` (regressed, to remove).
 - `--hot-experts-prefetch` - required by disk staging (provides the callback).
-- `--pin-hot-experts N`, `--pin-hot-experts-budget-mib N` - mlock-in-place tier
-  today; to become the copied DIO cache.
+- `--pin-hot-experts N`, `--pin-hot-experts-budget-mib N` - the per-layer RAM
+  expert set: mlock'd in place normally, copied into the disk decode cache with
+  `--load-mode dio`.
 - `--moe-expert-cache-budget-mib N` - VRAM expert cache (separate feature).
 
 ## Files touched
@@ -337,6 +354,10 @@ shard 1 once; it was restored).
 
 ## Gotchas
 
+- Rebuilding the CUDA objects needs the MSVC environment on PATH. Run
+  `cmd //c build-eval-ninja.bat build <target>` (it calls `vcvars64.bat` then
+  ninja); a plain `cmake --build` fails with `nvcc fatal : Cannot find compiler
+  'cl.exe' in PATH` as soon as a `.cu` object is out of date.
 - `bin/llama.dll` fails to link while `llama-server` is running. Stop it first.
 - `init_mappings` / `get_mapping_range` dereference `mappings.at(idx)`, so a
   "not mapped" file must still have an entry (hence the `map` flag, not a

@@ -167,6 +167,28 @@ llama_context::llama_context(
     const bool moe_requested =
         cparams.n_moe_cache_budget_bytes > 0;
 
+    // LLAMA_DISK_STAGE: direct-read streaming of the MoE experts. Created before
+    // the hot-expert engine because it replaces the mlock-in-place RAM tier:
+    // with the model tensors never mapped there is nothing to lock, so the
+    // engine is built ranking-only and the disk decode cache is the RAM tier
+    if (llama_disk_stage::supported()) {
+        ggml_backend_dev_t stage_dev = nullptr;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                stage_dev = dev;
+                break;
+            }
+        }
+        auto stage = std::make_unique<llama_disk_stage>(model, stage_dev,
+                cparams.n_pin_hot_experts, cparams.n_pin_hot_experts_budget_bytes);
+        if (stage->is_active()) {
+            disk_stage = std::move(stage);
+        }
+    }
+
+    const bool disk_active = disk_stage != nullptr;
+
     // decode ubatches feed the hot-expert ranking whenever pinning or the VRAM
     // MoE tier can consume it (matches the track_rank the engine was built with)
     hot_observe_decode = cparams.n_pin_hot_experts > 0 || moe_requested;
@@ -182,8 +204,12 @@ llama_context::llama_context(
                             "require the eval callback slot, but a custom cb_eval was already "
                             "supplied; all hot-expert features disabled\n", __func__);
         } else {
+            // with disk streaming the RAM tier is the disk decode cache, so build
+            // the engine ranking-only: its counts still drive the VRAM tier and
+            // the prefetch, but nothing is mlock'd in place
+            const int32_t n_pin_effective = disk_active ? 0 : cparams.n_pin_hot_experts;
             hot_experts = std::make_unique<llama_hot_expert_cache>(
-                model, cparams.n_pin_hot_experts, cparams.n_pin_hot_experts_budget_bytes,
+                model, n_pin_effective, cparams.n_pin_hot_experts_budget_bytes,
                 cparams.n_pin_hot_experts_decay_tokens, cparams.n_pin_hot_experts_min_count,
                 cparams.hot_experts_prefetch,
                 cparams.n_pin_hot_experts > 0 || moe_requested);
@@ -209,26 +235,14 @@ llama_context::llama_context(
         }
     }
 
-    // LLAMA_DISK_STAGE: synchronous direct-read staging of MoE experts for
-    // multi-token ubatches. It piggybacks on the hot-expert eval callback to
-    // fill each layer at its topk, so it needs that callback to be installed
-    if (llama_disk_stage::supported()) {
-        ggml_backend_dev_t stage_dev = nullptr;
-        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                stage_dev = dev;
-                break;
-            }
-        }
-        auto stage = std::make_unique<llama_disk_stage>(model, stage_dev);
-        if (!stage->is_active()) {
-            // disabled by env, no stageable layer, or allocation failed
-        } else if (hot_experts) {
-            hot_experts->set_disk_stage(stage.get());
-            disk_stage = std::move(stage);
+    // the disk stage fills through the eval callback, so it needs the hot-expert
+    // engine; attach it now that both exist
+    if (disk_active) {
+        if (hot_experts) {
+            hot_experts->set_disk_stage(disk_stage.get());
         } else {
             LLAMA_LOG_WARN("%s: LLAMA_DISK_STAGE needs --hot-experts-prefetch (the eval callback); disabled\n", __func__);
+            disk_stage.reset();
         }
     }
 

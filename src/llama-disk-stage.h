@@ -48,8 +48,12 @@ public:
     static bool supported();
 
     // dev selects the host buffer type the staging pool is allocated from
-    // (the device's pinned host buffer when it has one, CPU otherwise)
-    llama_disk_stage(const llama_model & model, ggml_backend_dev_t dev);
+    // (the device's pinned host buffer when it has one, CPU otherwise).
+    // n_pin_experts is the decode cache's resident experts per layer
+    // (--pin-hot-experts), cache_budget_bytes its hard cap across all layers
+    // (--pin-hot-experts-budget-mib); 0 means no explicit budget
+    llama_disk_stage(const llama_model & model, ggml_backend_dev_t dev,
+                     int32_t n_pin_experts, uint64_t cache_budget_bytes);
     ~llama_disk_stage();
 
     // staging tensors of MoE layer il, or null when the layer is not stageable

@@ -2804,11 +2804,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--pin-hot-experts"}, "N",
         string_format(
-            "lock the N most frequently used MoE experts per layer into RAM in place\n"
-            "(mlock on their existing weight tensors, no copy) so the OS cannot evict\n"
-            "them; ranking is GLOBAL across all layers (total slots = N x num_moe_layers),\n"
-            "the hot set is tracked dynamically from actual router decisions and refreshed\n"
-            "on the fly. Only affects experts kept in host (CPU) memory\n"
+            "size the per-layer RAM expert set to the N most frequently used MoE experts\n"
+            "per layer: with --load-mode dio the experts are copied into the disk decode\n"
+            "cache (filled by the same unbuffered reader), otherwise the model is mmap'd\n"
+            "and their existing pages are mlock'd in place (no copy). Ranking is GLOBAL\n"
+            "across all layers (total slots = N x num_moe_layers), tracked dynamically\n"
+            "from actual router decisions. Only affects experts kept in host (CPU) memory\n"
             "(default: %d, 0 = no pinning). With N = 0 the router observation still runs\n"
             "when --hot-experts-prefetch or --moe-expert-cache* is on (they feed on the\n"
             "same ranking); incompatible with a custom eval callback",
@@ -2824,12 +2825,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--pin-hot-experts-budget-mib"}, "N",
         string_format(
-            "hard cap, in MiB, on total memory locked by --pin-hot-experts across ALL layers\n"
-            "combined (default: %" PRIu64 ", 0 = unlimited). mlock() faults pages into RAM as\n"
-            "part of locking them, so leaving this unlimited on a large model/N can get the\n"
-            "process killed by the OOM killer instead of --pin-hot-experts simply having no\n"
-            "effect. Leave enough headroom for the KV cache and compute buffers, e.g. total\n"
-            "RAM minus model size minus expected KV cache / activation memory",
+            "hard cap, in MiB, on the total memory of the per-layer RAM expert set across\n"
+            "ALL layers combined (default: %" PRIu64 ", 0 = unlimited). This is the mlock\n"
+            "budget without --load-mode dio, where mlock() faults pages into RAM as part\n"
+            "of locking them and leaving this unlimited on a large model/N can get the\n"
+            "process killed by the OOM killer instead of --pin-hot-experts simply having\n"
+            "no effect. With --load-mode dio it is the budget of the disk decode cache,\n"
+            "which is committed up front, so setting it is strongly recommended. Leave\n"
+            "enough headroom for the KV cache and compute buffers, e.g. total RAM minus\n"
+            "model size minus expected KV cache / activation memory",
             params.n_pin_hot_experts_budget_mib
         ),
         [](common_params & params, int value) {

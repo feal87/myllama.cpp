@@ -296,12 +296,15 @@ const llama_disk_stage_cache_layer * llama_disk_stage::cache_layer(int il) const
     return &pimpl->cache[il].pub;
 }
 
-llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t dev) :
+llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t dev,
+                                   int32_t n_pin_experts, uint64_t cache_budget_bytes) :
     pimpl(std::make_unique<impl>(model)) {
     impl & p = *pimpl;
 
 #if !defined(_WIN32)
     GGML_UNUSED(dev);
+    GGML_UNUSED(n_pin_experts);
+    GGML_UNUSED(cache_budget_bytes);
     return;
 #else
     if (!env_flag_on("LLAMA_DISK_STAGE")) {
@@ -468,12 +471,19 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
         return;
     }
 
-    // persistent decode cache (LLAMA_DISK_STAGE_CACHE_MIB): one compact slot
-    // array per layer, filled by the same unbuffered reader. The graph remaps
-    // selected_experts through the layer's table and reads the weights in place,
-    // so a resident expert is served without a copy.
+    // persistent decode cache: one compact slot array per layer, filled by the
+    // same unbuffered reader. The graph remaps selected_experts through the
+    // layer's table and reads the weights in place, so a resident expert is
+    // served without a copy. Single-token decode needs it (the model tensors are
+    // never mapped), so it is always built: --pin-hot-experts sets the resident
+    // experts per layer, --pin-hot-experts-budget-mib caps the total across all
+    // layers, and LLAMA_DISK_STAGE_CACHE_MIB is kept as a fallback for scripts
+    uint64_t cache_budget = cache_budget_bytes;
     const uint64_t cache_mib = env_u64("LLAMA_DISK_STAGE_CACHE_MIB");
-    if (cache_mib > 0) {
+    if (cache_budget == 0 && cache_mib > 0) {
+        cache_budget = cache_mib << 20;
+    }
+    {
         int ref = -1;
         for (int il = 0; il < n_layer; ++il) {
             if (src[il].ok) {
@@ -491,8 +501,21 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                 per_expert += src[ref].t[role.slot]->nb[2];
             }
 
-            int32_t slots_per_layer = (int32_t) ((cache_mib << 20) /
-                    ((size_t) n_layer * std::max<size_t>(per_expert, 1)));
+            int32_t slots_per_layer = cache_budget > 0
+                    ? (int32_t) (cache_budget / ((size_t) n_layer * std::max<size_t>(per_expert, 1)))
+                    : 0;
+            if (n_pin_experts > 0) {
+                // --pin-hot-experts N: N resident experts per layer, plus the
+                // transient slots the routed-but-not-resident experts need
+                const int32_t want = std::min<int32_t>(n_pin_experts + n_trans, n_expert);
+                slots_per_layer = slots_per_layer > 0 ? std::min(slots_per_layer, want) : want;
+            }
+            if (slots_per_layer == 0) {
+                slots_per_layer = std::min<int32_t>(n_trans + 1, n_expert);
+                LLAMA_LOG_WARN("%s: neither --pin-hot-experts nor --pin-hot-experts-budget-mib given, "
+                               "using a minimal %d-slot decode cache per layer\n",
+                               __func__, (int) slots_per_layer);
+            }
             slots_per_layer = std::min<int32_t>(slots_per_layer, n_expert);
 
             if (slots_per_layer > n_trans) {
