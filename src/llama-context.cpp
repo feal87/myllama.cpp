@@ -223,7 +223,14 @@ llama_context::llama_context(
         }
     }
 
-    if (moe_requested) {
+    if (moe_requested && disk_active) {
+        // the experts are Disk tensors: their data pointers sit in the reserved,
+        // never-committed address range, so the VRAM tier has no host bytes to
+        // upload, and the disk decode cache already owns the decode substitution.
+        // Activating it would segfault on the first upload.
+        LLAMA_LOG_WARN("%s: --moe-expert-cache* is ignored with --load-mode dio; "
+                        "the disk decode cache is the RAM tier\n", __func__);
+    } else if (moe_requested) {
         if (hot_experts) {
             // the VRAM tier feeds on the hot-expert cache's global ranking (it
             // sizes its per-layer capacities from the observed routing profile).

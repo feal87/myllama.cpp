@@ -199,6 +199,17 @@ Decode cache (always built when disk streaming is active; sized by
    worker's reads entirely, so only the decode thread reads now and the guard is
    no longer contended. Anyone who reintroduces a second reader must bring its
    own completion port and handle set.
+6. `--moe-expert-cache*` (the VRAM tier) segfaulted in dio mode, at exactly 512
+   decode tokens. The Disk buffer type reports `is_host = true` (the scheduler
+   needs that), so `llama_moe_cache::reserve()` accepted the Disk expert tensors
+   as host-resident, reserved a device pool, and once `maybe_activate()` fired
+   the upload worker read `src->data` from the reserved-but-never-committed
+   address range. The graph-side use was already dead: `build_moe_ffn` replaces
+   `gate_exps` with the disk cache tensor before `llama_moe_cache::lookup()`
+   compares pointers, so the VRAM tier never served a token. `llama_context` now
+   warns and drops the tier when disk streaming is active, and the launcher does
+   not pass the flags in dio. Feeding VRAM from the disk cache slots (a real
+   VRAM > RAM > disk hierarchy) is future work, not a bug fix.
 
 ## Remaining work
 
@@ -239,11 +250,17 @@ Open follow-up: none; the configuration is covered by B.
    are kept across tokens and only new ids are read into transient slots. A
    promotion is mapping-only - `fill_cache` reads the expert when it is next
    routed - so an expert is read from disk once, never twice (see item 13).
-9. Layers 0-1 at 3.5-3.9 GB/s: shard 1 stays mapped for the lazy PLE
-   (`per_layer_token_embd`, 35.76 GiB, buffered ~170-byte rows via
-   `ple_direct_reader` / `qwen4exp.cpp`). Either unmap shard 1 after the PLE
-   table is no longer needed, or read PLE rows unbuffered, to lift them to
-   7.4 GB/s.
+9. Layers 0-1 at 3.5-3.9 GB/s: the PLE reader itself does NOT mmap. With
+   `--lazy-mode on-direct` the qwen4exp arch opens its own handle
+   (`FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_OVERLAPPED`, buffered, explicit offset
+   reads) and never touches a mapping. But shard 1 still gets one, because
+   `init_mappings` maps every file that holds a lazy tensor
+   (`need_map = use_mmap || !lazy.for_file(idx).empty()`) and the PLE table is
+   lazy. That mapping is unused with `on-direct`, yet it is live, and a live
+   data section caps that file's unbuffered reads (the root cause above). That
+   is the whole layers 0-1 penalty. Removing it needs the loader to skip files
+   whose only lazy tensors will be served by a direct reader, with a fallback
+   if the direct open fails. Effect is about 2-3% of a full prefill.
 9b. The ranking can be slower than the old first-come fill on SHORT runs (the
     first-come set is already close to hot, and the policy pays a warm-up plus
     churn). A long baseline is needed to see whether it wins; see item 13. The
