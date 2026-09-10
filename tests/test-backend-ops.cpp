@@ -1621,6 +1621,14 @@ struct test_case {
             n_runs = (int)std::min<int64_t>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_size / op_size(out)) + 1;
         }
 
+        // optional cap, for ops whose cost is not proportional to the output size (e.g. top_k)
+        if (const char * max_runs_env = getenv("GGML_BACKEND_OPS_MAX_RUNS")) {
+            const int max_runs = atoi(max_runs_env);
+            if (max_runs > 0) {
+                n_runs = std::min(n_runs, max_runs);
+            }
+        }
+
         // duplicate the op
         for (int i = 1; i < n_runs; i++) {
             ggml_graph_add_node(gf, out);
@@ -10373,6 +10381,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 8192,  2, 1, 1 }, 2051, true));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 33024, 4, 1, 1 }, 2051, true));
 
+    // Benchmark-only MoE shapes: 512 experts, 10 active. Set GGML_TOPK_BENCH=1 to register.
+    if (getenv("GGML_TOPK_BENCH") != nullptr) {
+        for (int nrows : {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {512, nrows, 1, 1}, 10));
+        }
+        for (int ncols : {128, 256, 1024, 2048, 4096, 8192}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {ncols, 1, 1, 1}, 10));
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {ncols, 512, 1, 1}, 10));
+        }
+        for (int k : {1, 2, 4, 8, 16, 32, 64}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {512, 1, 1, 1}, k));
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {512, 512, 1, 1}, k));
+        }
+    }
+
     // qwen4exp QSA indexer top-k fusion (get_rows + f16 mask + top_k)
     test_cases.emplace_back(new test_topk_qsa(512,  2048,  1, 1, 1500));
     test_cases.emplace_back(new test_topk_qsa(512,  2048,  2, 1, 1500));
@@ -11218,6 +11241,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (auto cols : {k, 1000, 65000, 200000}) {
                 test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, k));
             }
+        }
+    }
+
+    // Benchmark-only MoE shapes: 512 experts, 10 active. Set GGML_TOPK_BENCH=1 to register.
+    if (getenv("GGML_TOPK_BENCH") != nullptr) {
+        for (int nrows : {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {512, nrows, 1, 1}, 10));
+        }
+        for (int ncols : {128, 256, 1024, 2048, 4096, 8192}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {ncols, 1, 1, 1}, 10));
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {ncols, 512, 1, 1}, 10));
+        }
+        for (int k : {1, 2, 4, 8, 16, 32, 64}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {512, 1, 1, 1}, k));
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {512, 512, 1, 1}, k));
         }
     }
 
