@@ -504,10 +504,14 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                     cache_bytes += align_up((size_t) n_expert * sizeof(int32_t), disk_stage_align);
                 }
 
-                ggml_backend_buffer_type_t cbuft = ggml_backend_dev_host_buffer_type(dev);
-                if (cbuft == nullptr) {
-                    cbuft = ggml_backend_cpu_buffer_type();
-                }
+                // the decode cache is read by the CPU mul_mat_id only: decode
+                // never offloads (n_tokens == 1), so it is plain CPU memory.
+                // A pinned (cudaMallocHost) buffer would page-lock the whole
+                // cache, map it through the limited BAR1 aperture, and count
+                // against the WDDM device budget - a 32 GiB cache then fails or
+                // OOMs unrelated device allocations. The staging pool above stays
+                // pinned because it IS the source of the host->VRAM offload copy.
+                ggml_backend_buffer_type_t cbuft = ggml_backend_cpu_buffer_type();
                 p.cache_pool = ggml_backend_buft_alloc_buffer(cbuft, cache_bytes);
                 if (p.cache_pool == nullptr) {
                     LLAMA_LOG_WARN("%s: failed to allocate the %.2f GiB decode cache\n",
