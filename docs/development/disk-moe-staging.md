@@ -86,9 +86,8 @@ across layers, so about one layer's worth, not the sum over all layers):
   the tensor expects it (no bounce copy).
 - Reader: single-thread windowed IOCP, queue depth 32.
 
-Decode cache (always built; sized by `--pin-hot-experts` /
-`--pin-hot-experts-budget-mib`, with `LLAMA_DISK_STAGE_CACHE_MIB` as a
-fallback):
+Decode cache (always built when disk streaming is active; sized by
+`--pin-hot-experts` / `--pin-hot-experts-budget-mib`):
 
 - `llama_disk_stage_cache_layer { gate, up, down, table, n_slots }`
 - One compact slot array per layer plus an I32 `table[n_expert]` mapping expert
@@ -116,12 +115,11 @@ fallback):
   `eval_callback` watches tensors named `ffn_moe_topk-<il>`, `wants_observe(il)`
   decides whether to break the graph there, and `observe(il, t)` copies the ids
   and calls `disk_stage->fill(il)`.
-- `llama_context` installs the callback only for `ubatch.n_tokens > 1` and only
-  when `--hot-experts-prefetch` is on (`llama-context.cpp`, the
-  `need_eval_cb` line). Single-token ubatches instead feed a post-compute
-  ranking path (`observe_decode_*`) from top-k tensors registered as graph
-  outputs. `LLAMA_DISK_STAGE` therefore warns and disables itself without
-  `--hot-experts-prefetch`.
+- `llama_context` installs the callback for multi-token ubatches when
+  `--hot-experts-prefetch` is on, and for every ubatch when the disk stage is
+  active (single-token decode needs the fill too). Single-token ubatches also
+  feed the post-compute ranking path (`observe_decode_*`) from top-k tensors
+  registered as graph outputs.
 
 ## Verified
 
@@ -136,6 +134,11 @@ fallback):
   layer (79 resident, 10 transient), and greedy output matches `mmap+pin` byte
   for byte. Throughput on this machine is about 4.5-7 t/s depending on how warm
   the resident set is.
+- The resident set is ranking-driven per layer (`--pin-hot-experts N` /
+  `--pin-hot-experts-budget-mib`): over 96 decode tokens the set filled to
+  3160/3792 slots with a 48% routed-expert hit rate, and the greedy output was
+  still byte-identical to the earlier cache path. The mmap path still reports its
+  global mlock set (`N x 48` with skew, real lock calls).
 
 ### Bugs found and fixed on the way
 
@@ -175,16 +178,14 @@ Kept here as a record. The changes that made single-token generation work:
    three projections. The top-k weights keep the original ids, so the pairing is
    preserved.
 
-Open follow-up: the cache budget is still the env-only
-`LLAMA_DISK_STAGE_CACHE_MIB`; see B.
+Open follow-up: none; the configuration is covered by B.
 
 ### B. Cache budget as a real flag (done)
 
-5. Done. `--pin-hot-experts-budget-mib` is the disk decode cache budget and
-   `--pin-hot-experts N` its resident experts per layer; `LLAMA_DISK_STAGE_CACHE_MIB`
-   is kept as a fallback for scripts. When disk staging is active the hot-expert
-   engine is built ranking-only (`n_pin_experts = 0`), so nothing is mlock'd in
-   place and the copied disk cache is the RAM tier; its counts still drive the
+5. Done. `--pin-hot-experts-budget-mib` is the decode cache budget and
+   `--pin-hot-experts N` its resident experts per layer. When disk streaming is
+   active the hot-expert engine is built per-layer and the copied disk cache is
+   the RAM tier; nothing is mlock'd in place, and its counts still drive the
    VRAM tier and the prefetch. With neither flag given the cache falls back to a
    minimal `n_expert_used + 1` slots per layer and warns, so single-token decode
    works instead of faulting on the unmapped tensors.
@@ -217,15 +218,25 @@ Open follow-up: the cache budget is still the env-only
 
 ### E. Correctness and robustness
 
-13. The disk decode cache's resident set is first-come: the first `n_resident`
-    experts seen per layer keep their slots. Make it ranking-driven so it holds
-    the actual hottest experts (`--pin-hot-experts` currently only sizes the
-    set). Sketch: `llama_context` periodically snapshots
-    `llama_hot_expert_cache::all_counts()`, picks the `n_resident` hottest ids per
-    layer and hands the target to `llama_disk_stage`; the stage refills or frees
-    resident slots lazily at that layer's next `fill_cache`, with a churn guard
-    (swap only when the challenger clearly leads) like the mlock tier's
-    hysteresis.
+13. Done. The disk decode cache's resident set is now ranking-driven, per layer:
+    `llama_context` builds the hot-expert engine even in dio mode, with a per-layer
+    capacity equal to the cache's resident slots. When the disk stage is attached,
+    `try_promote` takes a per-layer path (`try_promote_layer`): fill up to `n_pin`
+    residents for the layer, then take over that layer's coldest resident, with the
+    same min-count floor, `takeover_min_lead` and `evict_grace_tokens` as the mlock
+    tier. A "pin" is a copy into a resident slot (`llama_disk_stage::pin`), an
+    eviction frees the slot (`unpin`); the slot is published only after the read
+    completes, so the graph can never read a half-filled slot. The mlock path keeps
+    its global ranking, so mmap mode is unchanged.
+
+    The promotion worker and the decode fill share one I/O completion port, so
+    their reads are serialized by a mutex (two concurrent reapers corrupt each
+    other). On short runs this makes the ranking-driven cache slower than the old
+    first-come fill (about 3.3 vs 4.4 t/s here), because the first-come set was
+    already close to the hot set and the per-layer policy pays a warm-up plus the
+    promotion reads. Over long sessions the ranking should win, since it does not
+    keep stale first-seen experts. A dedicated completion port and handle set for
+    the worker would remove the serialization.
 14. Confirm the cache `table` tensor always stays host-allocated (written by the
     callback, read by the graph right after the chunk boundary).
 15. Done: greedy output over 32 tokens is byte-identical to `--load-mode
@@ -283,26 +294,27 @@ budget is essentially the expert cache plus the staging ring.
 
 ## Knobs
 
-Disk staging (Windows only):
+Disk streaming is enabled by `--load-mode dio` (Windows only) and configured by
+the existing hot-expert flags; it has no environment variables of its own. It is
+created only when the model actually has Disk-buffer weights, so `--load-mode
+mmap` is unaffected. The staging slab always uses the device's pinned host buffer
+when one exists (plain CPU memory otherwise).
 
-- `LLAMA_DISK_STAGE=1` - enable.
-- `LLAMA_DISK_STAGE_PIN` - default on; use the device's pinned host buffer for
-  the staging pool. `0` forces the plain CPU buffer.
-- `LLAMA_DISK_STAGE_CACHE_MIB` - decode cache budget in MiB; fallback, used only
-  when neither `--pin-hot-experts` nor `--pin-hot-experts-budget-mib` is given.
-- `LLAMA_DISK_STAGE_SELFTEST=1` - run the reader over one contiguous span as a
-  control.
-- `LLAMA_DISK_STAGE_DECODE_FULL=1` - diagnostic: run single-token decode through
-  the full-layer slab instead of the decode cache, to compare the two paths.
+- `--load-mode dio` - route the MoE expert tensors to the Disk buffer and stream
+  them. The model tensors are never mapped.
+- `--pin-hot-experts N` - resident experts per layer for the decode cache.
+- `--pin-hot-experts-budget-mib N` - hard cap, in MiB, on the decode cache
+  across all layers. With neither flag the cache falls back to a minimal
+  `n_expert_used + 1` slots per layer and warns.
+- `--hot-experts-prefetch` - no longer required by disk streaming (the stage
+  installs the callback itself); still useful in `mmap` mode.
 
-Existing knobs:
+Other knobs:
 
 - `LLAMA_MMAP_CACHE_HINT` (default `random`).
 - `LLAMA_PREFETCH_LAYER_AHEAD` (regressed, to remove).
-- `--hot-experts-prefetch` - required by disk staging (provides the callback).
-- `--pin-hot-experts N`, `--pin-hot-experts-budget-mib N` - the per-layer RAM
-  expert set: mlock'd in place normally, copied into the disk decode cache with
-  `--load-mode dio`.
+- `--pin-hot-experts-decay-tokens`, `--pin-hot-experts-min-count` - ranking
+  aging and promotion floor, shared with the mlock tier.
 - `--moe-expert-cache-budget-mib N` - VRAM expert cache (separate feature).
 
 ## Files touched
@@ -325,16 +337,19 @@ Modified:
 
 ## Repro and debugging
 
-Run (prefill only; needs the callback, so `--hot-experts-prefetch` is mandatory):
+Run:
 
 ```
-LLAMA_DISK_STAGE=1 LLAMA_DISK_STAGE_PIN=1 ./build/bin/llama-cli.exe ^
+./build/bin/llama-cli.exe ^
   -m c:\models\Qwen3.8-Flash-Next-Uncensored-Q5_K_M-00001-of-00003.gguf ^
-  --load-mode dio --hot-experts-prefetch -ngl 99 -c 2048 --no-warmup -n 0 ^
+  --load-mode dio -ngl 99 -c 2048 --no-warmup -st -n 64 ^
+  --pin-hot-experts-budget-mib 16384 ^
   -p "Hello" -lv 4
 ```
 
-`-st` / `--single-turn` makes `llama-cli` exit after one turn. Without it the
+`--load-mode dio` is the only switch needed; `--pin-hot-experts-budget-mib`
+sizes the decode cache. `-st` / `--single-turn` makes `llama-cli` exit after one
+turn. Without it the
 interactive loop spins on EOF (an empty turn per iteration, `> ` forever); that
 is unrelated to disk staging but makes any run look like it never finishes.
 

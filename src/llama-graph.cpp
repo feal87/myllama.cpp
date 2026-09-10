@@ -2044,7 +2044,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             gate_exps_s == nullptr && up_exps_s == nullptr && down_exps_s == nullptr &&
             gate_exps_b == nullptr && up_exps_b == nullptr && down_exps_b == nullptr &&
             loras->empty()) {
-        if (this->n_tokens > 1 || llama_disk_stage::decode_full()) {
+        if (this->n_tokens > 1) {
             const llama_disk_stage_layer * ds = disk_stage->layer(il);
             if (ds != nullptr) {
                 gate_exps = ds->gate;

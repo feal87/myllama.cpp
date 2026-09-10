@@ -167,11 +167,11 @@ llama_context::llama_context(
     const bool moe_requested =
         cparams.n_moe_cache_budget_bytes > 0;
 
-    // LLAMA_DISK_STAGE: direct-read streaming of the MoE experts. Created before
+    // --load-mode dio: direct-read streaming of the MoE experts. Created before
     // the hot-expert engine because it replaces the mlock-in-place RAM tier:
     // with the model tensors never mapped there is nothing to lock, so the
     // engine is built ranking-only and the disk decode cache is the RAM tier
-    if (llama_disk_stage::supported()) {
+    if (llama_disk_stage::supported() && model.has_disk_weights()) {
         ggml_backend_dev_t stage_dev = nullptr;
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -189,14 +189,16 @@ llama_context::llama_context(
 
     const bool disk_active = disk_stage != nullptr;
 
-    // decode ubatches feed the hot-expert ranking whenever pinning or the VRAM
-    // MoE tier can consume it (matches the track_rank the engine was built with)
-    hot_observe_decode = cparams.n_pin_hot_experts > 0 || moe_requested;
+    // decode ubatches feed the hot-expert ranking whenever pinning, the VRAM MoE
+    // tier or the disk decode cache can consume it (matches the track_rank the
+    // engine was built with)
+    hot_observe_decode = cparams.n_pin_hot_experts > 0 || moe_requested || disk_active;
 
     const bool hot_experts_requested =
         cparams.n_pin_hot_experts > 0 ||
         moe_requested ||
-        cparams.hot_experts_prefetch;
+        cparams.hot_experts_prefetch ||
+        disk_active;
 
     if (hot_experts_requested) {
         if (cparams.cb_eval != nullptr) {
@@ -204,15 +206,17 @@ llama_context::llama_context(
                             "require the eval callback slot, but a custom cb_eval was already "
                             "supplied; all hot-expert features disabled\n", __func__);
         } else {
-            // with disk streaming the RAM tier is the disk decode cache, so build
-            // the engine ranking-only: its counts still drive the VRAM tier and
-            // the prefetch, but nothing is mlock'd in place
-            const int32_t n_pin_effective = disk_active ? 0 : cparams.n_pin_hot_experts;
+            // with disk streaming the RAM tier is the disk decode cache: the engine
+            // keeps the same ranking and promotion policy, but its per-layer capacity
+            // is the cache's resident slots and a "pin" copies the expert into a slot
+            // instead of mlocking its (never mapped) model pages
+            const int32_t n_pin_effective = disk_active ? disk_stage->resident_capacity()
+                                                        : cparams.n_pin_hot_experts;
             hot_experts = std::make_unique<llama_hot_expert_cache>(
                 model, n_pin_effective, cparams.n_pin_hot_experts_budget_bytes,
                 cparams.n_pin_hot_experts_decay_tokens, cparams.n_pin_hot_experts_min_count,
                 cparams.hot_experts_prefetch,
-                cparams.n_pin_hot_experts > 0 || moe_requested);
+                cparams.n_pin_hot_experts > 0 || moe_requested || disk_active);
             cparams.cb_eval           = llama_hot_expert_cache::eval_callback;
             cparams.cb_eval_user_data = hot_experts.get();
         }
@@ -240,8 +244,10 @@ llama_context::llama_context(
     if (disk_active) {
         if (hot_experts) {
             hot_experts->set_disk_stage(disk_stage.get());
+            LLAMA_LOG_INFO("%s: disk decode cache is the RAM tier, %d resident experts per layer\n",
+                           __func__, disk_stage->resident_capacity());
         } else {
-            LLAMA_LOG_WARN("%s: LLAMA_DISK_STAGE needs --hot-experts-prefetch (the eval callback); disabled\n", __func__);
+            LLAMA_LOG_WARN("%s: disk streaming needs the eval callback (--hot-experts-prefetch); disabled\n", __func__);
             disk_stage.reset();
         }
     }

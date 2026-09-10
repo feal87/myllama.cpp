@@ -747,6 +747,9 @@ struct llama_model {
 
     bool has_tensor_overrides() const;
 
+    // true when --load-mode dio routed the MoE expert tensors to the Disk buffer
+    bool has_disk_weights() const;
+
     const struct ggml_tensor * get_tensor(const char * name) const;
 
     // location of a host-resident tensor inside the model file it was mapped

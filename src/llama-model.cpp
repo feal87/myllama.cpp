@@ -2252,6 +2252,17 @@ bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
 
+bool llama_model::has_disk_weights() const {
+    for (const auto & it : tensors_by_name) {
+        const ggml_tensor * t = it.second;
+        if (t != nullptr && t->buffer != nullptr &&
+                llama_disk_buft_is(ggml_backend_buffer_get_type(t->buffer))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {

@@ -294,8 +294,8 @@ private:
     // (null when disabled or when the model has no cacheable layer)
     std::unique_ptr<llama_moe_cache> moe_cache;
 
-    // LLAMA_DISK_STAGE=1: synchronous direct-read staging of MoE expert weights
-    // into pinned host memory for multi-token ubatches (null when disabled)
+    // --load-mode dio: direct-read streaming of the MoE expert weights into a
+    // pinned host slab and a per-layer decode cache (null when not requested)
     std::unique_ptr<llama_disk_stage> disk_stage;
 
     // single-token decode ubatches feed the hot-expert ranking (RAM pin tier /

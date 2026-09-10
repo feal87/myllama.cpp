@@ -69,11 +69,19 @@ public:
     // layer's id table; reads the non-resident ones into transient slots
     void fill_cache(int il, const int32_t * ids, int64_t n_ids);
 
-    bool is_active() const;
+    // resident (hot) experts the decode cache can hold per layer, uniform across
+    // layers; this is the per-layer pin capacity of the hot-expert ranking
+    int32_t resident_capacity() const;
 
-    // diagnostic: force the full-layer slab on single-token ubatches too, so the
-    // decode cache can be compared against the known-correct slab path
-    static bool decode_full();
+    // make expert id of layer il resident: reserve a slot for it and mark it
+    // unfilled. No I/O here - fill_cache() reads the expert into the slot the next
+    // time it is routed, so a promoted expert is read from disk exactly once
+    bool resident_add(int il, int32_t id);
+
+    // drop a resident expert, freeing its slot for the next promotion
+    void resident_remove(int il, int32_t id);
+
+    bool is_active() const;
 
 private:
     struct impl;

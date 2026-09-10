@@ -205,8 +205,8 @@ class llama_hot_expert_cache {
     // only: prefill ubatches neither count nor age the ranking).
     void on_ubatch_begin(int64_t n_tokens);
 
-    // direct-read expert staging: when set, multi-token ubatches fill the stage
-    // at each layer's topk instead of prefetching the mmap (LLAMA_DISK_STAGE)
+    // direct-read expert staging: when set, ubatches fill the stage at each
+    // layer's topk instead of prefetching the mmap (--load-mode dio)
     void set_disk_stage(llama_disk_stage * ds) { disk_stage = ds; }
 
     // A new prompt has begun (llama_context detects the decode -> prefill
@@ -332,6 +332,17 @@ class llama_hot_expert_cache {
     void try_promote(int il, layer_state & ls, int32_t expert_id, uint64_t count, bool vram_resident,
                      bool apply_hysteresis);
 
+    // per-layer variant used when the disk decode cache is the RAM tier: keeps
+    // the n_pin hottest experts of EACH layer resident (the cache has a fixed
+    // number of slots per layer, so the global skew of try_promote cannot be
+    // represented). Same counting, min-count floor, takeover lead and eviction
+    // grace; the eviction victim is that layer's coldest resident
+    void try_promote_layer(int il, layer_state & ls, int32_t expert_id, uint64_t count, bool apply_hysteresis);
+
+    // (mu held) bookkeeping for a disk-cache promotion whose slot is reserved;
+    // the bytes are read by llama_disk_stage::fill_cache when next routed
+    void complete_disk_pin(int il, layer_state & ls, int32_t expert_id, size_t bytes);
+
     // is expert_id currently served by the VRAM tier? (caller holds mu)
     bool is_vram_resident(int il, int32_t expert_id) const;
 
@@ -423,6 +434,7 @@ class llama_hot_expert_cache {
 
     const int32_t  n_pin;            // N experts per layer
     int32_t        n_pin_total = 0;  // N * num_moe_layers (global cap)
+    std::vector<int32_t> n_pinned_layer; // residents per layer (disk cache path)
     const uint64_t budget_bytes;     // 0 = unlimited
     const uint64_t decay_interval;   // 0 = lifetime counts (no aging)
     const uint64_t min_pin_count;    // usage-count floor for pinning (0 = any routed expert)

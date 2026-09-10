@@ -43,6 +43,7 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
         }
     }
     n_pin_total = n_pin * n_moe_layers;
+    n_pinned_layer.assign((size_t) model.hparams.n_layer(), 0);
 
     if (n_moe_layers == 0) {
         if (n_pin > 0) {
@@ -232,9 +233,8 @@ bool llama_hot_expert_cache::wants_observe(int il) {
     // to break at every layer's topk: the whole layer slab on a multi-token one,
     // the decode cache on a single-token one
     if (disk_stage != nullptr) {
-        return n_tokens_cur > 1 || llama_disk_stage::decode_full()
-                   ? disk_stage->layer(il) != nullptr
-                   : disk_stage->cache_layer(il) != nullptr;
+        return n_tokens_cur > 1 ? disk_stage->layer(il) != nullptr
+                                : disk_stage->cache_layer(il) != nullptr;
     }
 
     if (!prefetch_enabled || n_tokens_cur <= 1) {
@@ -281,7 +281,7 @@ void llama_hot_expert_cache::observe(int il, const struct ggml_tensor * t) {
         } else {
             ggml_backend_tensor_get(t, ids, 0, n_ids * sizeof(int32_t));
         }
-        if (n_tokens_cur > 1 || llama_disk_stage::decode_full()) {
+        if (n_tokens_cur > 1) {
             disk_stage->fill(il);
         } else {
             disk_stage->fill_cache(il, ids, n_ids);
@@ -623,6 +623,14 @@ uint64_t llama_hot_expert_cache::count_of(int il, int32_t expert_id) const {
 
 void llama_hot_expert_cache::try_promote(int il, layer_state & ls, int32_t expert_id, uint64_t count, bool vram_resident,
                                          bool apply_hysteresis) {
+    if (disk_stage != nullptr) {
+        // the disk decode cache is the RAM tier: keep the hottest experts of each
+        // layer, since the cache has a fixed number of slots per layer
+        if (!vram_resident) {
+            try_promote_layer(il, ls, expert_id, count, apply_hysteresis);
+        }
+        return;
+    }
     if (!ls.tensors_are_host || n_pin <= 0 || !llama_mlock::SUPPORTED) {
         return;  // stats-only mode, nothing to pin
     }
@@ -770,6 +778,94 @@ void llama_hot_expert_cache::try_promote(int il, layer_state & ls, int32_t exper
         LLAMA_LOG_DEBUG("%s: pin of layer %d expert %d dropped after evicting %d/%d\n", __func__, il, expert_id,
                         evict_layer, evict_id);
     }
+}
+
+void llama_hot_expert_cache::try_promote_layer(int il, layer_state & ls, int32_t expert_id, uint64_t count,
+                                                bool apply_hysteresis) {
+    // caller holds mu; promotion only reserves a slot, fill_cache() reads the
+    // bytes in the next time this expert is routed (so it is read once, not twice)
+    if (n_pin <= 0 || il < 0 || il >= (int) n_pinned_layer.size()) {
+        return;
+    }
+    if (count < min_pin_count) {
+        n_min_count_holds++;
+        return;
+    }
+    if (expert_id < 0 || (uint32_t) expert_id >= ls.n_experts ||
+            (pin_state_at(ls, expert_id) & PIN_RESIDENT) != 0) {
+        return;  // already resident
+    }
+
+    const size_t bytes = expert_row_bytes(ls, expert_id);
+    if (bytes == 0) {
+        return;
+    }
+
+    if (n_pinned_layer[il] < n_pin) {
+        if (disk_stage->resident_add(il, expert_id)) {
+            complete_disk_pin(il, ls, expert_id, bytes);
+        }
+        return;
+    }
+
+    // layer full: take over its coldest resident, with the same lead and grace
+    // guards as the global path so count noise cannot swap near-equal experts
+    int32_t  victim = -1;
+    uint64_t vcount = UINT64_MAX;
+    for (uint32_t e = 0; e < ls.n_experts; ++e) {
+        if ((ls.pin_state[e] & PIN_RESIDENT) == 0) {
+            continue;
+        }
+        const uint64_t c = ls.counts[e];
+        if (c < vcount) {
+            vcount = c;
+            victim = (int32_t) e;
+        }
+    }
+    if (victim < 0 || count <= vcount) {
+        return;
+    }
+    if (apply_hysteresis && count < vcount + takeover_min_lead) {
+        n_hysteresis_holds++;
+        return;
+    }
+
+    expert_key key{ il, expert_id };
+    if (apply_hysteresis) {
+        auto ev = evicted_at.find(key);
+        if (ev != evicted_at.end()) {
+            if (n_content_tokens - ev->second < evict_grace_tokens) {
+                n_hysteresis_holds++;
+                return;
+            }
+            evicted_at.erase(ev);  // grace expired: admission allowed again
+        }
+    }
+
+    // the cache has exactly n_pin resident slots per layer, so the resident bytes
+    // of a layer are bounded by its slots; no byte-budget check is needed
+    unpin_expert(il, ls, victim);  // frees the victim's slot
+    if (disk_stage->resident_add(il, expert_id)) {
+        complete_disk_pin(il, ls, expert_id, bytes);
+        evicted_at[expert_key{ il, victim }] = n_content_tokens;
+    }
+}
+
+void llama_hot_expert_cache::complete_disk_pin(int il, layer_state & ls, int32_t expert_id, size_t bytes) {
+    // caller holds mu; the slot is reserved, its bytes are read by fill_cache()
+    expert_key key{ il, expert_id };
+    pinned_expert pe;
+    pe.nbytes_locked = bytes;
+    n_bytes_locked += bytes;
+    pinned.emplace(key, std::move(pe));
+    if (expert_id >= 0 && (uint32_t) expert_id < ls.n_experts) {
+        ls.pin_state[(size_t) expert_id] |= PIN_RESIDENT;
+    }
+    pinned_rank.insert({ count_of(il, expert_id), il, expert_id });
+    if (il >= 0 && il < (int) n_pinned_layer.size()) {
+        n_pinned_layer[il]++;
+    }
+    evicted_at.erase(key);
 }
 
 bool llama_hot_expert_cache::is_vram_resident(int il, int32_t expert_id) const {
@@ -950,6 +1046,12 @@ void llama_hot_expert_cache::unpin_expert(int il, layer_state & ls, int32_t expe
     pinned.erase(it);  // pinned_expert's destructor releases the mlock guards
     if (expert_id >= 0 && (uint32_t) expert_id < ls.n_experts) {
         ls.pin_state[(size_t) expert_id] &= (uint8_t) ~PIN_RESIDENT;
+    }
+    if (disk_stage != nullptr) {
+        disk_stage->resident_remove(il, expert_id);
+        if (il >= 0 && il < (int) n_pinned_layer.size() && n_pinned_layer[il] > 0) {
+            n_pinned_layer[il]--;
+        }
     }
 }
 
@@ -1239,7 +1341,7 @@ void llama_hot_expert_cache::promote_expert(int il, int32_t expert_id) {
     if (!ls.resolved_tensors) {
         resolve_tensors(il, ls);
     }
-    if (!ls.tensors_are_host || n_pin <= 0 || !llama_mlock::SUPPORTED) {
+    if (!ls.tensors_are_host || n_pin <= 0 || (disk_stage == nullptr && !llama_mlock::SUPPORTED)) {
         return;
     }
     if (is_vram_resident(il, expert_id)) {

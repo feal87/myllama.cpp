@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -32,32 +33,6 @@ static const size_t disk_stage_chunk = 1u << 20;
 static size_t align_up(size_t v, size_t a) {
     return (v + a - 1) & ~(a - 1);
 }
-
-static bool env_flag_on(const char * name) {
-    const char * v = std::getenv(name);
-    return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0 &&
-           std::strcmp(v, "off") != 0 && std::strcmp(v, "no") != 0;
-}
-
-// default when the variable is unset
-static bool env_flag_default_on(const char * name) {
-    const char * v = std::getenv(name);
-    if (v == nullptr) {
-        return true;
-    }
-    return v[0] != '\0' && std::strcmp(v, "0") != 0 &&
-           std::strcmp(v, "off") != 0 && std::strcmp(v, "no") != 0;
-}
-
-// integer env value, 0 when unset or unparsable
-static uint64_t env_u64(const char * name) {
-    const char * v = std::getenv(name);
-    if (v == nullptr) {
-        return 0;
-    }
-    return strtoull(v, nullptr, 10);
-}
-
 
 #if defined(_WIN32)
 struct disk_stage_file {
@@ -216,15 +191,19 @@ struct llama_disk_stage::impl {
         ggml_tensor * table = nullptr; // I32 [n_expert]
         char *        data[3] = { nullptr, nullptr, nullptr };
         cache_slot_region r[3];
-        int32_t n_slots         = 0;
-        int32_t n_resident      = 0;
-        int32_t n_resident_used = 0;
+        int32_t n_slots    = 0;
+        int32_t n_resident = 0;
         std::vector<int32_t> resident_slot; // expert id -> slot, -1 when not resident
+        std::vector<uint8_t> resident_filled; // expert id -> its slot holds this expert's data
+        std::vector<int32_t> free_slots;    // resident slots with no expert (LIFO)
         llama_disk_stage_cache_layer pub;    // public view returned by cache_layer()
     };
     ggml_backend_buffer_t cache_pool = nullptr;
     ggml_context *        cache_ctx  = nullptr;
     std::vector<cache_layer> cache;
+    std::mutex   cache_mu;       // guards resident_slot / free_slots and table writes
+    std::mutex   io_mu;          // one reaper at a time: the IOCP is shared by all reads
+    int32_t      n_resident = 0; // resident slots per layer (uniform), 0 when no cache
 
     ~impl() {
         if (pool) {
@@ -277,10 +256,6 @@ bool llama_disk_stage::is_active() const {
     return pimpl->active;
 }
 
-bool llama_disk_stage::decode_full() {
-    return env_flag_on("LLAMA_DISK_STAGE_DECODE_FULL");
-}
-
 const llama_disk_stage_layer * llama_disk_stage::layer(int il) const {
     if (!pimpl->active || il < 0 || il >= (int) pimpl->layers.size()) {
         return nullptr;
@@ -307,7 +282,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     GGML_UNUSED(cache_budget_bytes);
     return;
 #else
-    if (!env_flag_on("LLAMA_DISK_STAGE")) {
+    if (!model.has_disk_weights()) {
         return;
     }
 
@@ -401,11 +376,9 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
 
     // one pool, aliased by every layer's staging tensors. Prefer the device's
     // pinned host buffer so the offload copy into VRAM is not staged through
-    // pageable memory; LLAMA_DISK_STAGE_PIN=0 forces the plain CPU buffer
-    ggml_backend_buffer_type_t buft = nullptr;
-    if (env_flag_default_on("LLAMA_DISK_STAGE_PIN")) {
-        buft = ggml_backend_dev_host_buffer_type(dev);
-    }
+    // prefer the device's pinned host buffer so the host->VRAM offload copy reads
+    // from page-locked memory; fall back to plain CPU memory
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev);
     if (buft == nullptr) {
         buft = ggml_backend_cpu_buffer_type();
     }
@@ -476,13 +449,9 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     // layer's table and reads the weights in place, so a resident expert is
     // served without a copy. Single-token decode needs it (the model tensors are
     // never mapped), so it is always built: --pin-hot-experts sets the resident
-    // experts per layer, --pin-hot-experts-budget-mib caps the total across all
-    // layers, and LLAMA_DISK_STAGE_CACHE_MIB is kept as a fallback for scripts
-    uint64_t cache_budget = cache_budget_bytes;
-    const uint64_t cache_mib = env_u64("LLAMA_DISK_STAGE_CACHE_MIB");
-    if (cache_budget == 0 && cache_mib > 0) {
-        cache_budget = cache_mib << 20;
-    }
+    // experts per layer and --pin-hot-experts-budget-mib caps the total across
+    // all layers
+    const uint64_t cache_budget = cache_budget_bytes;
     {
         int ref = -1;
         for (int il = 0; il < n_layer; ++il) {
@@ -535,8 +504,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                     cache_bytes += align_up((size_t) n_expert * sizeof(int32_t), disk_stage_align);
                 }
 
-                ggml_backend_buffer_type_t cbuft = env_flag_default_on("LLAMA_DISK_STAGE_PIN")
-                    ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+                ggml_backend_buffer_type_t cbuft = ggml_backend_dev_host_buffer_type(dev);
                 if (cbuft == nullptr) {
                     cbuft = ggml_backend_cpu_buffer_type();
                 }
@@ -566,6 +534,11 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                             c.n_slots    = slots_per_layer;
                             c.n_resident = n_resident;
                             c.resident_slot.assign((size_t) n_expert, -1);
+                            c.resident_filled.assign((size_t) n_expert, 0);
+                            c.free_slots.resize((size_t) n_resident);
+                            for (int32_t s = 0; s < n_resident; ++s) {
+                                c.free_slots[(size_t) s] = s;
+                            }
 
                             ggml_tensor * tensors[3] = { nullptr, nullptr, nullptr };
                             for (const auto & role : roles) {
@@ -614,6 +587,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                             n_cache++;
                         }
                         if (p.cache_pool != nullptr) {
+                            p.n_resident = n_resident;
                             LLAMA_LOG_INFO("%s: decode cache active for %d layer(s), %.2f GiB, %d slots/layer (%d resident)\n",
                                            __func__, n_cache, cache_bytes / (1024.0 * 1024.0 * 1024.0), slots_per_layer, n_resident);
                         }
@@ -629,30 +603,6 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     LLAMA_LOG_INFO("%s: disk staging active for %d layer(s), %.1f MiB pool, %zu-byte aligned unbuffered reads\n",
                    __func__, n_staged, total / (1024.0 * 1024.0), disk_stage_align);
 
-    // control: run the same reader over one long contiguous span of a model
-    // file, the shape diskspd measured. If this hits ~7 GB/s while the per-layer
-    // fills stay near 3, the reader is fine and the access pattern (gaps between
-    // expert tensors, three shards) is what costs the bandwidth
-    if (env_flag_on("LLAMA_DISK_STAGE_SELFTEST") && !p.files.empty()) {
-        disk_stage_file * f = p.files.begin()->second.get();
-        const std::string & fname = p.files.begin()->first;
-        const size_t len = pool_off_total;
-
-        std::vector<disk_stage_job> jobs;
-        jobs.reserve(len / disk_stage_chunk + 1);
-        for (size_t off = 0; off < len; off += disk_stage_chunk) {
-            jobs.push_back({ f->h, p.base + off, off, std::min(disk_stage_chunk, len - off) });
-        }
-        for (int rep = 0; rep < 2; ++rep) {
-            const int64_t t0 = ggml_time_us();
-            disk_stage_run_jobs(jobs, 32, p.iocp);
-            const int64_t t1 = ggml_time_us();
-            const double secs = (t1 - t0) / 1e6;
-            LLAMA_LOG_INFO("%s: selftest contiguous %.0f MiB from %s in %.1f ms = %.2f GB/s (qd=32)\n",
-                           __func__, len / (1024.0 * 1024.0), fname.c_str(), secs * 1000.0,
-                           secs > 0 ? len / (secs * 1e9) : 0.0);
-        }
-    }
 #endif
 }
 
@@ -684,7 +634,12 @@ void llama_disk_stage::fill(int il) {
     }
 
     const int64_t t0 = ggml_time_us();
-    disk_stage_run_jobs(jobs, queue_depth, p.iocp);
+    {
+        // the pin worker reads through the same completion port, so only one
+        // batch may be reaped at a time
+        std::lock_guard<std::mutex> io(p.io_mu);
+        disk_stage_run_jobs(jobs, queue_depth, p.iocp);
+    }
     const int64_t t1 = ggml_time_us();
 
     // one line per layer: the raw fill rate, separate from the prefill average
@@ -709,54 +664,136 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
 
     int32_t * table = (int32_t *) c.table->data;
     std::vector<disk_stage_job> jobs;
+    std::vector<int32_t>    newly_filled; // residents whose slot was just read
     int32_t transient = c.n_resident;
 
-    for (int64_t i = 0; i < n_ids; ++i) {
-        const int32_t id = ids[i];
-        if (id < 0 || id >= (int32_t) c.resident_slot.size()) {
-            continue;
-        }
+    // slot assignment under the lock; the unbuffered reads below run without it
+    {
+        std::lock_guard<std::mutex> lock(p.cache_mu);
 
-        const int32_t slot = c.resident_slot[id];
-        if (slot >= 0) {
-            // resident: filled once, stays in place
-            table[id] = slot;
-            continue;
-        }
+        for (int64_t i = 0; i < n_ids; ++i) {
+            const int32_t id = ids[i];
+            if (id < 0 || id >= (int32_t) c.resident_slot.size()) {
+                continue;
+            }
 
-        int32_t use = -1;
-        if (c.n_resident_used < c.n_resident) {
-            // first-come resident set; promotion/eviction is a later step
-            use = c.n_resident_used++;
-            c.resident_slot[id] = use;
-        } else {
+            // a resident slot is only valid once this expert's bytes have been
+            // read into it; that first read happens here, in the same batch as
+            // the transients
+            const int32_t slot = c.resident_slot[id];
+            if (slot >= 0) {
+                table[id] = slot;
+                if (c.resident_filled[id] == 0) {
+                    for (int r = 0; r < 3; ++r) {
+                        const impl::cache_slot_region & sr = c.r[r];
+                        if (sr.file == nullptr || sr.stride == 0) {
+                            continue;
+                        }
+                        char * dst = c.data[r] + (size_t) slot * sr.slot_stride - sr.head;
+                        jobs.push_back({ sr.file->h, dst, sr.file_off + (size_t) id * sr.stride, align_up(sr.head + sr.stride, disk_stage_align) });
+                    }
+                    newly_filled.push_back(id);
+                }
+                continue;
+            }
+
+            // not resident: serve it from a transient slot for this ubatch
             if (transient >= c.n_slots) {
                 transient = c.n_resident;
             }
-            use = transient++;
-        }
+            const int32_t use = transient++;
 
-        // read the expert into its slot: source starts `head` bytes before the
-        // expert data so the aligned read lands the row where the tensor expects
-        // it, and the length is rounded up to the sector size the unbuffered read
-        // requires (the extra bytes fall in the per-tensor slack)
-        for (int r = 0; r < 3; ++r) {
-            const impl::cache_slot_region & sr = c.r[r];
-            if (sr.file == nullptr || sr.stride == 0) {
-                continue;
+            // read the expert into its slot: source starts `head` bytes before the
+            // expert data so the aligned read lands the row where the tensor expects
+            // it, and the length is rounded up to the sector size the unbuffered read
+            // requires (the extra bytes fall in the per-tensor slack)
+            for (int r = 0; r < 3; ++r) {
+                const impl::cache_slot_region & sr = c.r[r];
+                if (sr.file == nullptr || sr.stride == 0) {
+                    continue;
+                }
+                char * dst = c.data[r] + (size_t) use * sr.slot_stride - sr.head;
+                jobs.push_back({ sr.file->h, dst, sr.file_off + (size_t) id * sr.stride, align_up(sr.head + sr.stride, disk_stage_align) });
             }
-            char * dst = c.data[r] + (size_t) use * sr.slot_stride - sr.head;
-            jobs.push_back({ sr.file->h, dst, sr.file_off + (size_t) id * sr.stride, align_up(sr.head + sr.stride, disk_stage_align) });
+            table[id] = use;
         }
-        table[id] = use;
     }
 
     if (!jobs.empty()) {
+        std::lock_guard<std::mutex> io(p.io_mu);
         disk_stage_run_jobs(jobs, 32, p.iocp);
+    }
+
+    if (!newly_filled.empty()) {
+        std::lock_guard<std::mutex> lock(p.cache_mu);
+        for (const int32_t id : newly_filled) {
+            c.resident_filled[id] = 1;
+        }
     }
 #else
     GGML_UNUSED(il);
     GGML_UNUSED(ids);
     GGML_UNUSED(n_ids);
+#endif
+}
+
+int32_t llama_disk_stage::resident_capacity() const {
+    return pimpl->n_resident;
+}
+
+bool llama_disk_stage::resident_add(int il, int32_t id) {
+#if defined(_WIN32)
+    impl & p = *pimpl;
+    if (!p.active || il < 0 || il >= (int) p.cache.size()) {
+        return false;
+    }
+    impl::cache_layer & c = p.cache[il];
+    if (c.gate == nullptr || id < 0 || id >= (int32_t) c.resident_slot.size()) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(p.cache_mu);
+    if (c.resident_slot[id] >= 0) {
+        return true;  // already resident
+    }
+    if (c.free_slots.empty()) {
+        return false;  // all resident slots taken
+    }
+
+    // reserve only; fill_cache() reads the bytes in when the expert is routed
+    const int32_t slot = c.free_slots.back();
+    c.free_slots.pop_back();
+    c.resident_slot[id]   = slot;
+    c.resident_filled[id] = 0;
+    return true;
+#else
+    GGML_UNUSED(il);
+    GGML_UNUSED(id);
+    return false;
+#endif
+}
+
+void llama_disk_stage::resident_remove(int il, int32_t id) {
+#if defined(_WIN32)
+    impl & p = *pimpl;
+    if (!p.active || il < 0 || il >= (int) p.cache.size()) {
+        return;
+    }
+    impl::cache_layer & c = p.cache[il];
+    if (c.gate == nullptr || id < 0 || id >= (int32_t) c.resident_slot.size()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(p.cache_mu);
+    const int32_t slot = c.resident_slot[id];
+    if (slot < 0) {
+        return;
+    }
+    c.resident_slot[id]   = -1;
+    c.resident_filled[id] = 0;
+    c.free_slots.push_back(slot);
+#else
+    GGML_UNUSED(il);
+    GGML_UNUSED(id);
 #endif
 }
