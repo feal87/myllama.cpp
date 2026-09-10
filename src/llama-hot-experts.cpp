@@ -25,7 +25,8 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
                                                uint64_t            decay_interval,
                                                uint64_t            min_pin_count,
                                                bool                prefetch_enabled,
-                                               bool                track_rank) :
+                                               bool                track_rank,
+                                               bool                disk_mode) :
     model(model),
     n_pin(n_pin_experts),
     budget_bytes(budget_bytes),
@@ -50,7 +51,12 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
             LLAMA_LOG_WARN("%s: no MoE layers detected in model, --pin-hot-experts has no effect\n", __func__);
         }
     } else if (n_pin > 0) {
-        if (budget_bytes > 0) {
+        if (disk_mode) {
+            LLAMA_LOG_INFO(
+                "%s: keeping the %d hottest MoE experts per layer (%d MoE layers) resident in the "
+                "disk decode cache, nothing mlock'd\n",
+                __func__, n_pin, n_moe_layers);
+        } else if (budget_bytes > 0) {
             LLAMA_LOG_INFO(
                 "%s: pinning (mlock) up to %d hottest MoE experts per layer (%d MoE layers, "
                 "%d total global slots) in place, budget %.2f MiB total, pin/evict on the fly\n",
@@ -65,7 +71,7 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
                 __func__);
         }
     }
-    if (n_pin > 0) {
+    if (n_pin > 0 && !disk_mode) {
         if (budget_bytes > 0 && llama_mlock::SUPPORTED && !llama_mlock::reserve_working_set(budget_bytes)) {
             LLAMA_LOG_WARN(
                 "%s: could not raise the Windows working-set minimum to the pin budget; "
@@ -81,6 +87,8 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
                 "still keeps recently-used expert rows in the page cache)\n",
                 __func__);
         }
+    } else if (disk_mode) {
+        // the disk decode cache is the RAM tier; logged above, nothing is mlock'd
     } else if (track_rank) {
         // ranking-only mode: the router observation feeds the VRAM MoE tier
         // (llama_moe_cache) and/or the prefetch, but nothing is mlock'd
@@ -94,8 +102,8 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
                        "no usage tracking\n", __func__);
     }
     if (n_pin > 0 && min_pin_count > 0) {
-        LLAMA_LOG_INFO("%s: pinning only experts with usage count >= %" PRIu64 " (--pin-hot-experts-min-count)\n",
-                       __func__, min_pin_count);
+        LLAMA_LOG_INFO("%s: %s only experts with usage count >= %" PRIu64 " (--pin-hot-experts-min-count)\n",
+                       __func__, disk_mode ? "admitting" : "pinning", min_pin_count);
     }
     if (decay_interval > 0) {
         LLAMA_LOG_INFO("%s: halving all usage counts every %" PRIu64 " decode tokens\n", __func__, decay_interval);

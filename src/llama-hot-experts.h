@@ -107,13 +107,17 @@ class llama_hot_expert_cache {
     //                    prefetch-only runs, where the count bookkeeping is skipped entirely. The
     //                    ranking is fed by single-token decode ubatches only: batch/prefill ubatches
     //                    are observed for the prefetch alone and never move the counts or the pins
+    // disk_mode:         true with --load-mode dio, where n_pin_experts is the disk decode cache's
+    //                    resident slots per layer: the policy is the same but a "pin" reserves a
+    //                    cache slot instead of mlock'ing model pages, so no worker is started
     llama_hot_expert_cache(const llama_model & model,
                            int32_t             n_pin_experts,
                            uint64_t            budget_bytes,
                            uint64_t            decay_interval,
                            uint64_t            min_pin_count,
                            bool                prefetch_enabled,
-                           bool                track_rank);
+                           bool                track_rank,
+                           bool                disk_mode);
     ~llama_hot_expert_cache();
 
     llama_hot_expert_cache(const llama_hot_expert_cache &)             = delete;

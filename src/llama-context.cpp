@@ -216,7 +216,8 @@ llama_context::llama_context(
                 model, n_pin_effective, cparams.n_pin_hot_experts_budget_bytes,
                 cparams.n_pin_hot_experts_decay_tokens, cparams.n_pin_hot_experts_min_count,
                 cparams.hot_experts_prefetch,
-                cparams.n_pin_hot_experts > 0 || moe_requested || disk_active);
+                cparams.n_pin_hot_experts > 0 || moe_requested || disk_active,
+                disk_active);
             cparams.cb_eval           = llama_hot_expert_cache::eval_callback;
             cparams.cb_eval_user_data = hot_experts.get();
         }
