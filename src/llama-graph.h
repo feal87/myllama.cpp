@@ -94,6 +94,7 @@ struct llama_cross {
 
 struct llm_graph_params;
 class  llama_moe_cache;
+class  llama_disk_stage;
 
 //
 // llm_graph_input
@@ -788,6 +789,7 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache = nullptr; // GPU MoE expert cache (null when disabled)
+    const llama_disk_stage       * disk_stage = nullptr; // direct-read staging of MoE experts (null when disabled)
     // layout build count of moe_cache (0 when disabled/inactive): decode graphs
     // embed the cache tensors and the per-layer slot counts, so a per-prompt
     // layout rebuild must invalidate the graph reuse even though the moe_cache
@@ -893,7 +895,8 @@ struct llm_graph_params {
             // the VRAM mul_mat_id chain / change the cache tensor shapes, so a
             // reused decode graph would keep running the stale (or freed) chain
             moe_cache == other.moe_cache &&
-            moe_cache_gen == other.moe_cache_gen;
+            moe_cache_gen == other.moe_cache_gen &&
+            disk_stage == other.disk_stage;
     }
 };
 
@@ -1040,6 +1043,7 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache = nullptr; // GPU MoE expert cache (null when disabled)
+    const llama_disk_stage       * disk_stage = nullptr; // direct-read staging of MoE experts (null when disabled)
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

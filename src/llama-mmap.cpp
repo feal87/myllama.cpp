@@ -64,6 +64,28 @@ static std::string llama_format_win_err(DWORD err) {
     LocalFree(buf);
     return ret;
 }
+
+// Cache hint for the read-only handle the model mapping is created from.
+// Default is FILE_FLAG_RANDOM_ACCESS (see the file open comment); the
+// LLAMA_MMAP_CACHE_HINT env var overrides it so the two phases can be
+// compared on one binary. Read once per process.
+static DWORD llama_file_cache_hint() {
+    static const DWORD hint = [] {
+        const char * v = getenv("LLAMA_MMAP_CACHE_HINT");
+        if (v == nullptr || v[0] == '\0' || std::strcmp(v, "random") == 0 || std::strcmp(v, "0") == 0) {
+            return (DWORD) FILE_FLAG_RANDOM_ACCESS;
+        }
+        if (std::strcmp(v, "sequential") == 0 || std::strcmp(v, "1") == 0) {
+            return (DWORD) FILE_FLAG_SEQUENTIAL_SCAN;
+        }
+        if (std::strcmp(v, "none") == 0 || std::strcmp(v, "default") == 0) {
+            return (DWORD) 0;
+        }
+        LLAMA_LOG_WARN("warning: unknown LLAMA_MMAP_CACHE_HINT '%s', using random\n", v);
+        return (DWORD) FILE_FLAG_RANDOM_ACCESS;
+    }();
+    return hint;
+}
 #endif
 
 // llama_file
@@ -92,15 +114,17 @@ struct llama_file::impl {
         if (read_only) {
             // Model files are accessed at random offsets (expert rows via mmap
             // page faults interleaved with our PrefetchVirtualMemory calls).
-            // Without FILE_FLAG_RANDOM_ACCESS the cache manager may apply
-            // sequential read-ahead heuristics to this file object and treat
-            // the mapping as a streamed file (aggressive trim/eviction of the
-            // pages we explicitly want to keep). This mirrors the Linux path,
-            // which marks the on-demand ranges POSIX_MADV_RANDOM.
+            // Random access is the default: without it the cache manager may
+            // apply sequential read-ahead to this file object and treat the
+            // mapping as a streamed file (aggressive trim/eviction of the pages
+            // we explicitly want to keep). LLAMA_MMAP_CACHE_HINT=sequential
+            // trades that decode locality for prefill read-ahead; "none" leaves
+            // the hint to the OS. This mirrors the Linux path, which marks the
+            // on-demand ranges POSIX_MADV_RANDOM.
             HANDLE hFile = CreateFileA(fname, GENERIC_READ,
                                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                        NULL, OPEN_EXISTING,
-                                       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, NULL);
+                                       FILE_ATTRIBUTE_NORMAL | llama_file_cache_hint(), NULL);
             if (hFile == INVALID_HANDLE_VALUE) {
                 throw std::runtime_error(format("failed to open %s: %s", fname,
                                                 llama_format_win_err(GetLastError()).c_str()));
@@ -502,8 +526,16 @@ struct llama_mmap::impl {
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
 
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges, bool map) {
+        name = file->name();
         size = file->size();
+        if (!map) {
+            // no section is created for this file, so unbuffered reads on it stay
+            // fast (a live section caps them near the cache-manager rate)
+            size = 0;
+            addr = nullptr;
+            return;
+        }
         int fd = file->file_id();
         int flags = MAP_SHARED;
         if (numa) { prefetch = 0; }
@@ -609,10 +641,17 @@ struct llama_mmap::impl {
 #elif defined(_WIN32)
     HANDLE hMapping = nullptr;
 
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges, bool map) {
         GGML_UNUSED(numa);
 
+        name = file->name();
         size = file->size();
+
+        if (!map) {
+            size = 0;
+            addr = nullptr;
+            return;
+        }
 
         HANDLE hFile = (HANDLE) _get_osfhandle(file->file_id());
 
@@ -681,11 +720,17 @@ struct llama_mmap::impl {
         }
     }
 #else
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges, bool map) {
         GGML_UNUSED(file);
         GGML_UNUSED(prefetch);
         GGML_UNUSED(numa);
         GGML_UNUSED(lazy_ranges);
+
+        if (!map) {
+            size = 0;
+            addr = nullptr;
+            return;
+        }
 
         throw std::runtime_error("mmap not supported");
     }
@@ -698,16 +743,19 @@ struct llama_mmap::impl {
     }
 #endif
 
+    std::string name;
     void * addr;
     size_t size;
 };
 
 llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa,
-        const ranges & lazy_ranges) : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges)) {}
+        const ranges & lazy_ranges, bool map) : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges, map)) {}
 llama_mmap::~llama_mmap() = default;
 
 size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
+
+const std::string & llama_mmap::name() const { return pimpl->name; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
 

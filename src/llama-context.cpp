@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-hot-experts.h"
 #include "llama-moecache.h"
+#include "llama-disk-stage.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
@@ -205,6 +206,29 @@ llama_context::llama_context(
         } else {
             LLAMA_LOG_WARN("%s: --moe-expert-cache* needs the router-observation engine, but a "
                             "custom cb_eval is in use; MoE expert cache disabled\n", __func__);
+        }
+    }
+
+    // LLAMA_DISK_STAGE: synchronous direct-read staging of MoE experts for
+    // multi-token ubatches. It piggybacks on the hot-expert eval callback to
+    // fill each layer at its topk, so it needs that callback to be installed
+    if (llama_disk_stage::supported()) {
+        ggml_backend_dev_t stage_dev = nullptr;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                stage_dev = dev;
+                break;
+            }
+        }
+        auto stage = std::make_unique<llama_disk_stage>(model, stage_dev);
+        if (!stage->is_active()) {
+            // disabled by env, no stageable layer, or allocation failed
+        } else if (hot_experts) {
+            hot_experts->set_disk_stage(stage.get());
+            disk_stage = std::move(stage);
+        } else {
+            LLAMA_LOG_WARN("%s: LLAMA_DISK_STAGE needs --hot-experts-prefetch (the eval callback); disabled\n", __func__);
         }
     }
 
@@ -1531,13 +1555,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         hot_experts->on_ubatch_begin(ubatch.n_tokens);
     }
 
-    // The mid-graph eval callback is only needed for the multi-token
-    // (batch/prefill) prefetch read-ahead. Decode ubatches are observed after the
-    // compute from the registered top-k tensors (observe_decode), so running the
-    // callback here would chunk the decode graph at every MoE layer and probe
-    // every node for nothing. Applied every ubatch (also on graph reuse).
+    // The mid-graph eval callback serves two readers: the multi-token
+    // (batch/prefill) prefetch read-ahead, and any ubatch that has to fill the
+    // disk staging or the disk decode cache before its MoE chunk runs. Without
+    // the latter a single-token ubatch would read the experts from the unmapped
+    // model file. Applied every ubatch (also on graph reuse).
     if (hot_experts) {
-        const bool need_eval_cb = ubatch.n_tokens > 1 && cparams.hot_experts_prefetch;
+        const bool need_eval_cb = (ubatch.n_tokens > 1 && cparams.hot_experts_prefetch) ||
+                                  disk_stage != nullptr;
         ggml_backend_sched_set_eval_callback(sched.get(),
                 need_eval_cb ? llama_hot_expert_cache::eval_callback : nullptr,
                 need_eval_cb ? hot_experts.get() : nullptr);
@@ -2692,6 +2717,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ (moe_cache && moe_cache->is_active()) ? moe_cache.get() : nullptr,
+        /*.disk_stage  =*/ disk_stage.get(),
         /*.moe_cache_gen =*/ (moe_cache && moe_cache->is_active()) ? moe_cache->layout_generation() : 0,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,

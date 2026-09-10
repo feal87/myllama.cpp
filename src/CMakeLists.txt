@@ -17,6 +17,10 @@ add_library(llama
             llama-chat.cpp
             llama-context.cpp
             llama-cparams.cpp
+            llama-disk-buft.cpp
+            llama-disk-buft.h
+            llama-disk-stage.cpp
+            llama-disk-stage.h
             llama-grammar.cpp
             llama-graph.cpp
             llama-hot-experts.cpp
@@ -56,7 +60,7 @@ set_target_properties(llama PROPERTIES
 
 configure_file(llama-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/llama-version.h @ONLY)
 
-target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
+target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 

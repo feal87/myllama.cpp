@@ -6,6 +6,7 @@
 #include "llama-cparams.h"
 #include "llama-sampler.h"
 #include "llama-moecache.h"
+#include "llama-disk-stage.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1495,6 +1496,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     moe_cache        (params.moe_cache),
+    disk_stage       (params.disk_stage),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2025,6 +2027,40 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
+    // direct-read staging: on multi-token ubatches use the layer's host staging
+    // tensors (filled from the model file right before this layer computes) in
+    // place of the mmap'd expert weights, so the host->VRAM offload copy sources
+    // resident memory instead of faulting the mapping. On a single-token ubatch
+    // use the layer's decode cache instead and remap the expert ids through its
+    // table (below). Only the plain separate gate/up/down layout without scales,
+    // biases or LoRA is staged.
+    // Gate on the ubatch size, not on cur->ne[1]: a layer can be fed a 1-token
+    // slice (this model's attention layer) inside a multi-token ubatch, and the
+    // staged weight is still the right source for it
+    const llama_disk_stage_cache_layer * dc = nullptr;
+    if (disk_stage != nullptr && il >= 0 &&
+            gate_up_exps == nullptr && gate_up_exps_b == nullptr &&
+            gate_exps != nullptr && up_exps != nullptr && down_exps != nullptr &&
+            gate_exps_s == nullptr && up_exps_s == nullptr && down_exps_s == nullptr &&
+            gate_exps_b == nullptr && up_exps_b == nullptr && down_exps_b == nullptr &&
+            loras->empty()) {
+        if (this->n_tokens > 1 || llama_disk_stage::decode_full()) {
+            const llama_disk_stage_layer * ds = disk_stage->layer(il);
+            if (ds != nullptr) {
+                gate_exps = ds->gate;
+                up_exps   = ds->up;
+                down_exps = ds->down;
+            }
+        } else {
+            dc = disk_stage->cache_layer(il);
+            if (dc != nullptr) {
+                gate_exps = dc->gate;
+                up_exps   = dc->up;
+                down_exps = dc->down;
+            }
+        }
+    }
+
     ggml_tensor * logits = nullptr;
 
     if (probs_in == nullptr) {
@@ -2116,6 +2152,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
     }
     cb(selected_experts, "ffn_moe_topk", il);
+
+    // decode cache: the MoE reads the compact slot tensors, so its ids have to be
+    // mapped through the layer's table. The original ids stay the source for the
+    // gate weights below, and the eval callback still sees them under the
+    // "ffn_moe_topk-<il>" name
+    ggml_tensor * selected_experts_c = selected_experts;
+    if (dc != nullptr) {
+        selected_experts_c = ggml_reshape_2d(ctx0,
+                ggml_get_rows(ctx0, dc->table, selected_experts), n_expert_used, n_tokens);
+        cb(selected_experts_c, "ffn_moe_topk_cached", il);
+    }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
@@ -2211,7 +2258,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts_c, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (mc) {
@@ -2236,7 +2283,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, selected_experts_c, up_exps_s); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (mc) {
@@ -2254,7 +2301,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, selected_experts_c, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
 
             if (mc) {
@@ -2360,7 +2407,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps, cur, selected_experts_c, down_exps_s); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
     if (mc) {

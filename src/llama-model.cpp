@@ -1,6 +1,7 @@
 #include "llama-model.h"
 
 #include "llama-arch.h"
+#include "llama-disk-buft.h"
 #include "llama-ext.h"
 #include "llama-hparams.h"
 #include "llama-impl.h"
@@ -1156,6 +1157,11 @@ struct llama_model::impl {
     // model memory mapped files
     llama_mmaps mappings;
 
+    // tensor name -> (file path, absolute offset). Filled from the loader so the
+    // disk staging can locate a tensor's bytes even when nothing is mapped and
+    // the tensor has no data pointer (disk-stream mode).
+    std::map<std::string, std::pair<std::string, size_t>> tensor_regions;
+
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;
@@ -1707,6 +1713,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
+    // remember where every weight lives in the files: disk-stream tensors have no
+    // mapping to derive it from later
+    for (const auto & it : ml.weights_map) {
+        if (it.second.idx < ml.files.size()) {
+            pimpl->tensor_regions[it.first] = { ml.files[it.second.idx]->name(), it.second.offs };
+        }
+    }
+
     // create the backend buffers
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
     ctx_buf_maps.reserve(ml.ctx_map.size());
@@ -1765,6 +1779,35 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
                 }
                 bufs.emplace_back(buf);
+                buf_map.emplace(idx, buf);
+            }
+        } else if (llama_disk_buft_is(buft)) {
+            // streamed weights: no RAM and no mapping. Reserve address space so the
+            // tensors get a non-null data pointer (the scheduler then leaves them
+            // alone) but commit nothing; the graph substitutes the real tensors.
+            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, 0);
+            if (buf == nullptr) {
+                throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+            }
+            const auto align4k = [](size_t x) { return (x + 4095) & ~(size_t) 4095; };
+            size_t total = 4096;
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                total += align4k(ggml_backend_buft_get_alloc_size(buft, t));
+            }
+            char * scratch = (char *) llama_disk_buft_reserve(total);
+            if (scratch == nullptr) {
+                throw std::runtime_error("unable to reserve the disk-stream address space");
+            }
+            size_t off = 0;
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                t->buffer = buf;
+                t->data   = scratch + off;
+                off += align4k(ggml_backend_buft_get_alloc_size(buft, t));
+            }
+            LLAMA_LOG_INFO("%s: reserved %.2f GiB of address space at %p for %s weights\n",
+                           __func__, total / (1024.0 * 1024.0 * 1024.0), (void *) scratch, ggml_backend_buft_name(buft));
+            bufs.emplace_back(buf);
+            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 buf_map.emplace(idx, buf);
             }
         } else {
@@ -2219,6 +2262,31 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
     }
 
     return it->second;
+}
+
+bool llama_model::tensor_file_region(const ggml_tensor * t, std::string & path, size_t & offs) const {
+    if (t == nullptr) {
+        return false;
+    }
+    if (t->data != nullptr) {
+        const char * p = (const char *) t->data;
+        for (const auto & mapping : pimpl->mappings) {
+            const char * base = (const char *) mapping->addr();
+            if (base != nullptr && p >= base && p < base + mapping->size()) {
+                path = mapping->name();
+                offs = (size_t) (p - base);
+                return true;
+            }
+        }
+    }
+    // disk-stream tensors are not mapped and have no data pointer
+    const auto it = pimpl->tensor_regions.find(ggml_get_name(t));
+    if (it != pimpl->tensor_regions.end()) {
+        path = it->second.first;
+        offs = it->second.second;
+        return true;
+    }
+    return false;
 }
 
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {

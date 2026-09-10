@@ -1,5 +1,6 @@
 #include "llama-model-loader.h"
 
+#include "llama-disk-buft.h"
 #include "ggml-alloc.h"
 #include "ggml.h"
 #include "gguf.h"
@@ -558,6 +559,7 @@ llama_model_loader::llama_model_loader(
 
     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_MMAP_PIN || load_mode == LLAMA_LOAD_MODE_AUTO;
     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
+    this->disk_stream   = this->use_direct_io;
 
     if (!fname.empty()) {
         // Load the main GGUF
@@ -1252,13 +1254,19 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        // disk-stream mode: expert weights are read on demand, never resident
+        if (disk_stream && (tn.tensor == LLM_TENSOR_FFN_GATE_EXPS ||
+                            tn.tensor == LLM_TENSOR_FFN_UP_EXPS   ||
+                            tn.tensor == LLM_TENSOR_FFN_DOWN_EXPS)) {
+            buft = llama_disk_buft();
+        }
+
         if (!buft) {
             buft = select_weight_buft(hparams, t_meta, op, buft_list);
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }
         }
-
         // avoid using a host buffer when using mmap
         auto * buft_dev = ggml_backend_buft_get_device(buft);
         if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
@@ -1421,8 +1429,13 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
             const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
 
+            // map a file only when it actually needs a mapping: everything when
+            // use_mmap, otherwise just the files holding lazy tensors. A file left
+            // unmapped keeps its unbuffered reads at full speed.
+            const bool need_map = use_mmap || !lazy.for_file(idx).empty();
+
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx));
+                    lazy.for_file(idx), need_map);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
@@ -1629,6 +1642,13 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        // streamed weights are never read at load: the graph reads them from the
+        // disk-backed substitute tensors (staging slab / decode cache)
+        if (cur->buffer != nullptr && llama_disk_buft_is(ggml_backend_buffer_get_type(cur->buffer))) {
+            size_done += n_size;
+            continue;
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 

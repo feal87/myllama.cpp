@@ -85,6 +85,7 @@
 #include <vector>
 
 struct llama_model;
+class llama_disk_stage;
 
 class llama_hot_expert_cache {
   public:
@@ -204,6 +205,10 @@ class llama_hot_expert_cache {
     // only: prefill ubatches neither count nor age the ranking).
     void on_ubatch_begin(int64_t n_tokens);
 
+    // direct-read expert staging: when set, multi-token ubatches fill the stage
+    // at each layer's topk instead of prefetching the mmap (LLAMA_DISK_STAGE)
+    void set_disk_stage(llama_disk_stage * ds) { disk_stage = ds; }
+
     // A new prompt has begun (llama_context detects the decode -> prefill
     // transition of the ubatch stream, llama-server runs np = 1): divide every
     // usage count by four immediately, so the shared ranking (and the RAM pin
@@ -286,6 +291,10 @@ class llama_hot_expert_cache {
     // the syscalls run on the pin worker thread, so a large n_lock_slow count no
     // longer stalls decode directly but still competes for the disk and CPU
     static constexpr int64_t lock_slow_us = 2000;
+    // --prefetch-layer-ahead only engages on ubatches at least this wide: a
+    // narrow multi-token ubatch routes too few experts for the whole-layer
+    // read-ahead to be worth the extra bytes
+    static constexpr int64_t prefetch_layer_ahead_min_tokens = 128;
     // pin jobs queued ahead of the worker (bounds the in-flight budget reserve
     // and the memory of the queue itself); when full, newcomers are skipped and
     // retried on a later observation instead of blocking the decode thread
@@ -400,6 +409,13 @@ class llama_hot_expert_cache {
                              int32_t             expert_id,
                              std::vector<std::pair<const void *, size_t>> & out);
 
+    // read-ahead the whole expert region of layer il (the gate/up/down tensor
+    // extents) into the page cache. Prefill routes nearly every expert, so for a
+    // wide ubatch the whole layer is the read set and it can be issued one layer
+    // ahead of the demand faults; the pinned experts are already resident, so
+    // prefetching them is a no-op. Selected by LLAMA_PREFETCH_LAYER_AHEAD
+    void prefetch_layer(int il);
+
     // halve all usage counts (and the rank keys of the pinned entries)
     void decay_counts();
 
@@ -411,6 +427,8 @@ class llama_hot_expert_cache {
     const uint64_t decay_interval;   // 0 = lifetime counts (no aging)
     const uint64_t min_pin_count;    // usage-count floor for pinning (0 = any routed expert)
     const bool     prefetch_enabled; // read-ahead routed-but-unpinned expert rows (--hot-experts-prefetch)
+    const bool     prefetch_layer_ahead; // read-ahead the whole next layer, not the routed set (LLAMA_PREFETCH_LAYER_AHEAD)
+    llama_disk_stage * disk_stage = nullptr; // direct-read staging of the routed experts (null when disabled)
     const bool     track_rank;       // rank feeds pinning/VRAM tier; false = prefetch-only mode
     uint64_t       n_tokens_seen = 0;  // tokens since the last decay
     int64_t        n_tokens_cur  = 0;  // tokens of the ubatch being computed (ask-phase gate)

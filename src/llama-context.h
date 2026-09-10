@@ -18,6 +18,7 @@ struct llama_model;
 class llama_batch_allocr;
 class llama_hot_expert_cache;
 class llama_moe_cache;
+class llama_disk_stage;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -292,6 +293,10 @@ private:
     // --moe-expert-cache*: GPU-resident cache for host-offloaded MoE experts
     // (null when disabled or when the model has no cacheable layer)
     std::unique_ptr<llama_moe_cache> moe_cache;
+
+    // LLAMA_DISK_STAGE=1: synchronous direct-read staging of MoE expert weights
+    // into pinned host memory for multi-token ubatches (null when disabled)
+    std::unique_ptr<llama_disk_stage> disk_stage;
 
     // single-token decode ubatches feed the hot-expert ranking (RAM pin tier /
     // VRAM MoE tier), so their top-k expert selection is observed after the

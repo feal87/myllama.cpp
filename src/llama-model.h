@@ -749,6 +749,10 @@ struct llama_model {
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 
+    // location of a host-resident tensor inside the model file it was mapped
+    // from (for out-of-band reads that need to reopen the file)
+    bool tensor_file_region(const struct ggml_tensor * t, std::string & path, size_t & offs) const;
+
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
 

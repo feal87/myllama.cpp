@@ -80,6 +80,10 @@ struct llama_model_loader {
 
     bool use_mmap = false;
     bool use_direct_io = false;
+    // expert weights are streamed from disk instead of being resident: they are
+    // routed to the disk buffer type and never read at load. Set by
+    // --load-mode dio; the graph substitutes the disk-backed tensors for them.
+    bool disk_stream = false;
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;

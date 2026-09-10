@@ -50,11 +50,15 @@ struct llama_mmap {
 
     llama_mmap(const llama_mmap &) = delete;
     llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false,
-               const ranges & lazy_ranges = {});
+               const ranges & lazy_ranges = {}, bool map = true);
     ~llama_mmap();
 
     size_t size() const;
     void * addr() const;
+
+    // path of the file this mapping was created from (for out-of-band reads
+    // that need to reopen the file, e.g. unbuffered staging)
+    const std::string & name() const;
 
     void unmap_fragment(size_t first, size_t last);
 
