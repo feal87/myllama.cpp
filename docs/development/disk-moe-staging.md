@@ -335,6 +335,79 @@ Open follow-up: none; the configuration is covered by B.
     POSIX equivalent (`pread`, or io_uring). `llama_mmap` already takes the
     `map` flag, so the loader side is portable.
 
+## Plan: VRAM MoE tier on top of the disk cache
+
+Goal: make `--moe-expert-cache*` work in dio too, so mmap+pin and dio can be
+compared with the same three tiers (VRAM > RAM > disk). Today
+`llama_context` warns and drops the tier when disk streaming is active, because
+its upload worker would read the reserved, never-committed Disk range.
+
+Why it is not a small change (both facts confirmed in the code):
+
+- The tier's skip is `src[3]`/`host_table`, and `ggml-cpu.c:1659` indexes that
+table by the value in the ids tensor (`moe_tbl[i02]`, `i02` from `ids->data`). In
+  dio `build_moe_ffn` already remapped the ids through the disk table
+  (`selected_experts_c = get_rows(dc->table, selected_experts)`), so `i02` is a
+  DISK SLOT, not an expert id. `host_table` (expert-indexed) is the wrong table,
+  and `op_params[0]`/`n_as` would have to become disk-side values.
+- The upload worker does `ggml_backend_tensor_set(dst, src->data + expert*sz, ...)`
+  with `src` = the model expert tensor. In dio `src->data` is the reserved
+  address range, so the first upload is an access violation (reproduced:
+  segfault at exactly 512 decode tokens, `maybe_activate`).
+
+Design that fits the existing code (the dummy-slot trick avoids `src[3]`):
+
+1. Give the disk decode cache a zeroed dummy slot per role: tensors become
+   `ne[2] = n_slots + 1`, index `n_slots` all zeros, `table[e] = n_slots` for an
+   expert served by the VRAM tier. The disk chain then emits zeros for it
+   through the EXISTING id remap - no `src[3]` on the disk chain at all.
+2. Make VRAM residents a SUBSET of the disk residents, so their disk slots are
+   stable and their bytes are already in RAM. The tier sizes its per-layer
+   capacity from the disk stage's resident set instead of the global ranking
+   alone. Needs a disk-stage query: `resident_slot(il, e)` -> slot or -1, and
+   `resident_filled(il, e)`.
+3. Upload from the resident RAM slot, not from disk: the worker copies from
+   `c.data[role] + slot*slot_stride` (the same arithmetic `fill_cache` uses to
+   write it). No extra disk read, no second reader on the IOCP (that was Bug F).
+4. `fill_cache` must not read VRAM residents: for an expert whose table entry is
+   the dummy, skip the read and leave the slot to the VRAM chain. It needs the
+   VRAM residency for the layer; reuse `llama_moe_cache::vram_resident_cb` or add
+   a callback the disk stage holds.
+5. `build_moe_ffn`: when both are active, build the VRAM device chain exactly as
+   the mmap+pin path does (dev_table -> slot ids -> mul_mat_id over c_gate/c_up/
+   c_down -> swiglu -> sum with the disk chain), and do NOT set `src[3]` on the
+   disk chain.
+6. Publish order: keep the existing "resident only after the upload completed"
+   rule (`tick`/`rebalance`). During the in-flight window the disk table still
+   points at a real slot, so the disk chain serves the expert and the output is
+   correct; the dummy is published only once the VRAM slot holds the bytes.
+7. Avoid double coverage: an expert promoted to VRAM should ideally free its
+   disk resident slot (or at least not consume both). Correctness does not need
+   it; wasted RAM is the only cost. Start with the simple version, measure.
+8. Sizing: the VRAM budget is `--moe-expert-cache-budget-mib`; the RAM budget is
+   `--pin-hot-experts-budget-mib`. They are independent tiers and both count
+   against the machine, so the launcher should size them together.
+
+Wiring:
+
+- `llama-context.cpp`: in dio, create `llama_moe_cache` instead of warning, and
+  pass the disk stage to it (`llama_moe_cache` needs a `set_disk_stage`, like the
+  hot cache has).
+- `llama-disk-stage`: expose the two residency queries and the dummy slot.
+- `llama-graph.cpp`: the dio decode path adds the VRAM chain (mostly copy from
+  the existing `mc` block, guarded so it only builds when the disk cache is the
+  host source).
+- Stats: `vram_resident_cb` already exists; add the VRAM bytes to the
+  `RAM tier` report so a run shows both tiers.
+
+Validation before trusting it:
+
+- greedy output byte-identical within dio with the tier on and off;
+- no access violation past 512 decode tokens (the current failure point);
+- VRAM/RAM stats lines consistent, hit rate reported;
+- both load modes run the same profile with the tier on, for the apples-to-apples
+  number.
+
 ## Key facts
 
 Model: `Qwen3.8-Flash-Next-Uncensored-Q5_K_M` (arch `qwen4exp`), 48 layers,
