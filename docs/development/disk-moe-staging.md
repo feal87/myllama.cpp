@@ -209,7 +209,15 @@ Decode cache (always built when disk streaming is active; sized by
    compares pointers, so the VRAM tier never served a token. `llama_context` now
    warns and drops the tier when disk streaming is active, and the launcher does
    not pass the flags in dio. Feeding VRAM from the disk cache slots (a real
-   VRAM > RAM > disk hierarchy) is future work, not a bug fix.
+   VRAM > RAM > disk hierarchy) is future work, not a bug fix: in dio the graph
+   already remaps ids through the disk table (`selected_experts_c`), so the
+   VRAM skip cannot use `src[3]`/host_table (the kernel indexes it by the id in
+   the ids tensor, ggml-cpu.c:1659), and the upload source must become a disk or
+   RAM-slot read instead of `src->data`. The shape that fits the existing code:
+   give the disk cache a zeroed dummy slot, map VRAM residents to it in the disk
+   table (the disk chain then emits zeros for them, no src[3] needed), keep VRAM
+   residents a subset of the disk residents, and upload from the resident RAM
+   slot so there is no extra disk read and no second reader on the IOCP.
 
 ## Remaining work
 
