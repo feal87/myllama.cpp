@@ -1000,7 +1000,7 @@ void llama_hot_expert_cache::on_prompt_begin() {
             continue;
         }
         for (uint64_t & c : ls.counts) {
-            const uint64_t new_count = (c + 3) / 4;  // divide by 4, floor at 1
+            const uint64_t new_count = (c + 1) / 2;  // divide by 2, floor at 1
             if (new_count != c) {
                 c = new_count;
             }
