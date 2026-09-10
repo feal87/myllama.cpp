@@ -19,9 +19,12 @@ struct llama_model;
 // unbuffered (FILE_FLAG_NO_BUFFERING) reads immediately before the layer computes,
 // so the offload copy sources resident memory instead of faulting the mapping.
 //
-// The staging tensors for every layer alias one pinned pool (one region per
+// The staging tensors for every layer alias one pooled buffer (one region per
 // gate/up/down tensor): the scheduler keys copies by tensor, so the layers need
 // distinct tensor objects or a single copy would be reused across all of them.
+// The pool holds TWO such sets and the stageable layers alternate between them:
+// while layer i computes on the GPU, a reader thread fills layer i+1 into the
+// other set, so the prefill read overlaps the compute instead of preceding it.
 struct llama_disk_stage_layer {
     ggml_tensor * gate = nullptr;
     ggml_tensor * up   = nullptr;
@@ -59,7 +62,9 @@ public:
     // staging tensors of MoE layer il, or null when the layer is not stageable
     const llama_disk_stage_layer * layer(int il) const;
 
-    // synchronously fill layer il's staging tensors from the model file
+    // ensure layer il is staged, then start reading the next stageable layer
+    // into the other buffer. Blocks only if layer il's own read is still in
+    // flight, i.e. when this layer's compute was shorter than its read
     void fill(int il);
 
     // persistent decode cache of layer il, or null when the cache is off
@@ -86,4 +91,8 @@ public:
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
+
+    // build and run the blocking read batch for one layer; called by the
+    // staging reader thread, and directly by fill() when there is one buffer
+    void fill_run(int il);
 };

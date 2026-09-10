@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -205,6 +206,22 @@ struct llama_disk_stage::impl {
     std::mutex   io_mu;          // one reaper at a time: the IOCP is shared by all reads
     int32_t      n_resident = 0; // resident slots per layer (uniform), 0 when no cache
 
+    // double-buffered staging pipeline: one reader thread reads the next
+    // stageable layer while the current layer computes. n_buf == 1 disables it
+    // (a read-ahead would clobber the buffer in use)
+    std::thread             reader;
+    std::mutex              pipe_mu;
+    std::condition_variable pipe_req_cv;
+    std::condition_variable pipe_done_cv;
+    int32_t  pipe_req    = -1;   // layer the main thread requested
+    int32_t  pipe_issued = -1;   // layer the pipeline was last asked for
+    int32_t  pipe_done   = -1;   // layer the reader finished
+    bool     pipe_stop   = false;
+    std::string pipe_error;      // non-empty once a read has failed
+    int      n_buf = 2;
+    std::vector<int32_t> next_stage; // layer -> next stageable layer, -1 if none
+    std::vector<int8_t>  layer_buf;  // layer -> staging buffer index
+
     ~impl() {
         if (pool) {
             ggml_backend_buffer_free(pool);
@@ -357,16 +374,18 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     }
 
     size_t region_off[3] = { 0, 0, 0 };
-    size_t pool_off_total = 0;
+    size_t per_buffer = 0; // one layer's worth, all roles
     for (const auto & role : roles) {
-        region_off[role.slot] = pool_off_total;
-        pool_off_total += region_len[role.slot];
+        region_off[role.slot] = per_buffer;
+        per_buffer += region_len[role.slot];
     }
-    // slack for aligning the pool base plus any per-tensor allocation rounding
-    const size_t total = pool_off_total + 2 * disk_stage_align;
 
-    // the pool holds one layer's expert region per role; anything far larger
-    // means the layout math is wrong, so refuse rather than commit huge memory
+    // two buffers so the read of layer i+1 overlaps the compute of layer i;
+    // slack for aligning the pool base plus any per-tensor allocation rounding
+    size_t total = (size_t) p.n_buf * per_buffer + 2 * disk_stage_align;
+
+    // the pool holds one layer's expert region per role per buffer; anything far
+    // larger means the layout math is wrong, so refuse rather than commit memory
     const size_t total_max = (size_t) 16 << 30;
     if (total > total_max) {
         LLAMA_LOG_WARN("%s: staging pool would be %.1f GiB, refusing, disk staging disabled\n",
@@ -384,6 +403,15 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     }
 
     p.pool = ggml_backend_buft_alloc_buffer(buft, total);
+    if (p.pool == nullptr && p.n_buf > 1) {
+        // no room for the second buffer: fall back to one, no read-ahead
+        LLAMA_LOG_WARN("%s: could not allocate the %zu MiB double staging pool, "
+                       "falling back to a single buffer (no prefill read-ahead)\n",
+                       __func__, total / (1024 * 1024));
+        p.n_buf = 1;
+        total  = per_buffer + 2 * disk_stage_align;
+        p.pool = ggml_backend_buft_alloc_buffer(buft, total);
+    }
     if (p.pool == nullptr) {
         LLAMA_LOG_WARN("%s: failed to allocate the %zu MiB staging pool, disk staging disabled\n",
                        __func__, total / (1024 * 1024));
@@ -392,6 +420,26 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     ggml_backend_buffer_set_usage(p.pool, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
     p.base = (char *) align_up((uintptr_t) ggml_backend_buffer_get_base(p.pool), disk_stage_align);
+
+    // alternate the staging buffer along the order of stageable layers, so a
+    // layer and its read-ahead target never share one
+    {
+        std::vector<int32_t> order;
+        order.reserve(n_layer);
+        for (int il = 0; il < n_layer; ++il) {
+            if (src[il].ok) {
+                order.push_back(il);
+            }
+        }
+        p.layer_buf.assign(n_layer, 0);
+        p.next_stage.assign(n_layer, -1);
+        for (size_t k = 0; k < order.size(); ++k) {
+            p.layer_buf[order[k]] = (int8_t) (k % (size_t) p.n_buf);
+            if (k + 1 < order.size()) {
+                p.next_stage[order[k]] = order[k + 1];
+            }
+        }
+    }
 
     ggml_init_params ip = {
         /*.mem_size   =*/ ggml_tensor_overhead() * (size_t) (n_layer * 3 + 16),
@@ -419,7 +467,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
         }
         for (const auto & role : roles) {
             impl::region & r = src[il].r[role.slot];
-            r.pool_off = region_off[role.slot];
+            r.pool_off = (size_t) p.layer_buf[il] * per_buffer + region_off[role.slot];
 
             void * addr = p.base + r.pool_off + r.head;
             if (ggml_backend_tensor_alloc(p.pool, tensors[role.slot], addr) != GGML_STATUS_SUCCESS) {
@@ -603,14 +651,62 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
         }
     }
 
+    if (p.n_buf > 1) {
+        p.reader = std::thread([&p, this]() {
+            for (;;) {
+                int32_t il = -1;
+                {
+                    std::unique_lock<std::mutex> lk(p.pipe_mu);
+                    p.pipe_req_cv.wait(lk, [&p] { return p.pipe_stop || p.pipe_req != -1; });
+                    if (p.pipe_stop) {
+                        return;
+                    }
+                    il = p.pipe_req;
+                    p.pipe_req = -1;
+                }
+
+                std::string err;
+                try {
+                    this->fill_run(il);
+                } catch (const std::exception & e) {
+                    err = e.what();
+                } catch (...) {
+                    err = "disk stage: unbuffered read failed";
+                }
+
+                {
+                    std::lock_guard<std::mutex> lk(p.pipe_mu);
+                    p.pipe_done = il;
+                    if (!err.empty()) {
+                        p.pipe_error = err;
+                    }
+                }
+                p.pipe_done_cv.notify_all();
+            }
+        });
+    }
+
     p.active = true;
-    LLAMA_LOG_INFO("%s: disk staging active for %d layer(s), %.1f MiB pool, %zu-byte aligned unbuffered reads\n",
-                   __func__, n_staged, total / (1024.0 * 1024.0), disk_stage_align);
+    LLAMA_LOG_INFO("%s: disk staging active for %d layer(s), %.1f MiB pool, %d buffer(s), %zu-byte aligned unbuffered reads\n",
+                   __func__, n_staged, total / (1024.0 * 1024.0), p.n_buf, disk_stage_align);
 
 #endif
 }
 
-llama_disk_stage::~llama_disk_stage() = default;
+llama_disk_stage::~llama_disk_stage() {
+#if defined(_WIN32)
+    if (pimpl) {
+        {
+            std::lock_guard<std::mutex> lk(pimpl->pipe_mu);
+            pimpl->pipe_stop = true;
+        }
+        pimpl->pipe_req_cv.notify_all();
+        if (pimpl->reader.joinable()) {
+            pimpl->reader.join();
+        }
+    }
+#endif
+}
 
 void llama_disk_stage::fill(int il) {
     impl & p = *pimpl;
@@ -618,8 +714,51 @@ void llama_disk_stage::fill(int il) {
         return;
     }
 
-
 #if defined(_WIN32)
+    if (p.n_buf < 2) {
+        // single staging buffer: no read-ahead possible, fill synchronously
+        fill_run(il);
+        return;
+    }
+
+    // wait for this layer's read, which the pipeline started at the previous
+    // layer, then start the read for the next stageable layer so it overlaps
+    // with this layer's compute
+    {
+        std::unique_lock<std::mutex> lk(p.pipe_mu);
+        if (p.pipe_issued != il) {
+            p.pipe_req    = il;
+            p.pipe_issued = il;
+            p.pipe_req_cv.notify_one();
+        }
+        p.pipe_done_cv.wait(lk, [&p, il] { return p.pipe_done == il || !p.pipe_error.empty(); });
+        const bool        failed = !p.pipe_error.empty();
+        const std::string err    = p.pipe_error;
+        p.pipe_done = -1;
+        if (failed) {
+            throw std::runtime_error(err);
+        }
+    }
+
+    const int32_t nxt = p.next_stage[il];
+    if (nxt >= 0) {
+        std::lock_guard<std::mutex> lk(p.pipe_mu);
+        p.pipe_req    = nxt;
+        p.pipe_issued = nxt;
+        p.pipe_req_cv.notify_one();
+    }
+#else
+    GGML_UNUSED(il);
+#endif
+}
+
+void llama_disk_stage::fill_run(int il) {
+#if defined(_WIN32)
+    impl & p = *pimpl;
+    if (il < 0 || il >= (int) p.layer_regions.size() || p.layer_regions[il].empty()) {
+        return;
+    }
+
     std::vector<disk_stage_job> jobs;
     for (const impl::region & r : p.layer_regions[il]) {
         char * dst = p.base + r.pool_off;
@@ -652,6 +791,8 @@ void llama_disk_stage::fill(int il) {
     LLAMA_LOG_INFO("%s: layer %d fill: %.1f MiB in %.1f ms = %.2f GB/s (qd=%d)\n",
                    __func__, il, bytes / (1024.0 * 1024.0), secs * 1000.0,
                    secs > 0 ? bytes / (secs * 1e9) : 0.0, queue_depth);
+#else
+    GGML_UNUSED(il);
 #endif
 }
 
