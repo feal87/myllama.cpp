@@ -1235,7 +1235,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
         const int64_t n_stream = mctx_hyb->get_n_stream();
 
-        gather = n_tokens == n_stream && n_kv >= 2*width;
+        // the masked path only gets more expensive than the gather overhead once n_kv is well
+        // past the top-k width; the crossover measured on sm_89 is ~20k cells, and below it
+        // gather loses up to 10%. gate at 9*width instead of 2*width.
+        // QWEN4EXP_QSA_GATHER_MIN overrides the threshold in cells (0 = default).
+        static const int64_t gather_min = [] {
+            const char * e = getenv("QWEN4EXP_QSA_GATHER_MIN");
+            return e == nullptr ? int64_t(0) : (int64_t) atoll(e);
+        }();
+
+        const int64_t min_kv = gather_min > 0 ? gather_min : 9*width;
+        gather = n_tokens == n_stream && n_kv >= min_kv;
     }
 
     ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il, gather) : nullptr;
