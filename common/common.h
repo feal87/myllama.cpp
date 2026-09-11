@@ -445,6 +445,16 @@ struct lr_opt {
 
 struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 
+// how a context can remove tokens from a sequence. AUTO probes the context at
+// load; the other values pin the answer and skip the probe
+enum common_context_seq_rm_type {
+    COMMON_CONTEXT_SEQ_RM_TYPE_NO           = 0, // seq_rm not supported (e.g. no memory module)
+    COMMON_CONTEXT_SEQ_RM_TYPE_PART         = 1, // can seq_rm partial sequences
+    COMMON_CONTEXT_SEQ_RM_TYPE_FULL         = 2, // can seq_rm full sequences only
+    COMMON_CONTEXT_SEQ_RM_TYPE_RS           = 3, // can seq_rm partial sequences, bounded by n_rs_seq
+    COMMON_CONTEXT_SEQ_RM_TYPE_AUTO         = 4, // probe the context
+};
+
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
@@ -520,6 +530,8 @@ struct common_params {
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
 
     enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
+
+    enum common_context_seq_rm_type seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_AUTO; // probe or pin the context's seq_rm capability
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
@@ -1024,16 +1036,10 @@ private:
 // Context utils
 //
 
-enum common_context_seq_rm_type {
-    COMMON_CONTEXT_SEQ_RM_TYPE_NO           = 0, // seq_rm not supported (e.g. no memory module)
-    COMMON_CONTEXT_SEQ_RM_TYPE_PART         = 1, // can seq_rm partial sequences
-    COMMON_CONTEXT_SEQ_RM_TYPE_FULL         = 2, // can seq_rm full sequences only
-    COMMON_CONTEXT_SEQ_RM_TYPE_RS = 3, // can seq_rm partial sequences, bounded by n_rs_seq
-};
-
 // check if the llama_context can remove sequences
 // note: clears the memory of the context
-common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx);
+common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx,
+        common_context_seq_rm_type force = COMMON_CONTEXT_SEQ_RM_TYPE_AUTO);
 
 struct common_memory {
     llama_context * ctx_tgt = nullptr;

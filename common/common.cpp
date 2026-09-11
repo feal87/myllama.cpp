@@ -1580,10 +1580,28 @@ char * common_get_model_or_exit(int argc, char * argv[]) {
     return path;
 }
 
-common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
+static const char * common_context_seq_rm_type_name(common_context_seq_rm_type type) {
+    switch (type) {
+        case COMMON_CONTEXT_SEQ_RM_TYPE_NO:   return "no";
+        case COMMON_CONTEXT_SEQ_RM_TYPE_PART: return "part";
+        case COMMON_CONTEXT_SEQ_RM_TYPE_FULL: return "full";
+        case COMMON_CONTEXT_SEQ_RM_TYPE_RS:   return "rs";
+        default:                              return "auto";
+    }
+}
+
+common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx, common_context_seq_rm_type force) {
     auto * mem = llama_get_memory(ctx);
     if (mem == nullptr) {
         return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    }
+
+    // the capability is a property of the memory implementation, so it can be
+    // pinned instead of probed. a value the memory cannot honour aborts later, in
+    // common_context_seq_rm()
+    if (force != COMMON_CONTEXT_SEQ_RM_TYPE_AUTO) {
+        COM_TRC("%s: using seq_rm type '%s' without probing\n", __func__, common_context_seq_rm_type_name(force));
+        return force;
     }
 
     common_context_seq_rm_type res = COMMON_CONTEXT_SEQ_RM_TYPE_PART;

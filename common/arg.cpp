@@ -1710,6 +1710,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--seq-rm-type"}, "TYPE",
+        "how the context removes tokens from a sequence (default: auto)\n"
+        "- auto: probe the context at load with a 2-token decode (exact, but reads the expert weights on a disk-backed model)\n"
+        "- no: no sequence removal, disables speculative decoding\n"
+        "- part: partial sequence removal is supported\n"
+        "- full: only full sequences can be removed, speculative decoding uses checkpoints\n"
+        "- rs: partial removal, bounded by n_rs_seq\n"
+        "a pinned value is not checked: if the context cannot honour it, removing tokens aborts",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "auto") { params.seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_AUTO; }
+            else if (value == "no")   { params.seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;   }
+            else if (value == "part") { params.seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_PART; }
+            else if (value == "full") { params.seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_FULL; }
+            else if (value == "rs")   { params.seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_RS;   }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),

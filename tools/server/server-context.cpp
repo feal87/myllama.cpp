@@ -1336,7 +1336,7 @@ private:
 
         slots.clear();
 
-        ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
+        ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt, params_base.seq_rm_type);
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
@@ -1367,7 +1367,7 @@ private:
         }
 
         if (ctx_dft) {
-            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
+            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft, params_base.seq_rm_type);
         }
 
         if (spec) {
