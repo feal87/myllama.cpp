@@ -1654,6 +1654,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             if (hot_experts && cparams.n_pin_hot_experts > 0) {
                 hot_experts->print_stats();
             }
+            if (disk_stage) {
+                disk_stage->print_stats();
+            }
             if (moe_cache && moe_cache->is_active()) {
                 moe_cache->print_stats();
             }

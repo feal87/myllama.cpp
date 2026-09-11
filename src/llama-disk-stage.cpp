@@ -9,14 +9,17 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cinttypes>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <list>
 #include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #if defined(_WIN32)
@@ -217,6 +220,107 @@ struct llama_disk_stage::impl {
     std::mutex   io_mu;          // one reaper at a time: the IOCP is shared by all reads
     int32_t      n_trans = 0;    // transient slots per layer, 0 when no cache
 
+    // second-level (L2) expert pool. During decode the two prefill staging
+    // slabs are idle, so they hold the experts the resident cache missed. A miss
+    // is read into a pool slot and copied to the transient slot the graph
+    // executes from; a later hit copies from the pool instead of reading the
+    // disk. One pool per expert-bundle type (one slab each): a slot stride is
+    // fixed per tensor, and this model mixes Q8_0 and Q5_1 down projections.
+    // Evicted residents enter at the MRU end and outlive mere miss entries.
+    struct evict_pool {
+        char *  data[3]   = { nullptr, nullptr, nullptr }; // role -> slab region
+        size_t  stride[3] = { 0, 0, 0 };
+        int32_t cap       = 0;
+        // LRU: lru.front() is the most recent; key = ((int64_t) il << 32) | id
+        std::list<int64_t>                        lru;
+        std::unordered_map<int64_t, int32_t>      slot_of;   // key -> slot
+        std::vector<std::list<int64_t>::iterator> iter_of;   // slot -> position in lru
+        std::vector<int64_t>                      slot_key;  // slot -> key, -1 when empty
+        std::vector<int32_t>                      free_slots;
+    };
+    std::vector<evict_pool> evict_pools;
+    std::vector<int>        evict_pool_id;    // layer -> pool, -1 when not pooled
+    bool                    evict_populated = false; // pools hold entries a prefill would clobber
+
+    uint64_t n_l2_hits        = 0;
+    uint64_t n_l2_misses      = 0;
+    uint64_t n_l2_cold        = 0; // lookups while the RAM tier was still filling, excluded from the hit rate
+    uint64_t n_l2_evictions   = 0;
+    uint64_t n_l2_demotions   = 0;
+    uint64_t n_l2_hit_bytes   = 0;
+    uint64_t n_l2_promos      = 0; // resident fills served from the L2 instead of the disk
+    uint64_t n_l2_promo_bytes = 0;
+    bool     l2_warm          = false; // latched when every resident pool is full
+
+    int evict_pool_for(int il) const {
+        return (il >= 0 && il < (int) evict_pool_id.size()) ? evict_pool_id[(size_t) il] : -1;
+    }
+
+    int32_t evict_touch(int pool, int64_t key) {
+        evict_pool & ep = evict_pools[(size_t) pool];
+        const auto it = ep.slot_of.find(key);
+        if (it == ep.slot_of.end()) {
+            return -1;
+        }
+        const int32_t slot = it->second;
+        if (ep.iter_of[(size_t) slot] != ep.lru.begin()) {
+            ep.lru.splice(ep.lru.begin(), ep.lru, ep.iter_of[(size_t) slot]);
+            ep.iter_of[(size_t) slot] = ep.lru.begin();
+        }
+        return slot;
+    }
+
+    int32_t evict_alloc(int pool, int64_t key) {
+        evict_pool & ep = evict_pools[(size_t) pool];
+        int32_t slot;
+        if (!ep.free_slots.empty()) {
+            slot = ep.free_slots.back();
+            ep.free_slots.pop_back();
+        } else {
+            const int64_t victim = ep.lru.back();
+            ep.lru.pop_back();
+            slot = ep.slot_of.at(victim);
+            ep.slot_of.erase(victim);
+            ep.slot_key[(size_t) slot] = -1;
+            n_l2_evictions++;
+        }
+        ep.slot_key[(size_t) slot] = key;
+        ep.slot_of[key] = slot;
+        ep.lru.push_front(key);
+        ep.iter_of[(size_t) slot] = ep.lru.begin();
+        return slot;
+    }
+
+    int32_t evict_put(int pool, int64_t key) {
+        const int32_t slot = evict_touch(pool, key);
+        return slot >= 0 ? slot : evict_alloc(pool, key);
+    }
+
+    void evict_remove(int pool, int64_t key) {
+        evict_pool & ep = evict_pools[(size_t) pool];
+        const auto it = ep.slot_of.find(key);
+        if (it == ep.slot_of.end()) {
+            return;
+        }
+        const int32_t slot = it->second;
+        ep.lru.erase(ep.iter_of[(size_t) slot]);
+        ep.slot_of.erase(it);
+        ep.slot_key[(size_t) slot] = -1;
+        ep.free_slots.push_back(slot);
+    }
+
+    void evict_clear() {
+        for (evict_pool & ep : evict_pools) {
+            ep.lru.clear();
+            ep.slot_of.clear();
+            ep.free_slots.resize((size_t) ep.cap);
+            for (int32_t s = 0; s < ep.cap; ++s) {
+                ep.free_slots[(size_t) s] = s;
+            }
+            std::fill(ep.slot_key.begin(), ep.slot_key.end(), (int64_t) -1);
+        }
+    }
+
     // double-buffered staging pipeline: one reader thread reads the next
     // stageable layer while the current layer computes. n_buf == 1 disables it
     // (a read-ahead would clobber the buffer in use)
@@ -325,6 +429,19 @@ bool llama_disk_stage::supported() {
 
 bool llama_disk_stage::is_active() const {
     return pimpl->active;
+}
+
+void llama_disk_stage::print_stats() const {
+    const impl & p = *pimpl;
+    if (p.evict_pools.empty()) {
+        return;
+    }
+    const uint64_t lookups = p.n_l2_hits + p.n_l2_misses;
+    LLAMA_LOG_INFO("[disk-stage] L2 pool: hit=%.1f%% (%" PRIu64 "/%" PRIu64 " warm routed, %" PRIu64 " cold fill skipped)"
+                   " | disk avoided=%.2f MiB (promo %.2f MiB) | evictions=%" PRIu64 " | demotions=%" PRIu64 "\n",
+                   lookups ? 100.0 * p.n_l2_hits / lookups : 0.0, p.n_l2_hits, lookups, p.n_l2_cold,
+                   p.n_l2_hit_bytes / (1024.0 * 1024.0), p.n_l2_promo_bytes / (1024.0 * 1024.0),
+                   p.n_l2_evictions, p.n_l2_demotions);
 }
 
 const llama_disk_stage_layer * llama_disk_stage::layer(int il) const {
@@ -826,6 +943,91 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                                p.pools[g].res_cap);
                             }
                         }
+
+                        // the prefill staging slabs are idle during decode: reuse
+                        // them as the L2 pool, one slab per expert-bundle type.
+                        // Requires aligned data: the pool reads an expert at its
+                        // slot start, so head must be zero
+                        const char * l2_env = std::getenv("LLAMA_DISK_STAGE_L2");
+                        const bool   l2_on  = l2_env == nullptr || (l2_env[0] != '\0' && l2_env[0] != '0');
+                        if (!l2_on) {
+                            LLAMA_LOG_INFO("%s: L2 eviction pool disabled by LLAMA_DISK_STAGE_L2\n", __func__);
+                        } else if (all_aligned && p.n_buf >= 2) {
+                            p.evict_pool_id.assign(n_layer, -1);
+
+                            for (int il = 0; il < n_layer && (int) p.evict_pools.size() < p.n_buf; ++il) {
+                                if (!src[il].ok || p.evict_pool_id[il] >= 0) {
+                                    continue;
+                                }
+                                const int pid = (int) p.evict_pools.size();
+
+                                int32_t cap = INT32_MAX;
+                                for (const auto & role : roles) {
+                                    const size_t stride = src[il].r[role.slot].stride;
+                                    if (stride > 0) {
+                                        cap = std::min<int32_t>(cap, (int32_t) (region_len[role.slot] / stride));
+                                    }
+                                }
+                                if (cap <= 0 || cap == INT32_MAX) {
+                                    continue;  // cannot size this type; leave the L2 off
+                                }
+
+                                impl::evict_pool ep;
+                                ep.cap = cap;
+                                for (const auto & role : roles) {
+                                    ep.data[role.slot]   = p.base + (size_t) pid * per_buffer + region_off[role.slot] + src[il].r[role.slot].head;
+                                    ep.stride[role.slot] = src[il].r[role.slot].stride;
+                                }
+                                ep.slot_key.assign((size_t) ep.cap, -1);
+                                ep.iter_of.resize((size_t) ep.cap);
+                                ep.free_slots.resize((size_t) ep.cap);
+                                for (int32_t s = 0; s < ep.cap; ++s) {
+                                    ep.free_slots[(size_t) s] = s;
+                                }
+                                p.evict_pools.push_back(std::move(ep));
+
+                                for (int jl = il; jl < n_layer; ++jl) {
+                                    if (!src[jl].ok) {
+                                        continue;
+                                    }
+                                    bool same = true;
+                                    for (const auto & role : roles) {
+                                        const ggml_tensor * a = src[il].t[role.slot];
+                                        const ggml_tensor * b = src[jl].t[role.slot];
+                                        if (a->type != b->type || a->ne[0] != b->ne[0] || a->ne[1] != b->ne[1]) {
+                                            same = false;
+                                            break;
+                                        }
+                                    }
+                                    if (same) {
+                                        p.evict_pool_id[jl] = pid;
+                                    }
+                                }
+                            }
+
+                            bool all_pooled = true;
+                            for (int il = 0; il < n_layer; ++il) {
+                                if (src[il].ok && p.evict_pool_id[il] < 0) {
+                                    all_pooled = false;
+                                    break;
+                                }
+                            }
+                            if (!all_pooled) {
+                                // more bundle types than staging slabs: the pool
+                                // cannot cover them all, so leave it off
+                                p.evict_pools.clear();
+                                p.evict_pool_id.assign(n_layer, -1);
+                                LLAMA_LOG_WARN("%s: more expert-bundle types than staging buffers, "
+                                               "L2 eviction pool disabled\n", __func__);
+                            } else {
+                                for (size_t k = 0; k < p.evict_pools.size(); ++k) {
+                                    LLAMA_LOG_INFO("%s:   L2 pool %zu: %d slots, strides %zu/%zu/%zu bytes\n",
+                                                   __func__, k, p.evict_pools[k].cap,
+                                                   p.evict_pools[k].stride[0], p.evict_pools[k].stride[1],
+                                                   p.evict_pools[k].stride[2]);
+                                }
+                            }
+                        }
                     }
                 }
             } else {
@@ -898,6 +1100,12 @@ void llama_disk_stage::fill(int il) {
     }
 
 #if defined(_WIN32)
+    if (p.evict_populated) {
+        std::lock_guard<std::mutex> lock(p.cache_mu);
+        p.evict_clear();
+        p.evict_populated = false;
+    }
+
     if (p.n_buf < 2) {
         // single staging buffer: no read-ahead possible, fill synchronously
         fill_run(il);
@@ -1155,9 +1363,17 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
     }
     impl::cache_pool & pool = p.pools[c.pool];
 
+    struct pool_copy {
+        const char * src;
+        char *       dst;
+        size_t       len;
+    };
+
     int32_t * table = (int32_t *) c.table->data;
     std::vector<disk_stage_job> jobs;
     std::vector<int32_t>    newly_filled; // residents whose slot was just read
+    std::vector<pool_copy>  copies;       // L2 pool rows to copy into a transient or resident slot
+    std::vector<std::pair<int, int64_t>> l2_consume; // L2 entries consumed by a resident fill
 
     // this layer's own transient window inside the pool: [0, res_base) is split
     // into one n_trans-wide window per layer
@@ -1189,29 +1405,104 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
             if (slot >= 0) {
                 table[id] = slot;
                 if (c.resident_filled[id] == 0) {
-                    for (int r = 0; r < 3; ++r) {
-                        const impl::region & sr = p.layer_regions[il][r];
-                        if (sr.file == nullptr || sr.stride == 0) {
-                            continue;
+                    // a promoted expert may still sit in the L2 pool from its
+                    // first route: copy it in instead of reading the disk again
+                    const int epid = p.evict_pool_for(il);
+                    const int64_t key = ((int64_t) il << 32) | (uint32_t) id;
+                    const int32_t eslot = epid >= 0 ? p.evict_touch(epid, key) : -1;
+                    if (eslot >= 0) {
+                        impl::evict_pool & ep = p.evict_pools[(size_t) epid];
+                        for (int r = 0; r < 3; ++r) {
+                            const size_t len = p.layer_regions[il][r].stride;
+                            if (len == 0) {
+                                continue;
+                            }
+                            copies.push_back({ ep.data[r] + (size_t) eslot * ep.stride[r],
+                                               pool.data[r] + (size_t) slot * pool.slot_stride[r], len });
+                            p.n_l2_promo_bytes += len;
                         }
-                        char * dst = pool.data[r] + (size_t) slot * pool.slot_stride[r] - sr.head;
-                        jobs.push_back({ sr.file->h, dst, sr.file_off + (size_t) id * sr.stride, align_up(sr.head + sr.stride, disk_stage_align) });
+                        p.n_l2_promos++;
+                        p.evict_populated = true;
+                        l2_consume.emplace_back(epid, key);
+                    } else {
+                        for (int r = 0; r < 3; ++r) {
+                            const impl::region & sr = p.layer_regions[il][r];
+                            if (sr.file == nullptr || sr.stride == 0) {
+                                continue;
+                            }
+                            char * dst = pool.data[r] + (size_t) slot * pool.slot_stride[r] - sr.head;
+                            jobs.push_back({ sr.file->h, dst, sr.file_off + (size_t) id * sr.stride, align_up(sr.head + sr.stride, disk_stage_align) });
+                        }
                     }
                     newly_filled.push_back(id);
                 }
                 continue;
             }
 
-            // not resident: serve it from this layer's transient window
+            // not resident: serve it from this layer's transient window. When
+            // the L2 pool holds it, copy the rows in instead of reading the
+            // disk; otherwise read the disk into a pool slot, which fills the
+            // pool, and copy from there
             if (transient >= trans_end) {
                 transient = trans_begin;
             }
             const int32_t use = transient++;
 
-            // read the expert into its slot: source starts `head` bytes before the
-            // expert data so the aligned read lands the row where the tensor expects
-            // it, and the length is rounded up to the sector size the unbuffered read
-            // requires (the extra bytes fall in the per-tensor slack)
+            const int epid = p.evict_pool_for(il);
+            if (epid >= 0) {
+                impl::evict_pool & ep = p.evict_pools[(size_t) epid];
+                const int64_t      key = ((int64_t) il << 32) | (uint32_t) id;
+                const int32_t      hit = p.evict_touch(epid, key);
+                const int32_t      eslot = hit >= 0 ? hit : p.evict_alloc(epid, key);
+
+                p.evict_populated = true;
+                // the cold prefix is the RAM tier fill: a promoted expert is
+                // served from residence next time, so those lookups cannot hit
+                const bool l2_warm = p.l2_warm;
+                if (hit < 0) {
+                    if (l2_warm) {
+                        p.n_l2_misses++;
+                    } else {
+                        p.n_l2_cold++;
+                    }
+                    for (int r = 0; r < 3; ++r) {
+                        const impl::region & sr = p.layer_regions[il][r];
+                        if (sr.file == nullptr || sr.stride == 0) {
+                            continue;
+                        }
+                        char * dst = ep.data[r] + (size_t) eslot * ep.stride[r] - sr.head;
+                        jobs.push_back({ sr.file->h, dst, sr.file_off + (size_t) id * sr.stride,
+                                         align_up(sr.head + sr.stride, disk_stage_align) });
+                    }
+                } else {
+                    if (l2_warm) {
+                        p.n_l2_hits++;
+                    } else {
+                        p.n_l2_cold++;
+                    }
+                    for (int r = 0; r < 3; ++r) {
+                        p.n_l2_hit_bytes += p.layer_regions[il][r].stride;
+                    }
+                }
+
+                // the graph reads the transient slot: copy the pool rows there
+                for (int r = 0; r < 3; ++r) {
+                    const size_t len = p.layer_regions[il][r].stride;
+                    if (len == 0) {
+                        continue;
+                    }
+                    copies.push_back({ ep.data[r] + (size_t) eslot * ep.stride[r],
+                                       pool.data[r] + (size_t) use * pool.slot_stride[r], len });
+                }
+                table[id] = use;
+                continue;
+            }
+
+            // no L2 pool: read the expert into its slot: source starts `head`
+            // bytes before the expert data so the aligned read lands the row
+            // where the tensor expects it, and the length is rounded up to the
+            // sector size the unbuffered read requires (the extra bytes fall in
+            // the per-tensor slack)
             for (int r = 0; r < 3; ++r) {
                 const impl::region & sr = p.layer_regions[il][r];
                 if (sr.file == nullptr || sr.stride == 0) {
@@ -1227,6 +1518,22 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
     if (!jobs.empty()) {
         std::lock_guard<std::mutex> io(p.io_mu);
         disk_stage_run_jobs(jobs, 32, p.iocp);
+    }
+
+    // pool rows are copied after the reads above, so a miss always copies the
+    // bytes the read just landed in its pool slot
+    for (const pool_copy & cp : copies) {
+        std::memcpy(cp.dst, cp.src, cp.len);
+    }
+
+    // resident fills that consumed an L2 entry: drop the now-redundant copy so
+    // it does not hold a slot. The entry was touched to the MRU above, so it is
+    // still present (evict_remove is a no-op otherwise)
+    if (!l2_consume.empty()) {
+        std::lock_guard<std::mutex> lock(p.cache_mu);
+        for (const auto & [epid, key] : l2_consume) {
+            p.evict_remove(epid, key);
+        }
     }
 
     if (!newly_filled.empty()) {
@@ -1278,11 +1585,25 @@ bool llama_disk_stage::resident_add(int il, int32_t id) {
         return false;  // the pool's resident slots are all taken
     }
 
-    // reserve only; fill_cache() reads the bytes in when the expert is routed
+    // reserve only; fill_cache() reads the bytes in when the expert is routed,
+    // from the L2 pool when its first route left a copy there, else from disk
     const int32_t slot = pool.free_slots.back();
     pool.free_slots.pop_back();
     c.resident_slot[id]   = slot;
     c.resident_filled[id] = 0;
+
+    // the RAM tier is full once no pool has a free slot: from then on the L2
+    // stats describe steady state (see fill_cache)
+    if (!p.l2_warm) {
+        bool full = true;
+        for (const impl::cache_pool & cp : p.pools) {
+            if (!cp.free_slots.empty()) {
+                full = false;
+                break;
+            }
+        }
+        p.l2_warm = full;
+    }
     return true;
 #else
     GGML_UNUSED(il);
@@ -1310,9 +1631,30 @@ void llama_disk_stage::resident_remove(int il, int32_t id) {
     if (slot < 0) {
         return;
     }
+    impl::cache_pool & pool = p.pools[c.pool];
+
+    // demote the bytes to the L2 before the slot can be reused: an evicted
+    // resident is a recent-hot expert, so it is the best pool candidate. A slot
+    // that was never filled holds no valid data, so skip it
+    const int epid = p.evict_pool_for(il);
+    if (epid >= 0 && c.resident_filled[id] != 0) {
+        impl::evict_pool & ep = p.evict_pools[(size_t) epid];
+        const int64_t      key = ((int64_t) il << 32) | (uint32_t) id;
+        const int32_t      eslot = p.evict_put(epid, key);
+        for (int r = 0; r < 3; ++r) {
+            const size_t len = p.layer_regions[il][r].stride;
+            if (len == 0) {
+                continue;
+            }
+            std::memcpy(ep.data[r] + (size_t) eslot * ep.stride[r],
+                        pool.data[r] + (size_t) slot * pool.slot_stride[r], len);
+        }
+        p.n_l2_demotions++;
+        p.evict_populated = true;
+    }
+
     c.resident_slot[id]   = -1;
     c.resident_filled[id] = 0;
-    impl::cache_pool & pool = p.pools[c.pool];
     pool.free_slots.push_back(slot);
 #else
     GGML_UNUSED(il);
@@ -1398,6 +1740,13 @@ void llama_disk_stage::vram_commit(int il, int32_t id) {
         return;
     }
     c.vram[id] = 1;
+
+    // served from VRAM now: drop a stale L2 copy
+    const int epid = p.evict_pool_for(il);
+    if (epid >= 0) {
+        p.evict_remove(epid, ((int64_t) il << 32) | (uint32_t) id);
+    }
+
     impl::cache_pool & pool = p.pools[c.pool];
     ((int32_t *) c.table->data)[id] = pool.sentinel;
 

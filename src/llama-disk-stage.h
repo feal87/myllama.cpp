@@ -131,6 +131,11 @@ public:
 
     bool is_active() const;
 
+    // print the L2 eviction-pool stats (hits/misses, disk bytes the pool saved).
+    // The pool reuses the prefill staging slabs during decode; no-op when the
+    // pool is disabled. Called from the shared --experts-stats-interval report.
+    void print_stats() const;
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
