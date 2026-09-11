@@ -1710,6 +1710,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--slot-ckpt-disk"},
+        {"--no-slot-ckpt-disk"},
+        "snapshot a context checkpoint at every prefill batch, and drop the user-message and near-prompt-end batch breaks (set -b == -ub for one checkpoint per ubatch)",
+        [](common_params & params, bool value) {
+            params.slot_ckpt_disk = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_CKPT_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--seq-rm-type"}, "TYPE",
         "how the context removes tokens from a sequence (default: auto)\n"
         "- auto: probe the context at load with a 2-token decode (exact, but reads the expert weights on a disk-backed model)\n"

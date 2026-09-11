@@ -1492,6 +1492,15 @@ private:
             SRV_TRC("%s", "context checkpoints disabled\n");
         }
 
+        if (params_base.slot_ckpt_disk) {
+            if (params_base.n_batch != params_base.n_ubatch) {
+                SRV_WRN("--slot-ckpt-disk: n_batch (%d) != n_ubatch (%d), checkpoints land on batch boundaries, not ubatch boundaries\n",
+                        params_base.n_batch, params_base.n_ubatch);
+            } else {
+                SRV_TRC("--slot-ckpt-disk: one checkpoint per prefilled batch (n_batch == n_ubatch == %d)\n", params_base.n_batch);
+            }
+        }
+
         if (!params_base.model_alias.empty()) {
             // backward compat: use first alias as model name
             model_name = *params_base.model_alias.begin();
@@ -2439,7 +2448,7 @@ private:
         for (auto it = slot.prompt.checkpoints.begin();
                 slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
                 it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
+            if (!params_base.slot_ckpt_disk && it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
@@ -3481,6 +3490,11 @@ private:
                                             if (cur.pos_max > pos_next) {
                                                 return false;
                                             }
+                                            // exact match: the checkpoint covers the whole common prefix
+                                            if (params_base.slot_ckpt_disk && cur.n_tokens == n_past) {
+                                                SLT_TRC(slot, "exact-match checkpoint accepted (n_tokens = %" PRId64 ")\n", cur.n_tokens);
+                                                return true;
+                                            }
                                             return cur.pos_min < pos_min_thold || cur.pos_min == 0;
                                         }
                                     );
@@ -3670,7 +3684,7 @@ private:
                         slot.prompt.tokens.push_back(cur_tok);
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
+                        if (!params_base.slot_ckpt_disk && do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
@@ -3684,7 +3698,7 @@ private:
                         //  - 4 + n_ubatch
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        if (do_checkpoint) {
+                        if (!params_base.slot_ckpt_disk && do_checkpoint) {
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
                             bool should_break = false;
@@ -3727,7 +3741,7 @@ private:
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        if (!params_base.slot_ckpt_disk && !is_user_start && !near_prompt_end) {
                             do_checkpoint = false;
                         }
                     }
@@ -3746,6 +3760,7 @@ private:
 
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
+                            params_base.slot_ckpt_disk ||
                             slot.prompt.checkpoints.empty() ||
                             is_last_user_message || near_prompt_end ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
@@ -3952,6 +3967,15 @@ private:
                     slot.release();
                     slot.i_batch = -1;
                     return;
+                }
+
+                // end-of-prompt checkpoint: lets a later request resume from the exact prompt end
+                if (params_base.slot_ckpt_disk && params_base.n_ctx_checkpoints > 0) {
+                    const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                    const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                    if (pos_min >= 0) {
+                        create_checkpoint(slot, 0, pos_min, pos_max);
+                    }
                 }
 
                 GGML_ASSERT(slot.task->need_sampling());
