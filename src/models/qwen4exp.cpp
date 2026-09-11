@@ -24,6 +24,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <malloc.h>
 #include <windows.h>
 #endif
 
@@ -57,7 +58,7 @@ static HANDLE ple_open_file(const std::string & path) {
 
     return CreateFileW(wide_path.data(), GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_OVERLAPPED, nullptr);
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
 }
 
 struct ple_win_handle {
@@ -173,13 +174,127 @@ struct llama_model_qwen4exp::ple_direct_reader {
 private:
     void run_range(const std::vector<std::pair<int32_t, int32_t>> & pairs,
                    int64_t begin, int64_t end, float * dst) const {
-        std::vector<uint8_t> bounce(row_size);
 #ifdef _WIN32
-        ple_win_handle event{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
-        if (event.handle == nullptr) {
-            throw std::runtime_error(format("PLE direct read event creation failed: %s", ple_win_error(GetLastError()).c_str()));
+        // the handle is FILE_FLAG_NO_BUFFERING (same flags as the disk-stage slab
+        // reads), so every read must be sector-aligned in offset, length AND buffer.
+        // Keep `qd` reads in flight: one 4 KiB read at a time leaves the gather
+        // latency bound (128 KiB in flight gives ~840 MB/s), qd of 8 per worker
+        // matches the slab's queue depth and reaches disk bandwidth
+        constexpr size_t sector = 4096;
+        constexpr int    qd     = 8;
+
+        struct flight {
+            OVERLAPPED ov;
+            HANDLE     ev      = nullptr;
+            uint8_t *  buf     = nullptr;
+            size_t     cap     = 0;
+            size_t     head    = 0;
+            size_t     rlen    = 0;
+            int64_t    run_beg = 0;
+            int64_t    run_end = 0; // inclusive
+        };
+
+        flight f[qd];
+        int issued = 0; // reads issued in the current window
+        try {
+            for (int r = 0; r < qd; ++r) {
+                f[r].ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+                if (f[r].ev == nullptr) {
+                    throw std::runtime_error(format("PLE direct read event creation failed: %s", ple_win_error(GetLastError()).c_str()));
+                }
+            }
+
+            for (int64_t i = begin; i < end; ) {
+                int nr = 0;
+                int64_t k = i;
+                while (nr < qd && k < end) {
+                    int64_t j = k;
+                    while (j + 1 < end && pairs[j + 1].first == pairs[k].first) {
+                        ++j; // dedup: one read serves the whole run
+                    }
+                    f[nr].run_beg = k;
+                    f[nr].run_end = j;
+                    ++nr;
+                    k = j + 1;
+                }
+
+                // issue the whole window before reaping any of it
+                issued = 0;
+                for (int r = 0; r < nr; ++r) {
+                    const size_t off  = base + (size_t) pairs[f[r].run_beg].first * row_size;
+                    const size_t aoff = off & ~(sector - 1);
+                    f[r].head = off - aoff;
+                    f[r].rlen = (f[r].head + row_size + sector - 1) & ~(sector - 1);
+
+                    if (f[r].cap < f[r].rlen) {
+                        _aligned_free(f[r].buf);
+                        f[r].buf = (uint8_t *) _aligned_malloc(f[r].rlen, sector);
+                        if (f[r].buf == nullptr) {
+                            throw std::runtime_error("PLE direct read bounce buffer allocation failed");
+                        }
+                        f[r].cap = f[r].rlen;
+                    }
+
+                    f[r].ov           = {};
+                    f[r].ov.hEvent    = f[r].ev;
+                    f[r].ov.Offset    = (DWORD) aoff;
+                    f[r].ov.OffsetHigh = (DWORD) (aoff >> 32);
+                    ResetEvent(f[r].ev);
+
+                    DWORD n_read = 0;
+                    if (!ReadFile(handle, f[r].buf, (DWORD) f[r].rlen, &n_read, &f[r].ov)) {
+                        const DWORD error = GetLastError();
+                        if (error != ERROR_IO_PENDING) {
+                            throw std::runtime_error(format("PLE direct read of %zu bytes at file offset %zu failed: %s",
+                                    f[r].rlen, aoff, ple_win_error(error).c_str()));
+                        }
+                    }
+                    ++issued;
+                }
+
+                for (int r = 0; r < nr; ++r) {
+                    DWORD n_read = 0;
+                    if (!GetOverlappedResult(handle, &f[r].ov, &n_read, TRUE)) {
+                        throw std::runtime_error(format("PLE direct read of %zu bytes failed: %s",
+                                f[r].rlen, ple_win_error(GetLastError()).c_str()));
+                    }
+                    if (n_read < f[r].head + row_size) {
+                        throw std::runtime_error(format("PLE direct read of %zu bytes failed: unexpected EOF", f[r].rlen));
+                    }
+
+                    float * first = dst + (size_t) pairs[f[r].run_beg].second * head_dim;
+                    if (to_float) {
+                        to_float(f[r].buf + f[r].head, first, head_dim);
+                    } else {
+                        memcpy(first, f[r].buf + f[r].head, (size_t) head_dim * sizeof(float));
+                    }
+                    for (int64_t kk = f[r].run_beg + 1; kk <= f[r].run_end; ++kk) {
+                        memcpy(dst + (size_t) pairs[kk].second * head_dim, first, (size_t) head_dim * sizeof(float));
+                    }
+                }
+
+                i = k;
+            }
+        } catch (...) {
+            // drain the reads already issued before the buffers they land in go away
+            for (int r = 0; r < issued; ++r) {
+                DWORD n_read = 0;
+                GetOverlappedResult(handle, &f[r].ov, &n_read, TRUE);
+            }
+            for (int r = 0; r < qd; ++r) {
+                _aligned_free(f[r].buf);
+                if (f[r].ev != nullptr) {
+                    CloseHandle(f[r].ev);
+                }
+            }
+            throw;
         }
-#endif
+        for (int r = 0; r < qd; ++r) {
+            _aligned_free(f[r].buf);
+            CloseHandle(f[r].ev);
+        }
+#else
+        std::vector<uint8_t> bounce(row_size);
         for (int64_t i = begin; i < end; ) {
             int64_t j = i;
             while (j + 1 < end && pairs[j + 1].first == pairs[i].first) {
@@ -187,34 +302,6 @@ private:
             }
             const size_t off = base + (size_t) pairs[i].first * row_size;
             for (size_t done = 0; done < row_size; ) {
-#ifdef _WIN32
-                const DWORD request = (DWORD) std::min<size_t>(row_size - done, MAXDWORD);
-                const uint64_t read_offset = (uint64_t) off + done;
-                OVERLAPPED overlapped = {};
-                overlapped.hEvent = event.handle;
-                overlapped.Offset = (DWORD) read_offset;
-                overlapped.OffsetHigh = (DWORD) (read_offset >> 32);
-                ResetEvent(event.handle);
-
-                DWORD n_read = 0;
-                if (!ReadFile(handle, bounce.data() + done, request, &n_read, &overlapped)) {
-                    const DWORD error = GetLastError();
-                    if (error != ERROR_IO_PENDING) {
-                        throw std::runtime_error(format("PLE direct read of %zu bytes at file offset %zu failed: %s",
-                                row_size, off, ple_win_error(error).c_str()));
-                    }
-                }
-                if (!GetOverlappedResult(handle, &overlapped, &n_read, TRUE)) {
-                    const DWORD error = GetLastError();
-                    throw std::runtime_error(format("PLE direct read of %zu bytes at file offset %zu failed: %s",
-                            row_size, off, ple_win_error(error).c_str()));
-                }
-                if (n_read == 0) {
-                    throw std::runtime_error(format("PLE direct read of %zu bytes at file offset %zu failed: unexpected EOF",
-                            row_size, off));
-                }
-                done += n_read;
-#else
                 const ssize_t n_read = ::pread(fd, bounce.data() + done, row_size - done, off + done);
                 if (n_read < 0 && errno == EINTR) {
                     continue; // interrupted by a signal without SA_RESTART
@@ -224,7 +311,6 @@ private:
                             row_size, off, n_read == 0 ? "unexpected EOF" : strerror(errno)));
                 }
                 done += n_read;
-#endif
             }
             float * first = dst + (size_t) pairs[i].second * head_dim;
             if (to_float) {
@@ -237,6 +323,7 @@ private:
             }
             i = j + 1;
         }
+#endif
     }
 };
 
@@ -1496,8 +1583,13 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     }
 
     if (pmodel.ple_reader) {
+        const int64_t t_gather = ggml_time_us();
         staging.resize(idx.size() * pmodel.ple_reader->head_dim * sizeof(float));
         pmodel.ple_reader->gather(idx.data(), (int64_t) idx.size(), (float *) staging.data());
+        LLAMA_LOG_DEBUG("%s: PLE gather %" PRId64 " rows x %" PRId64 " dims for %" PRId64 " token(s): %.1f MiB F32 in %.2f ms\n",
+                        __func__, (int64_t) idx.size(), pmodel.ple_reader->head_dim, n_tokens,
+                        (double) idx.size() * pmodel.ple_reader->head_dim * sizeof(float) / (1024.0 * 1024.0),
+                        (ggml_time_us() - t_gather) / 1000.0);
         ggml_backend_tensor_set(data, staging.data(), 0, staging.size());
     } else {
         ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));

@@ -1804,7 +1804,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 t->data   = scratch + off;
                 off += align4k(ggml_backend_buft_get_alloc_size(buft, t));
             }
-            LLAMA_LOG_INFO("%s: reserved %.2f GiB of address space at %p for %s weights\n",
+            LLAMA_LOG_DEBUG("%s: reserved %.2f GiB of address space at %p for %s weights\n",
                            __func__, total / (1024.0 * 1024.0 * 1024.0), (void *) scratch, ggml_backend_buft_name(buft));
             bufs.emplace_back(buf);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {

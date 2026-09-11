@@ -13,12 +13,6 @@
 #include <string>
 #include <vector>
 
-static bool env_flag_on(const char * name) {
-    const char * v = std::getenv(name);
-    return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0 &&
-           std::strcmp(v, "off") != 0 && std::strcmp(v, "no") != 0;
-}
-
 llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
                                                int32_t             n_pin_experts,
                                                uint64_t            budget_bytes,
@@ -33,7 +27,6 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
     decay_interval(decay_interval),
     min_pin_count(min_pin_count),
     prefetch_enabled(prefetch_enabled),
-    prefetch_layer_ahead(env_flag_on("LLAMA_PREFETCH_LAYER_AHEAD")),
     track_rank(track_rank) {
     // Count MoE layers by checking which layers have ffn_down_exps.weight
     int32_t n_moe_layers = 0;
@@ -107,10 +100,6 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
     }
     if (decay_interval > 0) {
         LLAMA_LOG_INFO("%s: halving all usage counts every %" PRIu64 " decode tokens\n", __func__, decay_interval);
-    }
-    if (prefetch_layer_ahead) {
-        LLAMA_LOG_INFO("%s: prefill read-ahead targets the whole next layer (LLAMA_PREFETCH_LAYER_AHEAD, ubatches >= %" PRId64 " tokens)\n",
-                       __func__, prefetch_layer_ahead_min_tokens);
     }
 
 }
@@ -347,7 +336,7 @@ void llama_hot_expert_cache::observe(int il, const struct ggml_tensor * t) {
         // host rows too. Dedupe first: prompt-processing batches route hundreds
         // of experts per layer and a duplicate would append the same rows once
         // per token.
-        if (prefetch_enabled && n_tokens > 1 && !prefetch_layer_ahead && disk_stage == nullptr) {
+        if (prefetch_enabled && n_tokens > 1 && disk_stage == nullptr) {
             // dedupe in place: prompt-processing batches route hundreds of experts
             // per layer and a duplicate would append the same rows once per token
             int32_t * b = obs_scratch.data();
@@ -366,13 +355,6 @@ void llama_hot_expert_cache::observe(int il, const struct ggml_tensor * t) {
             }
         }
     }  // lock released here
-
-    if (prefetch_enabled && n_tokens > 1 && prefetch_layer_ahead && n_tokens >= prefetch_layer_ahead_min_tokens) {
-        // read the whole next layer one step ahead of its demand faults; layer 0
-        // is issued by on_ubatch_begin()
-        prefetch_layer(il + 1);
-        return;
-    }
 
     if (!prefetch_ranges.empty()) {
         n_prefetch_calls++;
@@ -1091,50 +1073,6 @@ size_t llama_hot_expert_cache::add_expert_ranges(const layer_state &            
     return nbytes;
 }
 
-void llama_hot_expert_cache::prefetch_layer(int il) {
-    if (il < 0 || il >= (int) model.hparams.n_layer()) {
-        return;
-    }
-
-    std::vector<std::pair<const void *, size_t>> ranges;
-    uint64_t bytes = 0;
-    {
-        std::lock_guard<std::mutex> lock(mu);
-
-        layer_state & ls = layers[il];
-        if (!ls.resolved_tensors) {
-            resolve_tensors(il, ls);
-        }
-        if (!ls.tensors_are_host) {
-            return;
-        }
-
-        const ggml_tensor * ws[] = { ls.t_gate, ls.t_up, ls.t_down, ls.t_gate_up };
-        for (const ggml_tensor * w : ws) {
-            if (w == nullptr || !ggml_backend_buffer_is_host(w->buffer) || w->data == nullptr || w->ne[2] <= 0) {
-                continue;
-            }
-            // nb[2] * ne[2] covers the full extent of the tensor in the mapping,
-            // padding between experts included
-            const size_t extent = (size_t) w->nb[2] * (size_t) w->ne[2];
-            if (extent == 0) {
-                continue;
-            }
-            ranges.emplace_back(w->data, extent);
-            bytes += extent;
-        }
-        if (ranges.empty()) {
-            return;
-        }
-    }
-
-    n_prefetch_calls++;
-    n_prefetch_bytes += bytes;
-    if (!llama_mmap::prefetch(ranges)) {
-        n_prefetch_failures++;
-    }
-}
-
 void llama_hot_expert_cache::on_ubatch_begin(int64_t n_tokens) {
     n_ubatches++;
     n_tokens_cur = n_tokens;
@@ -1145,9 +1083,6 @@ void llama_hot_expert_cache::on_ubatch_begin(int64_t n_tokens) {
     // neither count nor age the ranking - the pinned experts stay exactly as
     // generation left them while prefill runs.
     if (n_tokens != 1) {
-        if (prefetch_enabled && prefetch_layer_ahead && n_tokens >= prefetch_layer_ahead_min_tokens) {
-            prefetch_layer(0);
-        }
         return;
     }
 
