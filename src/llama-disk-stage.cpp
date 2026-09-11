@@ -815,9 +815,9 @@ void llama_disk_stage::fill_run(int il) {
     };
 
     std::vector<disk_stage_job> jobs;
-    std::vector<cache_copy>     copies;
+    std::vector<cache_copy>     copies;  // whole residents, served from the cache
+    std::vector<cache_copy>     patches; // the bytes an aligned read overruns into a neighbour
 
-    const int64_t t0   = ggml_time_us();
     const int64_t cpu0 = disk_stage_thread_cpu_us();
 
     {
@@ -885,6 +885,25 @@ void llama_disk_stage::fill_run(int il) {
                     const size_t len = std::min(disk_stage_chunk, rlen - done);
                     jobs.push_back({ r.file->h, dst + done, aoff + done, len });
                 }
+
+                // The aligned read starts `prefix` bytes before the run and ends up
+                // to one sector past it, so it overruns the tail of the preceding
+                // resident and the head of the following one. Restore both from the
+                // cache once the reads are done: that is what frees the resident
+                // copies to run while the drive is busy instead of after it.
+                if (prefix > 0 && id > 0 && resident(id - 1)) {
+                    const size_t slot = (size_t) c->resident_slot[id - 1];
+                    patches.push_back({ c->data[role] + slot * c->r[role].slot_stride + (stride - prefix),
+                                        slab + (size_t) id * stride - prefix, prefix });
+                }
+                if (last < n_expert && resident(last)) {
+                    const size_t over = (size_t) ((dst + rlen) - (slab + (size_t) last * stride));
+                    if (over > 0 && over <= stride) {
+                        const size_t slot = (size_t) c->resident_slot[last];
+                        patches.push_back({ c->data[role] + slot * c->r[role].slot_stride,
+                                            slab + (size_t) last * stride, over });
+                    }
+                }
                 id = last;
             }
         }
@@ -894,31 +913,66 @@ void llama_disk_stage::fill_run(int il) {
             disk_bytes += j.len;
         }
 
-        {
+        size_t copy_bytes = 0;
+        for (const cache_copy & cp : copies) {
+            copy_bytes += cp.len;
+        }
+        size_t patch_bytes = 0;
+        for (const cache_copy & cp : patches) {
+            patch_bytes += cp.len;
+        }
+
+        // every read now writes bytes the copies do not own (the overruns into
+        // the neighbours are patched below), so the copies can run on a second
+        // thread while the drive is busy
+        std::thread copier;
+        if (!copies.empty()) {
+            try {
+                copier = std::thread([&copies]() {
+                    for (const cache_copy & cp : copies) {
+                        std::memcpy(cp.dst, cp.src, cp.len);
+                    }
+                });
+            } catch (...) {
+                // no thread: the copies are done inline below
+            }
+        }
+
+        const int64_t t1 = ggml_time_us();
+        try {
             // the pin worker reads through the same completion port, so only one
             // batch may be reaped at a time
             std::lock_guard<std::mutex> io(p.io_mu);
             disk_stage_run_jobs(jobs, queue_depth, p.iocp);
+        } catch (...) {
+            if (copier.joinable()) {
+                copier.join();
+            }
+            throw;
+        }
+        const int64_t t2 = ggml_time_us();
+
+        if (copier.joinable()) {
+            copier.join();
+        } else {
+            for (const cache_copy & cp : copies) {
+                std::memcpy(cp.dst, cp.src, cp.len);
+            }
         }
 
-        const int64_t t1 = ggml_time_us();
-
-        // last: a sector-aligned run read overruns the next expert's head by up
-        // to one sector, and these copies restore those bytes
-        size_t copy_bytes = 0;
-        for (const cache_copy & cp : copies) {
+        // last, so it is final: restore the bytes the aligned reads overran
+        for (const cache_copy & cp : patches) {
             std::memcpy(cp.dst, cp.src, cp.len);
-            copy_bytes += cp.len;
         }
 
         if (disk_stage_trace()) {
-            const double s_read = (t1 - t0) / 1e6;
-            const double s_copy = (ggml_time_us() - t1) / 1e6;
-            LLAMA_LOG_INFO("%s: layer %d fill: %.1f MiB read in %.1f ms (cpu %.1f ms) = %.2f GB/s + %.1f MiB copied in %.1f ms\n",
+            const double s_read = (t2 - t1) / 1e6;
+            const double s_all  = (ggml_time_us() - t1) / 1e6;
+            LLAMA_LOG_INFO("%s: layer %d fill: %.1f MiB read in %.1f ms (cpu %.1f ms) = %.2f GB/s + %.1f MiB copied + %.1f MiB patched, total %.1f ms\n",
                            __func__, il, disk_bytes / (1024.0 * 1024.0), s_read * 1000.0,
                            (disk_stage_thread_cpu_us() - cpu0) / 1000.0,
                            s_read > 0 ? disk_bytes / (s_read * 1e9) : 0.0,
-                           copy_bytes / (1024.0 * 1024.0), s_copy * 1000.0);
+                           copy_bytes / (1024.0 * 1024.0), patch_bytes / (1024.0 * 1024.0), s_all * 1000.0);
         }
     }
 #else
