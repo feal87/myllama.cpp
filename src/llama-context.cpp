@@ -737,7 +737,12 @@ void llama_context::sched_reserve() {
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    // keep the scheduler across re-reserves: ggml-alloc reuses a buffer that is already
+    // large enough and only reallocates the ones that grew, while a new scheduler frees
+    // and reallocates every compute buffer at the same size
+    if (!sched) {
+        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
