@@ -251,8 +251,24 @@ Open follow-up: none; the configuration is covered by B.
 
 ### C. Performance
 
-6. Slab fill: skip resident experts (memcpy from the cache) instead of re-reading
-   them from disk.
+6. Done. `fill_run` copies each filled RAM resident from its decode-cache slot
+   into the slab and reads only the runs of non-resident experts from the file.
+   The reads run first and the copies after: a sector-aligned run read overruns
+   the next expert's head by up to one sector, and the copy restores those bytes.
+   The pool reserves one sector after each role region so a tail cannot reach
+   into the next region. An expert served by the VRAM cache has no RAM slot
+   (`vram_commit` freed it), and a promoted-but-unread resident has no data, so
+   both are read normally. Measured at 285 residents/layer (55.7%): the read
+   drops from 1950 to 864 MiB, the copy is 1086 MiB at ~18 GB/s, and prefill goes
+   162 -> 202 t/s. A strided read is slower per byte (6.4-7.1 GB/s against 7.46
+   sequential), so the win is smaller than the byte count suggests.
+
+   Past this point prefill is PCIe-upload-bound, not disk-bound: the offloaded
+   slab is ~2045 MB/layer and the full slab is re-uploaded once per ubatch, so
+   the disk only has to sustain ~4.3 GB/s and sits idle the rest of the time.
+   Everything that dominates prefill is per-ubatch, so the tok/s scales as
+   1/ubatch-size - a bigger `--ubatch-size` is the next lever, not further work
+   on the fill.
 7. Double buffering: read layer `i+1` while layer `i` computes and copies.
 8. Decode already reads only the experts missing from the cache: resident slots
    are kept across tokens and only new ids are read into transient slots. A
@@ -273,7 +289,37 @@ Open follow-up: none; the configuration is covered by B.
    is not the cause either. What remains is a START-OF-UBATCH effect on the
    first ~3 layer reads; the likely causes are the reader thread being
    CPU-starved while the main thread runs ubatch setup, or the drive queue not
-   yet ramped. Not yet isolated.
+   yet ramped.
+
+   SOLVED. It is the PLE direct-read handle. It was opened BUFFERED
+   (`FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_OVERLAPPED`); a buffered handle on the
+   model volume throttles the unbuffered slab reads to ~3 GB/s for the first
+   ~1.5 s after the PLE is touched, i.e. at the start of every ubatch - hence the
+   per-ubatch reset, and hence layer 0 being slow in every ubatch, not just the
+   first. Opening the PLE file with the SAME flags as the slab handle
+   (`FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED`, no RANDOM_ACCESS) and doing
+   sector-aligned row reads makes every layer fill at 7.45 GB/s. It is the
+   buffering, not RANDOM_ACCESS: buffered without RANDOM_ACCESS is still slow.
+
+   Ruled out along the way, all with the exact llama flags, pinned destination,
+   IOCP reaping, the same file and the same 1950 MiB slab: drive/OS idle ramp
+   (150 s idle still 7.2-7.5 GB/s), reader CPU starvation (15 spinning threads,
+   7.20), a concurrent host->device copy (7.21), file offset (the tail reads at
+   7.4 in isolation), and the PLE I/O volume (32 rows = 0.08 MiB, and skipping
+   the gather entirely does not help). The harness is
+   `F:\LLM\iodiag\rampdiag.cpp` (per-slab timing, `--idle-s`, `--cpu-load`,
+   `--dma-mb`, `--start-mb`, `--pin`, `--iocp`).
+
+   Cost of the fix: the aligned read pulls one 4 KiB sector per 120-byte PLE row
+   (up to 8 KiB when the row straddles a boundary), so a large prefill reads a
+   few GiB more than the buffered path, a small fraction of the ~91 GiB of slab
+   reads per ubatch.
+
+   The gather also keeps 8 reads in flight per worker. One 4 KiB read at a time
+   is latency bound: 32 workers x 1 read = 128 KiB in flight = ~840 MB/s, so
+   every decode step paid ~2.5 ms and every 512-token ubatch ~40 ms. With qd=8
+   the same reads reach ~4.2 GB/s (measured 8192 rows in 8 ms, 16 rows in
+   0.27 ms). Still only ~0.2% of prefill, but ~2 ms off every decode step.
 9b. The ranking can be slower than the old first-come fill on SHORT runs (the
     first-come set is already close to hot, and the policy pays a warm-up plus
     churn). A long baseline is needed to see whether it wins; see item 13. The

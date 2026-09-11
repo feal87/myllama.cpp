@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -380,7 +381,9 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     size_t per_buffer = 0; // one layer's worth, all roles
     for (const auto & role : roles) {
         region_off[role.slot] = per_buffer;
-        per_buffer += region_len[role.slot];
+        // one sector of slack: a run read is sector-aligned and can overrun the
+        // region end into the next role's region
+        per_buffer += region_len[role.slot] + disk_stage_align;
     }
 
     // two buffers so the read of layer i+1 overlaps the compute of layer i;
@@ -771,6 +774,30 @@ void llama_disk_stage::fill(int il) {
 #endif
 }
 
+static bool disk_stage_trace() {
+    static const bool on = [] {
+        const char * v = std::getenv("LLAMA_DISK_STAGE_TRACE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
+}
+
+#if defined(_WIN32)
+// cpu time of the CALLING thread, to tell a slow read from a descheduled thread
+static int64_t disk_stage_thread_cpu_us() {
+    FILETIME c, e, k, u;
+    if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) {
+        return 0;
+    }
+    ULARGE_INTEGER kk, uu;
+    kk.LowPart = k.dwLowDateTime; kk.HighPart = k.dwHighDateTime;
+    uu.LowPart = u.dwLowDateTime; uu.HighPart = u.dwHighDateTime;
+    return (int64_t) ((kk.QuadPart + uu.QuadPart) / 10);
+}
+#else
+static int64_t disk_stage_thread_cpu_us() { return 0; }
+#endif
+
 void llama_disk_stage::fill_run(int il) {
 #if defined(_WIN32)
     impl & p = *pimpl;
@@ -778,38 +805,122 @@ void llama_disk_stage::fill_run(int il) {
         return;
     }
 
-    std::vector<disk_stage_job> jobs;
-    for (const impl::region & r : p.layer_regions[il]) {
-        char * dst = p.base + r.pool_off;
-        for (size_t done = 0; done < r.read_len; done += disk_stage_chunk) {
-            const size_t len = std::min(disk_stage_chunk, r.read_len - done);
-            jobs.push_back({ r.file->h, dst + done, r.file_off + done, len });
-        }
-    }
-
-    // queue depth 32 matches the diskspd measurement that saturated the drive
+    // the queue depth that saturated the drive in the diskspd measurement
     const int queue_depth = 32;
 
-    size_t bytes = 0;
-    for (const disk_stage_job & j : jobs) {
-        bytes += j.len;
-    }
+    struct cache_copy {
+        const char * src;
+        char *       dst;
+        size_t       len;
+    };
 
-    const int64_t t0 = ggml_time_us();
+    std::vector<disk_stage_job> jobs;
+    std::vector<cache_copy>     copies;
+
+    const int64_t t0   = ggml_time_us();
+    const int64_t cpu0 = disk_stage_thread_cpu_us();
+
     {
-        // the pin worker reads through the same completion port, so only one
-        // batch may be reaped at a time
-        std::lock_guard<std::mutex> io(p.io_mu);
-        disk_stage_run_jobs(jobs, queue_depth, p.iocp);
-    }
-    const int64_t t1 = ggml_time_us();
+        // the resident set only moves on a single-token ubatch, so it is stable
+        // for a whole prefill; the lock also keeps a slot from being reused
+        // while the reads below are in flight
+        std::lock_guard<std::mutex> lock(p.cache_mu);
 
-    // one line per layer: the raw fill rate, separate from the prefill average
-    // (the disk is idle while the offload copies the staged layer into VRAM)
-    const double secs = (t1 - t0) / 1e6;
-    LLAMA_LOG_INFO("%s: layer %d fill: %.1f MiB in %.1f ms = %.2f GB/s (qd=%d)\n",
-                   __func__, il, bytes / (1024.0 * 1024.0), secs * 1000.0,
-                   secs > 0 ? bytes / (secs * 1e9) : 0.0, queue_depth);
+        const impl::cache_layer * c = nullptr;
+        if (il < (int) p.cache.size() && p.cache[il].gate != nullptr) {
+            c = &p.cache[il];
+        }
+
+        for (int role = 0; role < (int) p.layer_regions[il].size(); ++role) {
+            const impl::region & r = p.layer_regions[il][role];
+
+            const size_t  stride   = c != nullptr ? c->r[role].stride : 0;
+            const int32_t n_expert = c != nullptr ? (int32_t) c->resident_slot.size() : 0;
+
+            if (stride == 0 || n_expert <= 0) {
+                // no decode cache for this layer: read the whole region
+                char * dst = p.base + r.pool_off;
+                for (size_t done = 0; done < r.read_len; done += disk_stage_chunk) {
+                    const size_t len = std::min(disk_stage_chunk, r.read_len - done);
+                    jobs.push_back({ r.file->h, dst + done, r.file_off + done, len });
+                }
+                continue;
+            }
+
+            // a resident expert already sits in the cache's CPU memory, so copy
+            // it instead of reading it again. An expert served by the VRAM cache
+            // has no RAM slot (vram_commit freed it), so it is read like any
+            // non-resident. A promoted-but-unread resident must be read too
+            auto resident = [&](int32_t id) {
+                return c->resident_slot[id] >= 0 && c->resident_filled[id] != 0 && c->vram[id] == 0;
+            };
+
+            char * slab = p.base + r.pool_off + r.head;
+
+            int32_t id = 0;
+            while (id < n_expert) {
+                if (resident(id)) {
+                    const size_t slot = (size_t) c->resident_slot[id];
+                    copies.push_back({ c->data[role] + slot * c->r[role].slot_stride,
+                                       slab + (size_t) id * stride, stride });
+                    ++id;
+                    continue;
+                }
+
+                int32_t last = id;
+                while (last < n_expert && !resident(last)) {
+                    ++last;
+                }
+
+                // one aligned read covers the whole run. It starts where the
+                // previous resident ended, so the destination carries the same
+                // alignment prefix the whole-region read had
+                const size_t start  = r.file_off + r.head + (size_t) id * stride;
+                const size_t aoff   = start & ~(disk_stage_align - 1);
+                const size_t prefix = start - aoff;
+                const size_t rlen   = align_up(prefix + (size_t) (last - id) * stride, disk_stage_align);
+                char *       dst    = slab + (size_t) id * stride - prefix;
+
+                for (size_t done = 0; done < rlen; done += disk_stage_chunk) {
+                    const size_t len = std::min(disk_stage_chunk, rlen - done);
+                    jobs.push_back({ r.file->h, dst + done, aoff + done, len });
+                }
+                id = last;
+            }
+        }
+
+        size_t disk_bytes = 0;
+        for (const disk_stage_job & j : jobs) {
+            disk_bytes += j.len;
+        }
+
+        {
+            // the pin worker reads through the same completion port, so only one
+            // batch may be reaped at a time
+            std::lock_guard<std::mutex> io(p.io_mu);
+            disk_stage_run_jobs(jobs, queue_depth, p.iocp);
+        }
+
+        const int64_t t1 = ggml_time_us();
+
+        // last: a sector-aligned run read overruns the next expert's head by up
+        // to one sector, and these copies restore those bytes
+        size_t copy_bytes = 0;
+        for (const cache_copy & cp : copies) {
+            std::memcpy(cp.dst, cp.src, cp.len);
+            copy_bytes += cp.len;
+        }
+
+        if (disk_stage_trace()) {
+            const double s_read = (t1 - t0) / 1e6;
+            const double s_copy = (ggml_time_us() - t1) / 1e6;
+            LLAMA_LOG_INFO("%s: layer %d fill: %.1f MiB read in %.1f ms (cpu %.1f ms) = %.2f GB/s + %.1f MiB copied in %.1f ms\n",
+                           __func__, il, disk_bytes / (1024.0 * 1024.0), s_read * 1000.0,
+                           (disk_stage_thread_cpu_us() - cpu0) / 1000.0,
+                           s_read > 0 ? disk_bytes / (s_read * 1e9) : 0.0,
+                           copy_bytes / (1024.0 * 1024.0), s_copy * 1000.0);
+        }
+    }
 #else
     GGML_UNUSED(il);
 #endif
