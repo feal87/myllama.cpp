@@ -1,5 +1,6 @@
 #include "server-context.h"
 #include "server-chat.h"
+#include "server-ckpt-store.h"
 #include "server-common.h"
 #include "server-http.h"
 #include "server-task.h"
@@ -1013,6 +1014,8 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    std::unique_ptr<server_ckpt_store> ckpt_store;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1498,6 +1501,24 @@ private:
                         params_base.n_batch, params_base.n_ubatch);
             } else {
                 SRV_TRC("--slot-ckpt-disk: one checkpoint per prefilled batch (n_batch == n_ubatch == %d)\n", params_base.n_batch);
+            }
+
+            if (!cache_disk_enabled) {
+                SRV_WRN("%s", "--slot-ckpt-disk needs --cache-disk PATH, keeping checkpoints in RAM\n");
+            } else {
+                const bool use_dio = params_base.load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
+                const size_t max_bytes = params_base.cache_disk_max_mib >= 0
+                    ? (size_t) params_base.cache_disk_max_mib * 1024 * 1024
+                    : 0;
+
+                ckpt_store = std::make_unique<server_ckpt_store>(
+                    params_base.cache_disk_path,
+                    server_prompt_cache_key(params_base, ctx_tgt, ctx_dft),
+                    use_dio,
+                    max_bytes);
+
+                SRV_TRC("slot checkpoint store on disk: %s (dio = %d, max = %zu MiB)\n",
+                        params_base.cache_disk_path.c_str(), (int) use_dio, max_bytes / (1024 * 1024));
             }
         }
 
@@ -2441,6 +2462,20 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
+        // an empty list at creation means the previous prompt was cleared: the old
+        // session's file stays for the fallback search, the next append starts a new one
+        if (ckpt_store && slot.prompt.checkpoints.empty()) {
+            ckpt_store->finalize(slot.id);
+            ckpt_store->print_stats();
+        }
+
+        auto erase_ckpt = [&](std::list<common_prompt_checkpoint>::iterator it) {
+            if (ckpt_store && it->on_disk) {
+                ckpt_store->release(slot.id, it->off_tgt);
+            }
+            return slot.prompt.checkpoints.erase(it);
+        };
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
@@ -2452,7 +2487,7 @@ private:
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
-                it = slot.prompt.checkpoints.erase(it);
+                it = erase_ckpt(it);
                 continue;
             }
 
@@ -2467,7 +2502,7 @@ private:
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            erase_ckpt(slot.prompt.checkpoints.begin());
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
@@ -2476,7 +2511,7 @@ private:
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if (it->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
-                    it = slot.prompt.checkpoints.erase(it);
+                    it = erase_ckpt(it);
                 } else {
                     ++it;
                 }
@@ -2492,7 +2527,36 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (ckpt_store) {
+            std::vector<std::pair<uint64_t, uint64_t>> remap;
+            ckpt_store->maybe_compact(slot.id, remap);
+            for (auto & c : slot.prompt.checkpoints) {
+                if (!c.on_disk) {
+                    continue;
+                }
+                for (const auto & m : remap) {
+                    if (m.first == c.off_tgt) {
+                        c.off_tgt = m.second;
+                        break;
+                    }
+                }
+            }
+
+            const size_t n = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            std::vector<uint8_t> buf(n);
+            if (n > 0 && llama_state_seq_get_data_ext(ctx_tgt, buf.data(), n, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == n) {
+                const uint64_t off = ckpt_store->append(slot.id, buf.data(), n);
+                if (off != UINT64_MAX) {
+                    cur.on_disk  = true;
+                    cur.off_tgt  = off;
+                    cur.size_tgt = n;
+                }
+            }
+        }
+
+        if (!cur.on_disk) {
+            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
@@ -3490,11 +3554,6 @@ private:
                                             if (cur.pos_max > pos_next) {
                                                 return false;
                                             }
-                                            // exact match: the checkpoint covers the whole common prefix
-                                            if (params_base.slot_ckpt_disk && cur.n_tokens == n_past) {
-                                                SLT_TRC(slot, "exact-match checkpoint accepted (n_tokens = %" PRId64 ")\n", cur.n_tokens);
-                                                return true;
-                                            }
                                             return cur.pos_min < pos_min_thold || cur.pos_min == 0;
                                         }
                                     );
@@ -3503,7 +3562,14 @@ private:
 
                                     if (!do_reset) {
                                         // restore the context checkpoint
-                                        it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        if (it->on_disk && ckpt_store) {
+                                            std::vector<uint8_t> buf(it->size_tgt);
+                                            if (ckpt_store->read(slot.id, it->off_tgt, it->size_tgt, buf.data())) {
+                                                llama_state_seq_set_data_ext(ctx_tgt, buf.data(), buf.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                            }
+                                        } else {
+                                            it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        }
                                         it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
@@ -3528,6 +3594,9 @@ private:
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+                                        if (ckpt_store && cur.on_disk) {
+                                            ckpt_store->release(slot.id, cur.off_tgt);
+                                        }
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;
@@ -3967,15 +4036,6 @@ private:
                     slot.release();
                     slot.i_batch = -1;
                     return;
-                }
-
-                // end-of-prompt checkpoint: lets a later request resume from the exact prompt end
-                if (params_base.slot_ckpt_disk && params_base.n_ctx_checkpoints > 0) {
-                    const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
-                    const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
-                    if (pos_min >= 0) {
-                        create_checkpoint(slot, 0, pos_min, pos_max);
-                    }
                 }
 
                 GGML_ASSERT(slot.task->need_sampling());

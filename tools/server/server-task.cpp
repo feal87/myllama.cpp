@@ -2461,6 +2461,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     // calculate checkpoints size to see if it will fit with the prompt
     size_t checkpoints_size = 0;
     for (const auto & ckpt : prompt.checkpoints) {
+        if (ckpt.on_disk) {
+            continue; // lives in the slot checkpoint store, not here
+        }
         checkpoints_size += ckpt.size();
     }
 
@@ -2512,6 +2515,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         size_t offset = state_size_tgt + state_size_dft;
         state.checkpoints_disk.reserve(prompt.checkpoints.size());
         for (const auto & checkpoint : prompt.checkpoints) {
+            if (checkpoint.on_disk) {
+                continue; // lives in the slot checkpoint store, not here
+            }
             server_prompt_cache_checkpoint checkpoint_disk;
             checkpoint_disk.n_tokens = checkpoint.n_tokens;
             checkpoint_disk.id_task  = checkpoint.id_task;
@@ -2543,7 +2549,11 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
         GGML_ASSERT(offset == state_size_new);
     } else {
-        state.prompt.checkpoints = prompt.checkpoints;
+        for (const auto & checkpoint : prompt.checkpoints) {
+            if (!checkpoint.on_disk) {
+                state.prompt.checkpoints.push_back(checkpoint);
+            }
+        }
 
         try {
             state.data.main.resize(state_size_tgt);

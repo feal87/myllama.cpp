@@ -1227,6 +1227,11 @@ struct common_prompt_checkpoint {
     // (e.g. eagle3's deferred-boundary g_embd row)
     std::vector<uint8_t> data_spec;
 
+    // slot checkpoint store: the target blob lives in the slot file, data_tgt stays empty
+    bool     on_disk  = false;
+    uint64_t off_tgt  = 0;
+    uint64_t size_tgt = 0;
+
     size_t size() const;
 
     bool empty() const;
