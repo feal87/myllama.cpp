@@ -146,6 +146,7 @@ llama_context::llama_context(
     cparams.cb_eval_user_data = params.cb_eval_user_data;
     cparams.n_pin_hot_experts  = params.n_pin_hot_experts;
     cparams.n_pin_hot_experts_budget_bytes = params.n_pin_hot_experts_budget_bytes;
+    cparams.n_pin_hot_experts_pool_layers  = params.n_pin_hot_experts_pool_layers;
     cparams.n_experts_stats_interval = params.n_experts_stats_interval;
     cparams.n_pin_hot_experts_decay_tokens   = params.n_pin_hot_experts_decay_tokens;
     cparams.n_pin_hot_experts_min_count      = params.n_pin_hot_experts_min_count;
@@ -181,7 +182,8 @@ llama_context::llama_context(
             }
         }
         auto stage = std::make_unique<llama_disk_stage>(model, stage_dev,
-                cparams.n_pin_hot_experts, cparams.n_pin_hot_experts_budget_bytes);
+                cparams.n_pin_hot_experts, cparams.n_pin_hot_experts_budget_bytes,
+                cparams.n_pin_hot_experts_pool_layers);
         if (stage->is_active()) {
             disk_stage = std::move(stage);
         }
@@ -230,8 +232,8 @@ llama_context::llama_context(
     if (disk_active) {
         if (hot_experts) {
             hot_experts->set_disk_stage(disk_stage.get());
-            LLAMA_LOG_INFO("%s: disk decode cache is the RAM tier, %d resident experts per layer\n",
-                           __func__, disk_stage->resident_capacity());
+            LLAMA_LOG_INFO("%s: disk decode cache is the RAM tier, %d pool(s), up to %d resident slots per pool\n",
+                           __func__, disk_stage->n_pools(), disk_stage->resident_capacity());
         } else {
             LLAMA_LOG_WARN("%s: disk streaming needs the eval callback (--hot-experts-prefetch); disabled\n", __func__);
             disk_stage.reset();
@@ -3973,6 +3975,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.n_pin_hot_experts            =*/ 0,
         /*.n_pin_hot_experts_budget_bytes=*/ 0,
+        /*.n_pin_hot_experts_pool_layers =*/ 6,
         /*.n_experts_stats_interval     =*/ 5,
         /*.n_pin_hot_experts_decay_tokens=*/ 0,
         /*.n_pin_hot_experts_min_count   =*/ 8,

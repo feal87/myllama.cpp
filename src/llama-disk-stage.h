@@ -22,21 +22,25 @@ struct llama_model;
 // The staging tensors for every layer alias one pooled buffer (one region per
 // gate/up/down tensor): the scheduler keys copies by tensor, so the layers need
 // distinct tensor objects or a single copy would be reused across all of them.
-// The pool holds TWO such sets and the stageable layers alternate between them:
-// while layer i computes on the GPU, a reader thread fills layer i+1 into the
-// other set, so the prefill read overlaps the compute instead of preceding it.
+// The staging buffer holds TWO such sets and the stageable layers alternate
+// between them: while layer i computes on the GPU, a reader thread fills layer
+// i+1 into the other set, so the prefill read overlaps the compute instead of
+// preceding it.
 struct llama_disk_stage_layer {
     ggml_tensor * gate = nullptr;
     ggml_tensor * up   = nullptr;
     ggml_tensor * down = nullptr;
 };
 
-// Persistent decode cache of one MoE layer: n_slots experts in one compact
-// tensor per role, plus an I32 table mapping expert id -> slot. The graph
-// remaps selected_experts through `table` and runs mul_mat_id on these tensors,
-// so the weights are read in place from the slot, no copy. The first
-// n_resident slots hold the resident (hot) set and are filled once; a routed
-// expert that is not resident is read into a transient slot at fill time.
+// Persistent decode cache view of one MoE layer: an I32 table mapping expert id
+// -> slot, plus the gate/up/down slot tensors it reads through. Layers of one
+// pool share those tensors, so a hot layer can own more resident slots than a
+// cold one; without aligned GGUF data every layer has its own pool.
+//
+// The graph remaps selected_experts through `table` and runs mul_mat_id on these
+// tensors, so the weights are read in place from the slot, no copy. A routed
+// expert that is not resident is read into one of the layer's transient slots at
+// fill time; the pool's resident slots hold the hot set and are filled once.
 //
 // Slot `sentinel` is a never-filled spare: an expert served by the VRAM cache
 // has its table entry pointed there, and `slot_skip` marks it, so the host
@@ -47,8 +51,6 @@ struct llama_disk_stage_cache_layer {
     ggml_tensor * down  = nullptr;
     ggml_tensor * table = nullptr; // I32 [n_expert], expert id -> slot
     ggml_tensor * slot_skip = nullptr; // I32 [n_slots + 1], 1 at the sentinel
-    int32_t       n_slots  = 0; // resident + transient slots (sentinel excluded)
-    int32_t       sentinel = 0; // index of the spare slot (== n_slots)
 };
 
 class llama_disk_stage {
@@ -61,8 +63,11 @@ public:
     // n_pin_experts is the decode cache's resident experts per layer
     // (--pin-hot-experts), cache_budget_bytes its hard cap across all layers
     // (--pin-hot-experts-budget-mib); 0 means no explicit budget
+    // pool_layers_max caps how many layers share one decode-cache pool (0 = no
+    // limit, 1 = one pool per layer). Layers in a pool share resident slots
     llama_disk_stage(const llama_model & model, ggml_backend_dev_t dev,
-                     int32_t n_pin_experts, uint64_t cache_budget_bytes);
+                     int32_t n_pin_experts, uint64_t cache_budget_bytes,
+                     int32_t pool_layers_max);
     ~llama_disk_stage();
 
     // staging tensors of MoE layer il, or null when the layer is not stageable
@@ -80,8 +85,19 @@ public:
     // layer's id table; reads the non-resident ones into transient slots
     void fill_cache(int il, const int32_t * ids, int64_t n_ids);
 
-    // resident (hot) experts the decode cache can hold per layer, uniform across
-    // layers; this is the per-layer pin capacity of the hot-expert ranking
+    // number of independent decode-cache pools (0 when the cache is off)
+    int n_pools() const;
+
+    // pool id of layer il, or -1 when the layer has no cache. Layers in one pool
+    // share their expert tensors and their resident slots, so a hot layer can
+    // hold more of them than a cold one; without aligned GGUF data every layer
+    // is its own pool
+    int pool_id(int il) const;
+
+    // resident slots of the pool serving layer il (0 when the layer has no cache)
+    int32_t resident_capacity(int il) const;
+
+    // largest pool resident capacity, for logs and the hot-expert engine gate
     int32_t resident_capacity() const;
 
     // make expert id of layer il resident: reserve a slot for it and mark it

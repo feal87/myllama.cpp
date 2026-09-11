@@ -157,6 +157,7 @@ struct llama_disk_stage::impl {
         size_t              pool_off = 0; // aligned offset of the read destination within the pool
         size_t              read_len = 0; // aligned length of the read
         size_t              head     = 0; // bytes between the aligned start and the tensor data
+        size_t              stride   = 0; // bytes per expert in the file
         disk_stage_file *   file     = nullptr;
         uint64_t            file_off = 0; // aligned-down source offset
     };
@@ -178,39 +179,43 @@ struct llama_disk_stage::impl {
     std::vector<std::vector<region>>    layer_regions; // [layer][role], role in {gate, up, down}
     std::map<std::string, std::unique_ptr<disk_stage_file>> files;
 
-    // persistent decode cache: one compact slot array per layer, aliased by the
-    // graph through a per-layer expert-id -> slot table
-    struct cache_slot_region {
-        disk_stage_file * file     = nullptr;
-        size_t            file_off = 0; // aligned-down file offset of expert 0
-        size_t            head     = 0; // bytes from file_off to expert 0 data
-        size_t            stride   = 0; // bytes per expert
-        size_t            slot_stride = 0; // padded bytes per slot in the cache tensor
+    // persistent decode cache: one shared slot array per pool of layers that have
+    // identical expert tensors. A resident expert takes a slot from the pool's
+    // global free list, so a hot layer can hold more of them than a cold one; the
+    // layer's table remaps the graph onto its slot. A pool is shared only when
+    // every layer's tensor data is sector-aligned in the file (head == 0), which
+    // the realign script guarantees; otherwise each layer is its own pool, which
+    // reproduces the old static per-layer layout exactly
+    struct cache_pool {
+        ggml_tensor * gate = nullptr;
+        ggml_tensor * up   = nullptr;
+        ggml_tensor * down = nullptr;
+        char *        data[3] = { nullptr, nullptr, nullptr };
+        size_t        slot_stride[3] = { 0, 0, 0 }; // padded bytes per slot
+        int32_t       n_layers = 0;
+        int32_t       res_base = 0; // first resident slot
+        int32_t       res_cap  = 0; // resident slots
+        int32_t       sentinel = 0; // == res_base + res_cap: first spare slot
+        std::vector<int32_t> free_slots;   // resident slots with no expert (LIFO)
     };
     struct cache_layer {
-        ggml_tensor * gate  = nullptr;
-        ggml_tensor * up    = nullptr;
-        ggml_tensor * down  = nullptr;
-        ggml_tensor * table = nullptr; // I32 [n_expert]
+        int           pool           = -1;
+        int           pool_layer_idx = 0;  // index within its pool, selects the transient region
+        ggml_tensor * table    = nullptr;  // I32 [n_expert], expert id -> slot
         ggml_tensor * slot_skip = nullptr; // I32 [n_slots + 1], 1 at the sentinel
-        char *        data[3] = { nullptr, nullptr, nullptr };
-        cache_slot_region r[3];
-        int32_t n_slots    = 0;
-        int32_t n_resident = 0;
-        int32_t sentinel   = 0; // spare slot for VRAM-served experts
-        std::vector<int32_t> resident_slot; // expert id -> slot, -1 when not resident
+        std::vector<int32_t> resident_slot;   // expert id -> slot, -1 when not resident
         std::vector<uint8_t> resident_filled; // expert id -> its slot holds this expert's data
-        std::vector<uint8_t> vram;           // expert id -> served by the VRAM cache (host chain skips it)
-        std::vector<int32_t> free_slots;    // resident slots with no expert (LIFO)
-        llama_disk_stage_cache_layer pub;    // public view returned by cache_layer()
+        std::vector<uint8_t> vram;            // expert id -> served by the VRAM cache (host chain skips it)
+        llama_disk_stage_cache_layer pub;     // public view returned by cache_layer()
     };
-    ggml_backend_buffer_t cache_pool = nullptr;
+    ggml_backend_buffer_t cache_buf  = nullptr;
     ggml_context *        cache_ctx  = nullptr;
     std::unique_ptr<llama_mlock> cache_lock; // decode cache held in RAM for the process lifetime
+    std::vector<cache_pool>  pools;
     std::vector<cache_layer> cache;
     std::mutex   cache_mu;       // guards resident_slot / free_slots and table writes
     std::mutex   io_mu;          // one reaper at a time: the IOCP is shared by all reads
-    int32_t      n_resident = 0; // resident slots per layer (uniform), 0 when no cache
+    int32_t      n_trans = 0;    // transient slots per layer, 0 when no cache
 
     // double-buffered staging pipeline: one reader thread reads the next
     // stageable layer while the current layer computes. n_buf == 1 disables it
@@ -232,8 +237,8 @@ struct llama_disk_stage::impl {
         if (pool) {
             ggml_backend_buffer_free(pool);
         }
-        if (cache_pool) {
-            ggml_backend_buffer_free(cache_pool);
+        if (cache_buf) {
+            ggml_backend_buffer_free(cache_buf);
         }
         if (ctx) {
             ggml_free(ctx);
@@ -331,14 +336,26 @@ const llama_disk_stage_layer * llama_disk_stage::layer(int il) const {
 }
 
 const llama_disk_stage_cache_layer * llama_disk_stage::cache_layer(int il) const {
-    if (il < 0 || il >= (int) pimpl->cache.size() || pimpl->cache[il].gate == nullptr) {
+    if (il < 0 || il >= (int) pimpl->cache.size() || pimpl->cache[il].table == nullptr) {
         return nullptr;
     }
     return &pimpl->cache[il].pub;
 }
 
+int llama_disk_stage::n_pools() const {
+    return (int) pimpl->pools.size();
+}
+
+int llama_disk_stage::pool_id(int il) const {
+    if (il < 0 || il >= (int) pimpl->cache.size() || pimpl->cache[il].table == nullptr) {
+        return -1;
+    }
+    return pimpl->cache[il].pool;
+}
+
 llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t dev,
-                                   int32_t n_pin_experts, uint64_t cache_budget_bytes) :
+                                   int32_t n_pin_experts, uint64_t cache_budget_bytes,
+                                   int32_t pool_layers_max) :
     pimpl(std::make_unique<impl>(model)) {
     impl & p = *pimpl;
 
@@ -346,6 +363,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     GGML_UNUSED(dev);
     GGML_UNUSED(n_pin_experts);
     GGML_UNUSED(cache_budget_bytes);
+    GGML_UNUSED(pool_layers_max);
     return;
 #else
     if (!model.has_disk_weights()) {
@@ -403,6 +421,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
 
             src[il].t[role.slot] = t;
             src[il].r[role.slot].head     = head;
+            src[il].r[role.slot].stride   = (size_t) t->nb[2];
             src[il].r[role.slot].read_len = align_up(head + size, disk_stage_align);
             src[il].r[role.slot].file_off = t_off - head;
             src[il].r[role.slot].file     = p.file_for(path);
@@ -444,10 +463,9 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
         return;
     }
 
-    // one pool, aliased by every layer's staging tensors. Prefer the device's
-    // pinned host buffer so the offload copy into VRAM is not staged through
-    // prefer the device's pinned host buffer so the host->VRAM offload copy reads
-    // from page-locked memory; fall back to plain CPU memory
+    // one staging buffer, aliased by every layer's staging tensors. Prefer the
+    // device's pinned host buffer so the host->VRAM offload copy reads from
+    // page-locked memory; fall back to plain CPU memory
     ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev);
     if (buft == nullptr) {
         buft = ggml_backend_cpu_buffer_type();
@@ -543,13 +561,14 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
         return;
     }
 
-    // persistent decode cache: one compact slot array per layer, filled by the
-    // same unbuffered reader. The graph remaps selected_experts through the
+    // persistent decode cache: one shared slot array per pool of layers with
+    // identical expert tensors. The graph remaps selected_experts through each
     // layer's table and reads the weights in place, so a resident expert is
-    // served without a copy. Single-token decode needs it (the model tensors are
-    // never mapped), so it is always built: --pin-hot-experts sets the resident
-    // experts per layer and --pin-hot-experts-budget-mib caps the total across
-    // all layers
+    // served without a copy. Single-token decode needs the cache (the model
+    // tensors are never mapped). A pool is shared only when every layer's tensor
+    // data is sector-aligned in the file (head == 0), which the realign script
+    // guarantees; otherwise each layer is its own pool, which reproduces the old
+    // static per-layer layout
     const uint64_t cache_budget = cache_budget_bytes;
     {
         int ref = -1;
@@ -563,18 +582,34 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
             const int32_t n_expert = (int32_t) src[ref].t[0]->ne[2];
             const int32_t n_used   = std::max<int32_t>(1, (int32_t) model.hparams.n_expert_used());
             const int32_t n_trans  = std::min<int32_t>(n_used, n_expert);
+            p.n_trans = n_trans;
 
-            size_t per_expert = 0;
-            for (const auto & role : roles) {
-                per_expert += src[ref].t[role.slot]->nb[2];
+            // size from the sum of every stageable layer's per-slot cost, not from
+            // one reference layer: the bundle varies across layers (this quantization
+            // mixes Q8_0 and Q5_1 down projections), and a reference layer's bundle
+            // would leave the cheaper layers under-filled. The padded stride is what
+            // the cache allocates per slot, and one sentinel slot per layer shares
+            // the same tensor, so the usable slot count is one below the quotient
+            size_t cost_per_slot = 0;
+            for (int il = 0; il < n_layer; ++il) {
+                if (!src[il].ok) {
+                    continue;
+                }
+                for (const auto & role : roles) {
+                    cost_per_slot += (size_t) src[il].t[role.slot]->nb[2] + disk_stage_align;
+                }
             }
 
-            int32_t slots_per_layer = cache_budget > 0
-                    ? (int32_t) (cache_budget / ((size_t) n_layer * std::max<size_t>(per_expert, 1)))
-                    : 0;
+            int32_t slots_per_layer = 0;
+            if (cache_budget > 0 && cost_per_slot > 0) {
+                const int64_t slots = (int64_t) (cache_budget / cost_per_slot) - 1;
+                slots_per_layer = slots > 0 ? (int32_t) std::min<int64_t>(slots, n_expert) : 0;
+            }
             if (n_pin_experts > 0) {
-                // --pin-hot-experts N: N resident experts per layer, plus the
-                // transient slots the routed-but-not-resident experts need
+                // --pin-hot-experts N: N resident experts per layer on average,
+                // plus the transient slots the routed-but-not-resident experts
+                // need. With pools a hot layer may exceed N and a cold one fall
+                // short; the budget bounds the total across the pool
                 const int32_t want = std::min<int32_t>(n_pin_experts + n_trans, n_expert);
                 slots_per_layer = slots_per_layer > 0 ? std::min(slots_per_layer, want) : want;
             }
@@ -587,21 +622,85 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
             slots_per_layer = std::min<int32_t>(slots_per_layer, n_expert);
 
             if (slots_per_layer > n_trans) {
-                const int32_t n_resident = slots_per_layer - n_trans;
+                const int32_t res_per_layer = slots_per_layer - n_trans;
 
-                size_t cache_bytes = 64 * 1024;
-                for (int il = 0; il < n_layer; ++il) {
+                // a pool needs every layer's tensor data at the same sector
+                // remainder, since one data pointer serves the whole pool and the
+                // unbuffered read destination must be aligned; the realign script
+                // makes that remainder zero
+                bool all_aligned = true;
+                for (int il = 0; il < n_layer && all_aligned; ++il) {
                     if (!src[il].ok) {
                         continue;
                     }
-                    // one extra aligned span per tensor: the per-expert read is
-                    // rounded up to the sector size, which can overrun the last slot
                     for (const auto & role : roles) {
-                        const size_t stride = (size_t) src[il].t[role.slot]->nb[2];
-                        cache_bytes += align_up(src[il].r[role.slot].head + (size_t) (slots_per_layer + 1) * (stride + disk_stage_align) + disk_stage_align, disk_stage_align);
+                        if (src[il].r[role.slot].head != 0) {
+                            all_aligned = false;
+                            break;
+                        }
                     }
-                    cache_bytes += align_up((size_t) n_expert * sizeof(int32_t), disk_stage_align);
-                    cache_bytes += align_up((size_t) (slots_per_layer + 1) * sizeof(int32_t), disk_stage_align);
+                }
+
+                // group the stageable layers: all-aligned layers with identical
+                // expert tensors share one array per role, everything else gets a
+                // private one. The cap trades cross-layer sharing for speed: the
+                // CPU mul_mat_id scans every slot of its src tensor (n_as = ne02),
+                // so a pool of N layers makes each layer pay for N layers' slots
+                const int max_pool_layers = pool_layers_max > 0 ? pool_layers_max : (1 << 30);
+                std::vector<std::vector<int>> groups;
+                if (all_aligned) {
+                    for (int il = 0; il < n_layer; ++il) {
+                        if (!src[il].ok) {
+                            continue;
+                        }
+                        int g = -1;
+                        for (size_t k = 0; k < groups.size(); ++k) {
+                            if ((int) groups[k].size() >= max_pool_layers) {
+                                continue;  // cap reached: start another sub-pool
+                            }
+                            const layer_src & a = src[groups[k][0]];
+                            bool same = true;
+                            for (const auto & role : roles) {
+                                const ggml_tensor * ta = a.t[role.slot];
+                                const ggml_tensor * tb = src[il].t[role.slot];
+                                if (ta->type != tb->type || ta->ne[0] != tb->ne[0] || ta->ne[1] != tb->ne[1]) {
+                                    same = false;
+                                    break;
+                                }
+                            }
+                            if (same) {
+                                g = (int) k;
+                                break;
+                            }
+                        }
+                        if (g < 0) {
+                            groups.push_back({});
+                            g = (int) groups.size() - 1;
+                        }
+                        groups[g].push_back(il);
+                    }
+                } else {
+                    for (int il = 0; il < n_layer; ++il) {
+                        if (src[il].ok) {
+                            groups.push_back({ il });
+                        }
+                    }
+                }
+
+                size_t cache_bytes = 64 * 1024;
+                for (const auto & grp : groups) {
+                    const int32_t n_pool_slots = (int32_t) grp.size() * (n_trans + res_per_layer);
+                    for (const auto & role : roles) {
+                        const size_t stride = (size_t) src[grp[0]].t[role.slot]->nb[2];
+                        const size_t head   = all_aligned ? 0 : src[grp[0]].r[role.slot].head;
+                        // one extra aligned span per tensor: the per-expert read is
+                        // rounded up to the sector size, which can overrun the last slot
+                        cache_bytes += align_up(head + (size_t) (n_pool_slots + 1) * (stride + disk_stage_align) + disk_stage_align, disk_stage_align);
+                    }
+                    for (size_t j = 0; j < grp.size(); ++j) {
+                        cache_bytes += align_up((size_t) n_expert * sizeof(int32_t), disk_stage_align);
+                        cache_bytes += align_up((size_t) (n_pool_slots + 1) * sizeof(int32_t), disk_stage_align);
+                    }
                 }
 
                 // the decode cache is read by the CPU mul_mat_id only: decode
@@ -612,107 +711,120 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                 // OOMs unrelated device allocations. The staging pool above stays
                 // pinned because it IS the source of the host->VRAM offload copy.
                 ggml_backend_buffer_type_t cbuft = ggml_backend_cpu_buffer_type();
-                p.cache_pool = ggml_backend_buft_alloc_buffer(cbuft, cache_bytes);
-                if (p.cache_pool == nullptr) {
+                p.cache_buf = ggml_backend_buft_alloc_buffer(cbuft, cache_bytes);
+                if (p.cache_buf == nullptr) {
                     LLAMA_LOG_WARN("%s: failed to allocate the %.2f GiB decode cache\n",
                                    __func__, cache_bytes / (1024.0 * 1024.0 * 1024.0));
                 } else {
-                    ggml_backend_buffer_set_usage(p.cache_pool, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-                    char * cbase = (char *) align_up((uintptr_t) ggml_backend_buffer_get_base(p.cache_pool), disk_stage_align);
+                    ggml_backend_buffer_set_usage(p.cache_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                    char * cbase = (char *) align_up((uintptr_t) ggml_backend_buffer_get_base(p.cache_buf), disk_stage_align);
 
                     if (!p.lock_cache(cbase, cache_bytes)) {
                         throw std::runtime_error("failed to hold the MoE decode cache in RAM");
                     }
 
                     ggml_init_params cip = {
-                        /*.mem_size   =*/ ggml_tensor_overhead() * (size_t) (n_layer * 5 + 16),
+                        /*.mem_size   =*/ ggml_tensor_overhead() * (size_t) (n_layer * 5 + groups.size() * 3 + 16),
                         /*.mem_buffer =*/ nullptr,
                         /*.no_alloc   =*/ true,
                     };
                     p.cache_ctx = ggml_init(cip);
                     if (p.cache_ctx != nullptr) {
                         p.cache.resize(n_layer);
+                        p.pools.resize(groups.size());
                         size_t off = 0;
                         int    n_cache = 0;
-                        for (int il = 0; il < n_layer && p.cache_pool != nullptr; ++il) {
-                            if (!src[il].ok) {
-                                continue;
-                            }
-                            impl::cache_layer & c = p.cache[il];
-                            c.n_slots    = slots_per_layer;
-                            c.n_resident = n_resident;
-                            c.sentinel   = slots_per_layer;
-                            c.resident_slot.assign((size_t) n_expert, -1);
-                            c.resident_filled.assign((size_t) n_expert, 0);
-                            c.vram.assign((size_t) n_expert, 0);
-                            c.free_slots.resize((size_t) n_resident);
-                            for (int32_t s = 0; s < n_resident; ++s) {
-                                c.free_slots[(size_t) s] = s;
-                            }
+
+                        for (size_t g = 0; g < groups.size() && p.cache_buf != nullptr; ++g) {
+                            const std::vector<int> & grp = groups[g];
+                            impl::cache_pool & pool = p.pools[g];
+                            pool.n_layers = (int32_t) grp.size();
+                            pool.res_base = pool.n_layers * n_trans;
+                            pool.res_cap  = (int32_t) grp.size() * res_per_layer;
+                            pool.sentinel = pool.res_base + pool.res_cap;
 
                             ggml_tensor * tensors[3] = { nullptr, nullptr, nullptr };
                             for (const auto & role : roles) {
-                                const ggml_tensor * s = src[il].t[role.slot];
-                                ggml_tensor * ct = ggml_new_tensor_3d(p.cache_ctx, s->type, s->ne[0], s->ne[1], slots_per_layer + 1);
-                                ggml_format_name(ct, "disk_cache_%s.%d", role.suffix, il);
+                                const ggml_tensor * s = src[grp[0]].t[role.slot];
+                                ggml_tensor * ct = ggml_new_tensor_3d(p.cache_ctx, s->type, s->ne[0], s->ne[1], pool.sentinel + 1);
+                                ggml_format_name(ct, "disk_cache_%s.%d", role.suffix, (int) g);
                                 // pad the slot stride: an expert read starts `head` bytes
                                 // before its slot to stay sector-aligned, so with adjacent
                                 // slots in flight it would clobber the tail of the
                                 // previous slot's expert without the pad
                                 ct->nb[2] = s->nb[2] + disk_stage_align;
-                                c.r[role.slot] = { src[il].r[role.slot].file, src[il].r[role.slot].file_off,
-                                                   src[il].r[role.slot].head, (size_t) s->nb[2], (size_t) ct->nb[2] };
-                                if (ggml_backend_tensor_alloc(p.cache_pool, ct, cbase + off + src[il].r[role.slot].head) != GGML_STATUS_SUCCESS) {
+                                const size_t head = all_aligned ? 0 : src[grp[0]].r[role.slot].head;
+                                if (ggml_backend_tensor_alloc(p.cache_buf, ct, cbase + off + head) != GGML_STATUS_SUCCESS) {
                                     LLAMA_LOG_WARN("%s: failed to bind a decode cache tensor, cache disabled\n", __func__);
-                                    ggml_backend_buffer_free(p.cache_pool);
-                                    p.cache_pool = nullptr;
+                                    ggml_backend_buffer_free(p.cache_buf);
+                                    p.cache_buf = nullptr;
                                     break;
                                 }
-                                c.data[role.slot] = (char *) ct->data;
-                                off += align_up(src[il].r[role.slot].head + (size_t) (slots_per_layer + 1) * ct->nb[2] + disk_stage_align, disk_stage_align);
+                                pool.data[role.slot]        = (char *) ct->data;
+                                pool.slot_stride[role.slot] = (size_t) ct->nb[2];
+                                off += align_up(head + (size_t) (pool.sentinel + 1) * ct->nb[2] + disk_stage_align, disk_stage_align);
                                 tensors[role.slot] = ct;
                             }
-                            if (p.cache_pool == nullptr) {
+                            if (p.cache_buf == nullptr) {
                                 p.cache.clear();
+                                p.pools.clear();
                                 break;
                             }
 
-                            // 2d [1, n_expert] so ggml_get_rows can index the
-                            // expert id along ne[1] during the decode remap
-                            ggml_tensor * tab = ggml_new_tensor_2d(p.cache_ctx, GGML_TYPE_I32, 1, n_expert);
-                            ggml_format_name(tab, "disk_cache_table.%d", il);
-                            ggml_backend_tensor_alloc(p.cache_pool, tab, cbase + off);
-                            std::memset(tab->data, 0, (size_t) n_expert * sizeof(int32_t));
-                            off += align_up((size_t) n_expert * sizeof(int32_t), disk_stage_align);
+                            pool.gate = tensors[0];
+                            pool.up   = tensors[1];
+                            pool.down = tensors[2];
+                            pool.free_slots.resize((size_t) pool.res_cap);
+                            for (int32_t s = 0; s < pool.res_cap; ++s) {
+                                pool.free_slots[(size_t) s] = pool.res_base + s;
+                            }
+                            for (size_t j = 0; j < grp.size(); ++j) {
+                                const int il = grp[j];
+                                impl::cache_layer & c = p.cache[il];
+                                c.pool           = (int) g;
+                                c.pool_layer_idx = (int) j;
+                                c.resident_slot.assign((size_t) n_expert, -1);
+                                c.resident_filled.assign((size_t) n_expert, 0);
+                                c.vram.assign((size_t) n_expert, 0);
 
-                            // slot-indexed skip table for the host mul_mat_id: 1 at
-                            // the sentinel, so a VRAM-served expert (whose table
-                            // entry is the sentinel) is skipped instead of read
-                            ggml_tensor * skip = ggml_new_tensor_2d(p.cache_ctx, GGML_TYPE_I32, 1, slots_per_layer + 1);
-                            ggml_format_name(skip, "disk_cache_skip.%d", il);
-                            ggml_backend_tensor_alloc(p.cache_pool, skip, cbase + off);
-                            std::memset(skip->data, 0, (size_t) (slots_per_layer + 1) * sizeof(int32_t));
-                            ((int32_t *) skip->data)[slots_per_layer] = 1;
-                            off += align_up((size_t) (slots_per_layer + 1) * sizeof(int32_t), disk_stage_align);
+                                // 2d [1, n_expert] so ggml_get_rows can index the
+                                // expert id along ne[1] during the decode remap
+                                ggml_tensor * tab = ggml_new_tensor_2d(p.cache_ctx, GGML_TYPE_I32, 1, n_expert);
+                                ggml_format_name(tab, "disk_cache_table.%d", il);
+                                ggml_backend_tensor_alloc(p.cache_buf, tab, cbase + off);
+                                std::memset(tab->data, 0, (size_t) n_expert * sizeof(int32_t));
+                                off += align_up((size_t) n_expert * sizeof(int32_t), disk_stage_align);
 
-                            c.gate  = tensors[0];
-                            c.up    = tensors[1];
-                            c.down  = tensors[2];
-                            c.table = tab;
-                            c.slot_skip = skip;
-                            c.pub.gate    = c.gate;
-                            c.pub.up      = c.up;
-                            c.pub.down    = c.down;
-                            c.pub.table   = c.table;
-                            c.pub.slot_skip = c.slot_skip;
-                            c.pub.n_slots = c.n_slots;
-                            c.pub.sentinel = c.sentinel;
-                            n_cache++;
+                                // slot-indexed skip table for the host mul_mat_id: 1 at
+                                // the sentinel, so a VRAM-served expert (whose table
+                                // entry is the sentinel) is skipped instead of read
+                                ggml_tensor * skip = ggml_new_tensor_2d(p.cache_ctx, GGML_TYPE_I32, 1, pool.sentinel + 1);
+                                ggml_format_name(skip, "disk_cache_skip.%d", il);
+                                ggml_backend_tensor_alloc(p.cache_buf, skip, cbase + off);
+                                std::memset(skip->data, 0, (size_t) (pool.sentinel + 1) * sizeof(int32_t));
+                                ((int32_t *) skip->data)[pool.sentinel] = 1;
+                                off += align_up((size_t) (pool.sentinel + 1) * sizeof(int32_t), disk_stage_align);
+
+                                c.table     = tab;
+                                c.slot_skip = skip;
+                                c.pub.gate      = pool.gate;
+                                c.pub.up        = pool.up;
+                                c.pub.down      = pool.down;
+                                c.pub.table     = tab;
+                                c.pub.slot_skip = skip;
+                                n_cache++;
+                            }
                         }
-                        if (p.cache_pool != nullptr) {
-                            p.n_resident = n_resident;
-                            LLAMA_LOG_INFO("%s: decode cache active for %d layer(s), %.2f GiB, %d slots/layer (%d resident)\n",
-                                           __func__, n_cache, cache_bytes / (1024.0 * 1024.0 * 1024.0), slots_per_layer, n_resident);
+
+                        if (p.cache_buf != nullptr) {
+                            LLAMA_LOG_INFO("%s: decode cache active for %d layer(s), %.2f GiB, %zu pool(s)%s\n",
+                                           __func__, n_cache, cache_bytes / (1024.0 * 1024.0 * 1024.0), p.pools.size(),
+                                           all_aligned ? ", shared expert tensors" : ", per-layer tensors");
+                            for (size_t g = 0; g < p.pools.size(); ++g) {
+                                LLAMA_LOG_INFO("%s:   pool %zu: %d layer(s), %d slots/layer, %d resident slots\n",
+                                               __func__, g, p.pools[g].n_layers, p.pools[g].sentinel / p.pools[g].n_layers,
+                                               p.pools[g].res_cap);
+                            }
                         }
                     }
                 }
@@ -875,15 +987,17 @@ void llama_disk_stage::fill_run(int il) {
         // while the reads below are in flight
         std::lock_guard<std::mutex> lock(p.cache_mu);
 
-        const impl::cache_layer * c = nullptr;
-        if (il < (int) p.cache.size() && p.cache[il].gate != nullptr) {
-            c = &p.cache[il];
+        const impl::cache_layer * c    = nullptr;
+        const impl::cache_pool *  pool = nullptr;
+        if (il < (int) p.cache.size() && p.cache[il].table != nullptr) {
+            c    = &p.cache[il];
+            pool = &p.pools[c->pool];
         }
 
         for (int role = 0; role < (int) p.layer_regions[il].size(); ++role) {
             const impl::region & r = p.layer_regions[il][role];
 
-            const size_t  stride   = c != nullptr ? c->r[role].stride : 0;
+            const size_t  stride   = c != nullptr ? r.stride : 0;
             const int32_t n_expert = c != nullptr ? (int32_t) c->resident_slot.size() : 0;
 
             if (stride == 0 || n_expert <= 0) {
@@ -910,7 +1024,7 @@ void llama_disk_stage::fill_run(int il) {
             while (id < n_expert) {
                 if (resident(id)) {
                     const size_t slot = (size_t) c->resident_slot[id];
-                    copies.push_back({ c->data[role] + slot * c->r[role].slot_stride,
+                    copies.push_back({ pool->data[role] + slot * pool->slot_stride[role],
                                        slab + (size_t) id * stride, stride });
                     ++id;
                     continue;
@@ -942,14 +1056,14 @@ void llama_disk_stage::fill_run(int il) {
                 // copies to run while the drive is busy instead of after it.
                 if (prefix > 0 && id > 0 && resident(id - 1)) {
                     const size_t slot = (size_t) c->resident_slot[id - 1];
-                    patches.push_back({ c->data[role] + slot * c->r[role].slot_stride + (stride - prefix),
+                    patches.push_back({ pool->data[role] + slot * pool->slot_stride[role] + (stride - prefix),
                                         slab + (size_t) id * stride - prefix, prefix });
                 }
                 if (last < n_expert && resident(last)) {
                     const size_t over = (size_t) ((dst + rlen) - (slab + (size_t) last * stride));
                     if (over > 0 && over <= stride) {
                         const size_t slot = (size_t) c->resident_slot[last];
-                        patches.push_back({ c->data[role] + slot * c->r[role].slot_stride,
+                        patches.push_back({ pool->data[role] + slot * pool->slot_stride[role],
                                             slab + (size_t) last * stride, over });
                     }
                 }
@@ -1036,14 +1150,20 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
         return;
     }
     impl::cache_layer & c = p.cache[il];
-    if (c.gate == nullptr || c.table == nullptr || n_ids <= 0) {
+    if (c.table == nullptr || n_ids <= 0) {
         return;
     }
+    impl::cache_pool & pool = p.pools[c.pool];
 
     int32_t * table = (int32_t *) c.table->data;
     std::vector<disk_stage_job> jobs;
     std::vector<int32_t>    newly_filled; // residents whose slot was just read
-    int32_t transient = c.n_resident;
+
+    // this layer's own transient window inside the pool: [0, res_base) is split
+    // into one n_trans-wide window per layer
+    const int32_t trans_begin = c.pool_layer_idx * p.n_trans;
+    const int32_t trans_end   = trans_begin + p.n_trans;
+    int32_t transient = trans_begin;
 
     // slot assignment under the lock; the unbuffered reads below run without it
     {
@@ -1058,7 +1178,7 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
             // served by the VRAM cache: point the table at the sentinel so the
             // host mul_mat_id skips it, and read nothing
             if (c.vram[id]) {
-                table[id] = c.sentinel;
+                table[id] = pool.sentinel;
                 continue;
             }
 
@@ -1070,11 +1190,11 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
                 table[id] = slot;
                 if (c.resident_filled[id] == 0) {
                     for (int r = 0; r < 3; ++r) {
-                        const impl::cache_slot_region & sr = c.r[r];
+                        const impl::region & sr = p.layer_regions[il][r];
                         if (sr.file == nullptr || sr.stride == 0) {
                             continue;
                         }
-                        char * dst = c.data[r] + (size_t) slot * sr.slot_stride - sr.head;
+                        char * dst = pool.data[r] + (size_t) slot * pool.slot_stride[r] - sr.head;
                         jobs.push_back({ sr.file->h, dst, sr.file_off + (size_t) id * sr.stride, align_up(sr.head + sr.stride, disk_stage_align) });
                     }
                     newly_filled.push_back(id);
@@ -1082,9 +1202,9 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
                 continue;
             }
 
-            // not resident: serve it from a transient slot for this ubatch
-            if (transient >= c.n_slots) {
-                transient = c.n_resident;
+            // not resident: serve it from this layer's transient window
+            if (transient >= trans_end) {
+                transient = trans_begin;
             }
             const int32_t use = transient++;
 
@@ -1093,11 +1213,11 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
             // it, and the length is rounded up to the sector size the unbuffered read
             // requires (the extra bytes fall in the per-tensor slack)
             for (int r = 0; r < 3; ++r) {
-                const impl::cache_slot_region & sr = c.r[r];
+                const impl::region & sr = p.layer_regions[il][r];
                 if (sr.file == nullptr || sr.stride == 0) {
                     continue;
                 }
-                char * dst = c.data[r] + (size_t) use * sr.slot_stride - sr.head;
+                char * dst = pool.data[r] + (size_t) use * pool.slot_stride[r] - sr.head;
                 jobs.push_back({ sr.file->h, dst, sr.file_off + (size_t) id * sr.stride, align_up(sr.head + sr.stride, disk_stage_align) });
             }
             table[id] = use;
@@ -1122,8 +1242,17 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
 #endif
 }
 
+int32_t llama_disk_stage::resident_capacity(int il) const {
+    const int pid = pool_id(il);
+    return pid >= 0 ? pimpl->pools[(size_t) pid].res_cap : 0;
+}
+
 int32_t llama_disk_stage::resident_capacity() const {
-    return pimpl->n_resident;
+    int32_t cap = 0;
+    for (const auto & pool : pimpl->pools) {
+        cap = std::max(cap, pool.res_cap);
+    }
+    return cap;
 }
 
 bool llama_disk_stage::resident_add(int il, int32_t id) {
@@ -1133,7 +1262,7 @@ bool llama_disk_stage::resident_add(int il, int32_t id) {
         return false;
     }
     impl::cache_layer & c = p.cache[il];
-    if (c.gate == nullptr || id < 0 || id >= (int32_t) c.resident_slot.size()) {
+    if (c.table == nullptr || id < 0 || id >= (int32_t) c.resident_slot.size()) {
         return false;
     }
 
@@ -1144,13 +1273,14 @@ bool llama_disk_stage::resident_add(int il, int32_t id) {
     if (c.resident_slot[id] >= 0) {
         return true;  // already resident
     }
-    if (c.free_slots.empty()) {
-        return false;  // all resident slots taken
+    impl::cache_pool & pool = p.pools[c.pool];
+    if (pool.free_slots.empty()) {
+        return false;  // the pool's resident slots are all taken
     }
 
     // reserve only; fill_cache() reads the bytes in when the expert is routed
-    const int32_t slot = c.free_slots.back();
-    c.free_slots.pop_back();
+    const int32_t slot = pool.free_slots.back();
+    pool.free_slots.pop_back();
     c.resident_slot[id]   = slot;
     c.resident_filled[id] = 0;
     return true;
@@ -1168,7 +1298,7 @@ void llama_disk_stage::resident_remove(int il, int32_t id) {
         return;
     }
     impl::cache_layer & c = p.cache[il];
-    if (c.gate == nullptr || id < 0 || id >= (int32_t) c.resident_slot.size()) {
+    if (c.table == nullptr || id < 0 || id >= (int32_t) c.resident_slot.size()) {
         return;
     }
 
@@ -1182,7 +1312,8 @@ void llama_disk_stage::resident_remove(int il, int32_t id) {
     }
     c.resident_slot[id]   = -1;
     c.resident_filled[id] = 0;
-    c.free_slots.push_back(slot);
+    impl::cache_pool & pool = p.pools[c.pool];
+    pool.free_slots.push_back(slot);
 #else
     GGML_UNUSED(il);
     GGML_UNUSED(id);
@@ -1196,7 +1327,7 @@ bool llama_disk_stage::resident_filled(int il, int32_t id) const {
         return false;
     }
     const impl::cache_layer & c = p.cache[il];
-    if (c.gate == nullptr || id < 0 || id >= (int32_t) c.resident_slot.size()) {
+    if (c.table == nullptr || id < 0 || id >= (int32_t) c.resident_slot.size()) {
         return false;
     }
 
@@ -1216,7 +1347,7 @@ bool llama_disk_stage::resident_copy(int il, int32_t id, const size_t sz[3], voi
         return false;
     }
     const impl::cache_layer & c = p.cache[il];
-    if (c.gate == nullptr || id < 0 || id >= (int32_t) c.resident_slot.size()) {
+    if (c.table == nullptr || id < 0 || id >= (int32_t) c.resident_slot.size()) {
         return false;
     }
 
@@ -1225,18 +1356,19 @@ bool llama_disk_stage::resident_copy(int il, int32_t id, const size_t sz[3], voi
     if (slot < 0 || c.vram[id] || c.resident_filled[id] == 0) {
         return false;
     }
+    const impl::cache_pool & pool = p.pools[c.pool];
 
     size_t off = 0;
     char * out = (char *) dst;
     for (int role = 0; role < 3; ++role) {
-        const size_t len = c.r[role].stride;
-        if (len == 0 || c.r[role].slot_stride == 0) {
+        const size_t len = p.layer_regions[il][role].stride;
+        if (len == 0 || pool.slot_stride[role] == 0) {
             continue;
         }
         if (len > sz[role] || off + len > dst_cap) {
             return false;  // caller buffer too small for this role
         }
-        std::memcpy(out + off, c.data[role] + (size_t) slot * c.r[role].slot_stride, len);
+        std::memcpy(out + off, pool.data[role] + (size_t) slot * pool.slot_stride[role], len);
         off += len;
     }
     return true;
@@ -1257,7 +1389,7 @@ void llama_disk_stage::vram_commit(int il, int32_t id) {
         return;
     }
     impl::cache_layer & c = p.cache[il];
-    if (c.gate == nullptr || id < 0 || id >= (int32_t) c.resident_slot.size()) {
+    if (c.table == nullptr || id < 0 || id >= (int32_t) c.resident_slot.size()) {
         return;
     }
 
@@ -1266,7 +1398,8 @@ void llama_disk_stage::vram_commit(int il, int32_t id) {
         return;
     }
     c.vram[id] = 1;
-    ((int32_t *) c.table->data)[id] = c.sentinel;
+    impl::cache_pool & pool = p.pools[c.pool];
+    ((int32_t *) c.table->data)[id] = pool.sentinel;
 
     // the RAM copy is redundant now: free the slot for the next promotion (it
     // may already be gone: the hot tier can have evicted it during the upload)
@@ -1274,7 +1407,7 @@ void llama_disk_stage::vram_commit(int il, int32_t id) {
     if (slot >= 0) {
         c.resident_slot[id]   = -1;
         c.resident_filled[id] = 0;
-        c.free_slots.push_back(slot);
+        pool.free_slots.push_back(slot);
     }
 #else
     GGML_UNUSED(il);
@@ -1289,7 +1422,7 @@ void llama_disk_stage::vram_release(int il, int32_t id) {
         return;
     }
     impl::cache_layer & c = p.cache[il];
-    if (c.gate == nullptr || id < 0 || id >= (int32_t) c.resident_slot.size()) {
+    if (c.table == nullptr || id < 0 || id >= (int32_t) c.resident_slot.size()) {
         return;
     }
 
@@ -1310,7 +1443,7 @@ bool llama_disk_stage::is_vram(int il, int32_t id) const {
         return false;
     }
     const impl::cache_layer & c = p.cache[il];
-    if (c.gate == nullptr || id < 0 || id >= (int32_t) c.resident_slot.size()) {
+    if (c.table == nullptr || id < 0 || id >= (int32_t) c.resident_slot.size()) {
         return false;
     }
 

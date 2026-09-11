@@ -561,10 +561,10 @@ void llama_moe_cache::maybe_activate() {
     // residents, so a layer cannot hold more VRAM slots than the RAM tier can
     // supply (the RAM set is uniform across layers)
     if (p->disk_mode) {
-        const int32_t cap = p->disk->resident_capacity();
-        for (auto & v : caps) {
-            if (v > cap) {
-                v = cap;
+        for (int il = 0; il < (int) caps.size(); ++il) {
+            const int32_t cap = p->disk->resident_capacity(il);
+            if (caps[il] > cap) {
+                caps[il] = cap;
             }
         }
     }
@@ -879,13 +879,12 @@ uint32_t llama_moe_cache::layout_generation() const {
     return pimpl ? pimpl->layout_gen : 0;
 }
 
-const llama_moe_cache_layer * llama_moe_cache::lookup(const ggml_tensor * gate) const {
-    if (!pimpl || !pimpl->activated) {
+const llama_moe_cache_layer * llama_moe_cache::lookup(int il) const {
+    if (!pimpl || !pimpl->activated || il < 0) {
         return nullptr;
     }
     for (const auto & ls : pimpl->layers) {
-        if (ls.pub.gate_src == gate || ls.pub.up_src == gate ||
-                ls.key_gate == gate || ls.key_up == gate) {
+        if (ls.pub.il == il) {
             return &ls.pub;
         }
     }

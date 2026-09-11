@@ -68,6 +68,8 @@ struct llama_cparams {
     int32_t n_pin_hot_experts;
     // hard cap in bytes on total memory locked by n_pin_hot_experts, across all layers (0 = unlimited)
     uint64_t n_pin_hot_experts_budget_bytes;
+    // max layers sharing one disk decode-cache pool (0 = no limit, 1 = no pooling)
+    int32_t n_pin_hot_experts_pool_layers;
     // print the periodic expert-tier stats report (RAM pin + VRAM MoE) every N
     // seconds of evaluation (0 = only at context teardown)
     uint64_t n_experts_stats_interval;

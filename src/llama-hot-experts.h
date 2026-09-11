@@ -210,8 +210,10 @@ class llama_hot_expert_cache {
     void on_ubatch_begin(int64_t n_tokens);
 
     // direct-read expert staging: when set, ubatches fill the stage at each
-    // layer's topk instead of prefetching the mmap (--load-mode dio)
-    void set_disk_stage(llama_disk_stage * ds) { disk_stage = ds; }
+    // layer's topk instead of prefetching the mmap (--load-mode dio). The disk
+    // cache's pools become the RAM tier's pools: shared slots within a pool,
+    // one pool per layer when the GGUF is not sector-aligned
+    void set_disk_stage(llama_disk_stage * ds);
 
     // A new prompt has begun (llama_context detects the decode -> prefill
     // transition of the ubatch stream, llama-server runs np = 1): divide every
@@ -332,12 +334,16 @@ class llama_hot_expert_cache {
     void try_promote(int il, layer_state & ls, int32_t expert_id, uint64_t count, bool vram_resident,
                      bool apply_hysteresis);
 
-    // per-layer variant used when the disk decode cache is the RAM tier: keeps
-    // the n_pin hottest experts of EACH layer resident (the cache has a fixed
-    // number of slots per layer, so the global skew of try_promote cannot be
-    // represented). Same counting, min-count floor, takeover lead and eviction
-    // grace; the eviction victim is that layer's coldest resident
-    void try_promote_layer(int il, layer_state & ls, int32_t expert_id, uint64_t count, bool apply_hysteresis);
+    // pool variant used when the disk decode cache is the RAM tier: the pool
+    // owns the resident slots and all of its layers draw from them, so a hot
+    // layer can hold more than a cold one. Same counting, min-count floor,
+    // takeover lead and eviction grace; the eviction victim is the pool's
+    // coldest resident
+    void try_promote_pool(int il, layer_state & ls, int32_t expert_id, uint64_t count, bool apply_hysteresis);
+
+    // disk-cache pool of a layer (0 in the non-disk mlock mode, where the whole
+    // model is one pool)
+    int pool_of_layer(int il) const;
 
     // (mu held) bookkeeping for a disk-cache promotion whose slot is reserved;
     // the bytes are read by llama_disk_stage::fill_cache when next routed
@@ -475,11 +481,14 @@ class llama_hot_expert_cache {
     // the maps below hold the heavyweight state (mlock guards, ordered rank) and
     // are only touched on pins/evictions/decay/stat reports.
 
-    // Global pinned set: (count, layer, expert_id) ordered ascending by count;
-    // begin() is the coldest pinned expert. Keys are only kept exact when the
-    // set is rebuilt (see rebuild_pinned_rank): between rebuilds the keys of
-    // routed experts lag their true counts, which they never exceed
-    std::set<std::tuple<uint64_t, int, int32_t>>                   pinned_rank;
+    // One pinned set per pool: (count, layer, expert_id) ordered ascending by
+    // count; begin() is the coldest pinned expert of that pool. Keys are only
+    // kept exact when the set is rebuilt (see rebuild_pinned_rank): between
+    // rebuilds the keys of routed experts lag their true counts, which they
+    // never exceed. The non-disk mlock mode has a single pool
+    std::vector<std::set<std::tuple<uint64_t, int, int32_t>>>      pinned_rank_pool;
+    std::vector<int>                                               layer_pool; // layer -> pool, -1 when not cached
+    int                                                            n_pools = 1;
     std::unordered_map<expert_key, pinned_expert, expert_key_hash> pinned;
     // pinned set at the previous stats report; diffed against the current one to
     // measure the list churn (expert replaced since the last report)

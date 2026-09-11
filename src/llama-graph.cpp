@@ -2236,12 +2236,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
         if (clamp_free) {
             if (gate_up_exps && !gate_exps) {
-                mc = moe_cache->lookup(gate_up_exps); // fused layout
+                mc = moe_cache->lookup(il); // fused layout
                 if (mc && !mc->fused) {
                     mc = nullptr;
                 }
             } else if (gate_exps && up_exps) {
-                mc = moe_cache->lookup(gate_exps);    // separate layout
+                mc = moe_cache->lookup(il); // separate layout
                 if (mc && mc->fused) {
                     mc = nullptr;
                 }

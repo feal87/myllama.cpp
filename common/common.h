@@ -484,6 +484,9 @@ struct common_params {
     // hard cap in MiB on total memory locked by n_pin_hot_experts, across all layers
     // combined (0 = unlimited, NOT recommended -- see --pin-hot-experts-budget-mib).
     uint64_t n_pin_hot_experts_budget_mib = 0;
+    // with --load-mode dio, max layers sharing one disk decode-cache pool (0 = no
+    // limit, 1 = no pooling). See --pin-hot-experts-pool-layers.
+    int32_t n_pin_hot_experts_pool_layers = 6;
     // print the periodic MoE expert-tier stats report (RAM pin tier + VRAM MoE
     // tier: totals, hit rates, list churn, per-layer breakdown) every N seconds
     // of evaluation (0 = only at teardown). Shared by --pin-hot-experts and

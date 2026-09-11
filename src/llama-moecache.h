@@ -149,9 +149,11 @@ class llama_moe_cache {
     // rebuild whenever the layout changed (see llm_graph_params).
     uint32_t layout_generation() const;
 
-    // cache layer owning `gate` (the ffn_gate_up_exps or ffn_gate_exps tensor),
-    // or nullptr when the cache is inactive or the layer has no slots
-    const llama_moe_cache_layer * lookup(const ggml_tensor * gate) const;
+    // cache layer of transformer layer `il`, or nullptr when the cache is
+    // inactive or the layer has no slots. Keyed on the layer id, not the gate
+    // tensor: in dio mode the disk pool tensors are shared across layers, so the
+    // tensor no longer identifies a layer
+    const llama_moe_cache_layer * lookup(int il) const;
 
     // called between graph executions (after each ubatch): publishes completed
     // uploads and periodically rebalances content against the current ranking

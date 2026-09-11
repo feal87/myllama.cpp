@@ -406,6 +406,14 @@ extern "C" {
         // recommended whenever n_pin_hot_experts > 0.
         uint64_t n_pin_hot_experts_budget_bytes;
 
+        // with --load-mode dio, max layers that share one disk decode-cache pool
+        // (0 = no limit, one pool per expert tensor group; 1 = no pooling).
+        // Layers in a pool share resident slots, so a hot layer can borrow from a
+        // cold one, but the CPU mul_mat_id scans every slot of the shared pool
+        // tensor, so a larger pool costs more fixed per-layer work. 6 balances
+        // the two.
+        int32_t n_pin_hot_experts_pool_layers;
+
         // print the periodic MoE expert-tier stats report (RAM pin tier + VRAM
         // MoE tier: totals, hit rates, list churn, per-layer breakdown) every N
         // seconds of evaluation (0 = disabled, a final hot-expert summary is

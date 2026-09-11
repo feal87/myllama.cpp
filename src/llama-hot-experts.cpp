@@ -38,6 +38,7 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
     }
     n_pin_total = n_pin * n_moe_layers;
     n_pinned_layer.assign((size_t) model.hparams.n_layer(), 0);
+    pinned_rank_pool.resize((size_t) n_pools);
 
     if (n_moe_layers == 0) {
         if (n_pin > 0) {
@@ -159,16 +160,21 @@ void llama_hot_expert_cache::print_stats() {
 
     uint64_t global_coldest_count = UINT64_MAX;
     uint64_t global_hottest_count = 0;
-    if (!pinned_rank.empty()) {
-        global_coldest_count = std::get<0>(*pinned_rank.begin());
-        global_hottest_count = std::get<0>(*pinned_rank.rbegin());
+    bool     any_rank = false;
+    for (const auto & rank : pinned_rank_pool) {
+        if (rank.empty()) {
+            continue;
+        }
+        any_rank = true;
+        global_coldest_count = std::min(global_coldest_count, std::get<0>(*rank.begin()));
+        global_hottest_count = std::max(global_hottest_count, std::get<0>(*rank.rbegin()));
     }
 
-    LLAMA_LOG_INFO("[pin-hot-experts] RAM tier: pinned=%zu/%d (N=%d x %zu MoE layers)"
+    LLAMA_LOG_INFO("[pin-hot-experts] RAM tier: pinned=%zu/%d (%d pool(s), N=%d)"
                    " | hit=%.1f%% (%" PRIu64 "/%" PRIu64 " routed)"
                    " | churn=%.1f%% (%zu/%zu changed since last report)"
                    " | locked=%.2f MiB (lock calls=%" PRIu64 " slow=%" PRIu64 " fails=%" PRIu64 ")",
-                   total_pinned, n_pin_total, n_pin, layers.size(),
+                   total_pinned, n_pin_total, n_pools, n_pin,
                    total_routed ? 100.0 * n_route_hit / total_routed : 0.0, n_route_hit, total_routed,
                    total_pinned ? 100.0 * n_new / total_pinned : 0.0, n_new, total_pinned,
                    n_bytes_locked / (1024.0 * 1024.0), n_lock_calls, n_lock_slow, n_pin_failures);
@@ -180,7 +186,7 @@ void llama_hot_expert_cache::print_stats() {
                    n_prefetch_bytes / (1024.0 * 1024.0), n_prefetch_failures, n_decays, n_hysteresis_holds,
                    n_min_count_holds);
 
-    if (!pinned_rank.empty()) {
+    if (any_rank) {
         LLAMA_LOG_CONT(" | pinned count range=[%" PRIu64 ", %" PRIu64 "]", global_coldest_count, global_hottest_count);
     }
 
@@ -611,13 +617,47 @@ uint64_t llama_hot_expert_cache::count_of(int il, int32_t expert_id) const {
     return ls.counts[(size_t) expert_id];
 }
 
+void llama_hot_expert_cache::set_disk_stage(llama_disk_stage * ds) {
+    disk_stage = ds;
+    if (ds == nullptr) {
+        return;
+    }
+    // the disk cache's pools become the RAM tier's pools; the not-aligned
+    // fallback (one pool per layer) makes this the old per-layer behaviour
+    n_pools = ds->n_pools() > 0 ? ds->n_pools() : 1;
+    pinned_rank_pool.assign((size_t) n_pools, std::set<std::tuple<uint64_t, int, int32_t>>());
+    layer_pool.assign((size_t) model.hparams.n_layer(), -1);
+    for (int il = 0; il < (int) layer_pool.size(); ++il) {
+        layer_pool[(size_t) il] = ds->pool_id(il);
+    }
+    // real total capacity: one representative layer per pool, since the pool
+    // capacity is shared across its layers
+    n_pin_total = 0;
+    for (int pid = 0; pid < n_pools; ++pid) {
+        for (int il = 0; il < (int) layer_pool.size(); ++il) {
+            if (layer_pool[(size_t) il] == pid) {
+                n_pin_total += ds->resident_capacity(il);
+                break;
+            }
+        }
+    }
+}
+
+int llama_hot_expert_cache::pool_of_layer(int il) const {
+    if (disk_stage == nullptr || layer_pool.empty() || il < 0 || il >= (int) layer_pool.size()) {
+        return 0;
+    }
+    const int p = layer_pool[(size_t) il];
+    return p >= 0 && p < n_pools ? p : 0;
+}
+
 void llama_hot_expert_cache::try_promote(int il, layer_state & ls, int32_t expert_id, uint64_t count, bool vram_resident,
                                          bool apply_hysteresis) {
     if (disk_stage != nullptr) {
-        // the disk decode cache is the RAM tier: keep the hottest experts of each
-        // layer, since the cache has a fixed number of slots per layer
+        // the disk decode cache is the RAM tier: the pool owns the resident
+        // slots, so a hot layer can hold more of them than a cold one
         if (!vram_resident) {
-            try_promote_layer(il, ls, expert_id, count, apply_hysteresis);
+            try_promote_pool(il, ls, expert_id, count, apply_hysteresis);
         }
         return;
     }
@@ -680,8 +720,8 @@ void llama_hot_expert_cache::try_promote(int il, layer_state & ls, int32_t exper
     // the mlock of the newcomer is deferred to the worker.
     std::tuple<uint64_t, int, int32_t> victim{};
     for (;;) {
-        const auto it = pinned_rank.begin();
-        if (it == pinned_rank.end()) {
+        const auto it = pinned_rank_pool[0].begin();
+        if (it == pinned_rank_pool[0].end()) {
             return;  // nothing pinned (all capacity in flight or released)
         }
         const uint64_t key_count = std::get<0>(*it);
@@ -700,13 +740,13 @@ void llama_hot_expert_cache::try_promote(int il, layer_state & ls, int32_t exper
         const int     mem_layer = std::get<1>(*it);
         const int32_t mem_id    = std::get<2>(*it);
         if (pinned.count(expert_key{ mem_layer, mem_id }) == 0) {
-            pinned_rank.erase(it);  // ghost entry from a VRAM takeover; drop it
+            pinned_rank_pool[0].erase(it);  // ghost entry from a VRAM takeover; drop it
             continue;
         }
         const uint64_t true_count = count_of(mem_layer, mem_id);
         if (key_count != true_count) {
-            pinned_rank.erase(it);  // stale-low key: heal it and re-check the bottom
-            pinned_rank.insert({ true_count, mem_layer, mem_id });
+            pinned_rank_pool[0].erase(it);  // stale-low key: heal it and re-check the bottom
+            pinned_rank_pool[0].insert({ true_count, mem_layer, mem_id });
             continue;
         }
         victim = *it;  // exact bottom key: the true coldest pinned expert
@@ -749,7 +789,7 @@ void llama_hot_expert_cache::try_promote(int il, layer_state & ls, int32_t exper
         return;
     }
 
-    pinned_rank.erase(victim);
+    pinned_rank_pool[0].erase(victim);
 
     auto & evict_ls = layers[evict_layer];
     if (!evict_ls.resolved_tensors) {
@@ -770,11 +810,16 @@ void llama_hot_expert_cache::try_promote(int il, layer_state & ls, int32_t exper
     }
 }
 
-void llama_hot_expert_cache::try_promote_layer(int il, layer_state & ls, int32_t expert_id, uint64_t count,
-                                                bool apply_hysteresis) {
+void llama_hot_expert_cache::try_promote_pool(int il, layer_state & ls, int32_t expert_id, uint64_t count,
+                                               bool apply_hysteresis) {
     // caller holds mu; promotion only reserves a slot, fill_cache() reads the
     // bytes in the next time this expert is routed (so it is read once, not twice)
     if (n_pin <= 0 || il < 0 || il >= (int) n_pinned_layer.size()) {
+        return;
+    }
+    // a layer without a decode cache has no pool to promote into; without this
+    // the pool-full path below would evict a resident of pool 0 for nothing
+    if (layer_pool.empty() || il >= (int) layer_pool.size() || layer_pool[(size_t) il] < 0) {
         return;
     }
     if (count < min_pin_count) {
@@ -791,38 +836,57 @@ void llama_hot_expert_cache::try_promote_layer(int il, layer_state & ls, int32_t
         return;
     }
 
-    if (n_pinned_layer[il] < n_pin) {
-        if (disk_stage->resident_add(il, expert_id)) {
-            complete_disk_pin(il, ls, expert_id, bytes);
-        }
+    // a free slot in the pool: take it without evicting anyone
+    if (disk_stage->resident_add(il, expert_id)) {
+        complete_disk_pin(il, ls, expert_id, bytes);
         return;
     }
 
-    // layer full: take over its coldest resident, with the same lead and grace
-    // guards as the global path so count noise cannot swap near-equal experts
-    int32_t  victim = -1;
-    uint64_t vcount = UINT64_MAX;
-    for (uint32_t e = 0; e < ls.n_experts; ++e) {
-        if ((ls.pin_state[e] & PIN_RESIDENT) == 0) {
+    // the pool is full: take over its coldest resident, with the same lead and
+    // grace guards as the global path so count noise cannot swap near-equal
+    // experts. Walking up from the cold end heals stale keys and drops ghosts
+    // until the bottom key is exact
+    const int pool = pool_of_layer(il);
+    auto & rank = pinned_rank_pool[(size_t) pool];
+
+    std::tuple<uint64_t, int, int32_t> victim{};
+    for (;;) {
+        auto it = rank.begin();
+        if (it == rank.end()) {
+            return;  // nothing pinned in this pool
+        }
+        const uint64_t key_count = std::get<0>(*it);
+        if (count <= key_count) {
+            return;
+        }
+        if (apply_hysteresis && count < key_count + takeover_min_lead) {
+            n_hysteresis_holds++;
+            return;
+        }
+        const int     mem_layer = std::get<1>(*it);
+        const int32_t mem_id    = std::get<2>(*it);
+        if (pinned.count(expert_key{ mem_layer, mem_id }) == 0) {
+            rank.erase(it);  // ghost entry from a VRAM takeover; drop it
             continue;
         }
-        const uint64_t c = ls.counts[e];
-        if (c < vcount) {
-            vcount = c;
-            victim = (int32_t) e;
+        const uint64_t true_count = count_of(mem_layer, mem_id);
+        if (key_count != true_count) {
+            rank.erase(it);  // stale-low key: heal it and re-check the bottom
+            rank.insert({ true_count, mem_layer, mem_id });
+            continue;
         }
-    }
-    if (victim < 0 || count <= vcount) {
-        return;
-    }
-    if (apply_hysteresis && count < vcount + takeover_min_lead) {
-        n_hysteresis_holds++;
-        return;
+        victim = *it;
+        break;
     }
 
-    expert_key key{ il, expert_id };
+    const int     evict_layer = std::get<1>(victim);
+    const int32_t evict_id    = std::get<2>(victim);
+
+    // hysteresis: an expert that was itself just evicted stays out for
+    // evict_grace_tokens decode tokens, or the takeover victim would climb right
+    // back on its next routes and take the slot from its own replacement
     if (apply_hysteresis) {
-        auto ev = evicted_at.find(key);
+        auto ev = evicted_at.find(expert_key{ il, expert_id });
         if (ev != evicted_at.end()) {
             if (n_content_tokens - ev->second < evict_grace_tokens) {
                 n_hysteresis_holds++;
@@ -832,12 +896,17 @@ void llama_hot_expert_cache::try_promote_layer(int il, layer_state & ls, int32_t
         }
     }
 
-    // the cache has exactly n_pin resident slots per layer, so the resident bytes
-    // of a layer are bounded by its slots; no byte-budget check is needed
-    unpin_expert(il, ls, victim);  // frees the victim's slot
+    rank.erase(victim);
+
+    auto & evict_ls = layers[evict_layer];
+    if (!evict_ls.resolved_tensors) {
+        resolve_tensors(evict_layer, evict_ls);
+    }
+    unpin_expert(evict_layer, evict_ls, evict_id);  // frees the victim's pool slot
+    evicted_at[expert_key{ evict_layer, evict_id }] = n_content_tokens;
+
     if (disk_stage->resident_add(il, expert_id)) {
         complete_disk_pin(il, ls, expert_id, bytes);
-        evicted_at[expert_key{ il, victim }] = n_content_tokens;
     }
 }
 
@@ -851,7 +920,7 @@ void llama_hot_expert_cache::complete_disk_pin(int il, layer_state & ls, int32_t
     if (expert_id >= 0 && (uint32_t) expert_id < ls.n_experts) {
         ls.pin_state[(size_t) expert_id] |= PIN_RESIDENT;
     }
-    pinned_rank.insert({ count_of(il, expert_id), il, expert_id });
+    pinned_rank_pool[(size_t) pool_of_layer(il)].insert({ count_of(il, expert_id), il, expert_id });
     if (il >= 0 && il < (int) n_pinned_layer.size()) {
         n_pinned_layer[il]++;
     }
@@ -1020,7 +1089,7 @@ void llama_hot_expert_cache::pin_worker_main() {
         if (job.expert_id >= 0 && (uint32_t) job.expert_id < wls.n_experts) {
             wls.pin_state[(size_t) job.expert_id] |= PIN_RESIDENT;
         }
-        pinned_rank.insert({ c, job.il, job.expert_id });
+        pinned_rank_pool[(size_t) pool_of_layer(job.il)].insert({ c, job.il, job.expert_id });
         evicted_at.erase(key);  // pinned again: the grace bookkeeping is moot
     }
 }
@@ -1047,10 +1116,10 @@ void llama_hot_expert_cache::unpin_expert(int il, layer_state & ls, int32_t expe
 
 void llama_hot_expert_cache::rebuild_pinned_rank() {
     // caller holds mu
-    pinned_rank.clear();
+    pinned_rank_pool.assign((size_t) n_pools, std::set<std::tuple<uint64_t, int, int32_t>>());
     for (const auto & kv : pinned) {
         const expert_key & key = kv.first;
-        pinned_rank.insert({ count_of(key.layer, key.expert_id), key.layer, key.expert_id });
+        pinned_rank_pool[(size_t) pool_of_layer(key.layer)].insert({ count_of(key.layer, key.expert_id), key.layer, key.expert_id });
     }
 }
 

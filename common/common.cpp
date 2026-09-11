@@ -1763,6 +1763,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.cb_eval_user_data = params.cb_eval_user_data;
     cparams.n_pin_hot_experts  = params.n_pin_hot_experts;
     cparams.n_pin_hot_experts_budget_bytes = params.n_pin_hot_experts_budget_mib * 1024ull * 1024ull;
+    cparams.n_pin_hot_experts_pool_layers  = params.n_pin_hot_experts_pool_layers;
     cparams.n_experts_stats_interval = params.n_experts_stats_interval;
     cparams.n_pin_hot_experts_decay_tokens   = params.n_pin_hot_experts_decay_tokens;
     cparams.n_pin_hot_experts_min_count      = params.n_pin_hot_experts_min_count;

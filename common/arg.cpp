@@ -2862,6 +2862,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PIN_HOTEXPERTS_BUDGET_MIB"));
     add_opt(common_arg(
+        {"--pin-hot-experts-pool-layers"}, "N",
+        string_format(
+            "with --load-mode dio, max MoE layers sharing one disk decode-cache\n"
+            "pool (default: %d, 0 = no limit, 1 = no pooling). Layers in a\n"
+            "pool share resident experts, so a hot layer can borrow slots from\n"
+            "a cold one and raise the hit rate. The CPU mul_mat_id scans every\n"
+            "slot of the shared pool tensor, so a large pool adds fixed\n"
+            "per-layer work; smaller pools trade sharing for speed. 6 is a good\n"
+            "balance; sweep it if decode throughput matters",
+            params.n_pin_hot_experts_pool_layers
+        ),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --pin-hot-experts-pool-layers must be >= 0");
+            }
+            params.n_pin_hot_experts_pool_layers = value;
+        }
+    ).set_env("LLAMA_ARG_PIN_HOTEXPERTS_POOL_LAYERS"));
+    add_opt(common_arg(
         {"--experts-stats-interval"}, "N",
         string_format(
             "print the periodic MoE expert-tier stats report (RAM pin tier + VRAM\n"
