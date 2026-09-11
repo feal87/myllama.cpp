@@ -1,6 +1,7 @@
 #include "llama-disk-stage.h"
 
 #include "llama-impl.h"
+#include "llama-mmap.h"
 #include "llama-model.h"
 
 #include "ggml.h"
@@ -205,6 +206,7 @@ struct llama_disk_stage::impl {
     };
     ggml_backend_buffer_t cache_pool = nullptr;
     ggml_context *        cache_ctx  = nullptr;
+    std::unique_ptr<llama_mlock> cache_lock; // decode cache held in RAM for the process lifetime
     std::vector<cache_layer> cache;
     std::mutex   cache_mu;       // guards resident_slot / free_slots and table writes
     std::mutex   io_mu;          // one reaper at a time: the IOCP is shared by all reads
@@ -244,6 +246,49 @@ struct llama_disk_stage::impl {
             CloseHandle(iocp);
         }
 #endif
+    }
+
+    // Hold the decode cache's RAM for real. The cache replaces a disk read, so a
+    // page that can be paged out is worse than no cache at all: evicting it costs
+    // a pagefile write, and the next "hit" is a pagefile read off the same disk.
+    // VirtualLock makes the range unpageable, and the touch makes the pages private
+    // (a locked page that was never written can still be the shared zero page).
+    bool lock_cache(void * base, size_t bytes) {
+        if (!llama_mlock::SUPPORTED) {
+            LLAMA_LOG_ERROR("%s: the decode cache cannot be held in RAM on this platform\n", __func__);
+            return false;
+        }
+
+        // the minimum working set is the quota VirtualLock is measured against,
+        // so raise it first; the extra MiB cover the lock bookkeeping itself
+        if (!llama_mlock::reserve_working_set(bytes + 64 * 1024 * 1024)) {
+            LLAMA_LOG_ERROR("%s: could not reserve a working set for the %.2f GiB decode cache; "
+                            "lower --pin-hot-experts-budget-mib\n",
+                            __func__, bytes / (1024.0 * 1024.0 * 1024.0));
+            return false;
+        }
+
+        cache_lock = std::make_unique<llama_mlock>();
+        cache_lock->init(base);
+        cache_lock->grow_to(bytes);
+        if (cache_lock->size() < bytes) {
+            LLAMA_LOG_ERROR("%s: only %.2f of the %.2f GiB decode cache could be held in RAM; "
+                            "lower --pin-hot-experts-budget-mib\n",
+                            __func__, cache_lock->size() / (1024.0 * 1024.0 * 1024.0),
+                            bytes / (1024.0 * 1024.0 * 1024.0));
+            cache_lock.reset();
+            return false;
+        }
+
+        const int64_t t0 = ggml_time_us();
+        char * cp = (char *) base;
+        for (size_t off = 0; off < bytes; off += disk_stage_align) {
+            cp[off] = 0;
+        }
+        LLAMA_LOG_INFO("%s: decode cache held in RAM: %.2f GiB locked, touched in %.0f ms\n",
+                       __func__, bytes / (1024.0 * 1024.0 * 1024.0), (ggml_time_us() - t0) / 1000.0);
+
+        return true;
     }
 
     disk_stage_file * file_for(const std::string & path) {
@@ -574,6 +619,10 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                 } else {
                     ggml_backend_buffer_set_usage(p.cache_pool, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
                     char * cbase = (char *) align_up((uintptr_t) ggml_backend_buffer_get_base(p.cache_pool), disk_stage_align);
+
+                    if (!p.lock_cache(cbase, cache_bytes)) {
+                        throw std::runtime_error("failed to hold the MoE decode cache in RAM");
+                    }
 
                     ggml_init_params cip = {
                         /*.mem_size   =*/ ggml_tensor_overhead() * (size_t) (n_layer * 5 + 16),
