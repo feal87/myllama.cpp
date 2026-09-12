@@ -2281,7 +2281,7 @@ bool common_prompt_batch_decode(
 
 size_t common_prompt_checkpoint::size() const {
     if (on_disk) {
-        return size_tgt;
+        return size_tgt + size_dft + size_spec;
     }
     return data_tgt.size() + data_dft.size() + data_spec.size();
 }
@@ -2299,9 +2299,13 @@ void common_prompt_checkpoint::clear() {
     pos_min = 0;
     pos_max = 0;
 
-    on_disk  = false;
-    off_tgt  = 0;
-    size_tgt = 0;
+    on_disk   = false;
+    off_tgt   = 0;
+    size_tgt  = 0;
+    off_dft   = 0;
+    size_dft  = 0;
+    off_spec  = 0;
+    size_spec = 0;
 
     data_tgt.clear();
     data_dft.clear();

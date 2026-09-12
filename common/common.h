@@ -680,7 +680,6 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
-    bool    slot_ckpt_disk      = false; // snapshot a checkpoint at every prefill batch (set -b == -ub)
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     int32_t cache_disk_max_mib  = -1;    // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
@@ -1227,10 +1226,14 @@ struct common_prompt_checkpoint {
     // (e.g. eagle3's deferred-boundary g_embd row)
     std::vector<uint8_t> data_spec;
 
-    // slot checkpoint store: the target blob lives in the slot file, data_tgt stays empty
+    // slot checkpoint store: the blobs live in the slot file, the data_* vectors stay empty
     bool     on_disk  = false;
     uint64_t off_tgt  = 0;
     uint64_t size_tgt = 0;
+    uint64_t off_dft  = 0;
+    uint64_t size_dft = 0;
+    uint64_t off_spec = 0;
+    uint64_t size_spec = 0;
 
     size_t size() const;
 

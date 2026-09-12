@@ -391,32 +391,9 @@ struct server_slot {
             return false;
         }
 
-        if (cur->data.is_disk()) {
-            GGML_ASSERT(cur->data.mapping != nullptr);
-
-            const size_t n_tgt = llama_state_seq_get_data_ext(
-                ctx_tgt, cur->data.mapping, cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-            if (n_tgt != cur_size_tgt) {
-                SLT_WRN(*this, "failed to save target prompt state: expected %zu bytes, wrote %zu\n", cur_size_tgt, n_tgt);
-                prompt_cache.discard(cur);
-                return false;
-            }
-            if (ctx_dft) {
-                const size_t n_dft = llama_state_seq_get_data_ext(
-                    ctx_dft, cur->data.mapping + cur_size_tgt, cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-                if (n_dft != cur_size_dft) {
-                    SLT_WRN(*this, "failed to save draft prompt state: expected %zu bytes, wrote %zu\n", cur_size_dft, n_dft);
-                    prompt_cache.discard(cur);
-                    return false;
-                }
-            }
-
-            return prompt_cache.commit(cur);
-        } else {
-            llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-            if (ctx_dft) {
-                llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-            }
+        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (ctx_dft) {
+            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
 
         return true;
@@ -1403,6 +1380,7 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+                save_slot_full_state(id_slot);
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {
@@ -1451,40 +1429,20 @@ private:
         }
 
         const bool cache_disk_enabled = !params_base.cache_disk_path.empty() && params_base.cache_disk_max_mib != 0;
-        const bool prompt_cache_enabled = cache_disk_enabled || params_base.cache_ram_mib != 0;
+        const bool prompt_cache_enabled = params_base.cache_ram_mib != 0;
 
         if (prompt_cache_enabled) {
-            const int32_t cache_limit_mib = cache_disk_enabled ? params_base.cache_disk_max_mib : params_base.cache_ram_mib;
-            const size_t cache_limit_tokens = cache_disk_enabled ? 0 : n_ctx;
+            SRV_TRC("%s", "prompt cache is enabled in RAM\n");
 
-            if (cache_disk_enabled) {
-                std::error_code ec;
-                std::filesystem::create_directories(params_base.cache_disk_path, ec);
-                const bool cache_dir_valid = !ec && std::filesystem::is_directory(params_base.cache_disk_path, ec);
-                if (ec || !cache_dir_valid) {
-                    SRV_ERR("failed to create prompt cache directory %s: %s\n",
-                            params_base.cache_disk_path.c_str(), ec ? ec.message().c_str() : "path is not a directory");
-                    return false;
-                }
-                SRV_TRC("prompt cache is enabled on disk: %s\n", params_base.cache_disk_path.c_str());
-            } else {
-                SRV_TRC("%s", "prompt cache is enabled in RAM\n");
-            }
-
-            if (cache_limit_mib < 0) {
+            if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache size limit: %s\n", "no limit");
             } else {
-                SRV_TRC("prompt cache size limit: %d MiB\n", cache_limit_mib);
+                SRV_TRC("prompt cache size limit: %d MiB\n", params_base.cache_ram_mib);
             }
 
-            prompt_cache = std::make_unique<server_prompt_cache>(
-                cache_limit_mib,
-                cache_limit_tokens,
-                cache_disk_enabled ? params_base.cache_disk_path : "",
-                cache_disk_enabled ? server_prompt_cache_key(params_base, ctx_tgt, ctx_dft) : "",
-                mctx != nullptr);
+            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
         } else {
-            SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` or `--cache-disk PATH` to enable it\n");
+            SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
@@ -1495,31 +1453,30 @@ private:
             SRV_TRC("%s", "context checkpoints disabled\n");
         }
 
-        if (params_base.slot_ckpt_disk) {
+        if (cache_disk_enabled) {
             if (params_base.n_batch != params_base.n_ubatch) {
-                SRV_WRN("--slot-ckpt-disk: n_batch (%d) != n_ubatch (%d), checkpoints land on batch boundaries, not ubatch boundaries\n",
+                SRV_WRN("--cache-disk: n_batch (%d) != n_ubatch (%d), checkpoints land on batch boundaries, not ubatch boundaries\n",
                         params_base.n_batch, params_base.n_ubatch);
             } else {
-                SRV_TRC("--slot-ckpt-disk: one checkpoint per prefilled batch (n_batch == n_ubatch == %d)\n", params_base.n_batch);
+                SRV_TRC("--cache-disk: one checkpoint per prefilled batch (n_batch == n_ubatch == %d)\n", params_base.n_batch);
             }
 
-            if (!cache_disk_enabled) {
-                SRV_WRN("%s", "--slot-ckpt-disk needs --cache-disk PATH, keeping checkpoints in RAM\n");
-            } else {
-                const bool use_dio = params_base.load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
-                const size_t max_bytes = params_base.cache_disk_max_mib >= 0
-                    ? (size_t) params_base.cache_disk_max_mib * 1024 * 1024
-                    : 0;
+            const bool use_dio = params_base.load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
+            const size_t max_bytes = params_base.cache_disk_max_mib > 0
+                ? (size_t) params_base.cache_disk_max_mib * 1024 * 1024
+                : 0;
 
-                ckpt_store = std::make_unique<server_ckpt_store>(
-                    params_base.cache_disk_path,
-                    server_prompt_cache_key(params_base, ctx_tgt, ctx_dft),
-                    use_dio,
-                    max_bytes);
+            server_ckpt_store::config store_cfg;
+            store_cfg.dir       = params_base.cache_disk_path;
+            store_cfg.key       = server_prompt_cache_key(params_base, ctx_tgt, ctx_dft);
+            store_cfg.use_dio   = use_dio;
+            store_cfg.has_mtmd  = mctx != nullptr;
+            store_cfg.max_bytes = max_bytes;
 
-                SRV_TRC("slot checkpoint store on disk: %s (dio = %d, max = %zu MiB)\n",
-                        params_base.cache_disk_path.c_str(), (int) use_dio, max_bytes / (1024 * 1024));
-            }
+            ckpt_store = std::make_unique<server_ckpt_store>(std::move(store_cfg));
+
+            SRV_TRC("slot checkpoint store on disk: %s (dio = %d, max = %zu MiB)\n",
+                    params_base.cache_disk_path.c_str(), (int) use_dio, max_bytes / (1024 * 1024));
         }
 
         if (!params_base.model_alias.empty()) {
@@ -1806,6 +1763,55 @@ private:
                 prompt_cache->update();
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+            }
+
+            // the store keeps a full state plus a checkpoint ladder per session.
+            // when it covers a longer prefix than the prompt cache restored, load
+            // the full state (attention + recurrent) and adopt its checkpoints.
+            if (ckpt_store &&
+                    task.type == SERVER_TASK_TYPE_COMPLETION &&
+                    ret->prompt.checkpoints.empty()) {
+                size_t index = 0;
+                float f_keep = 0.0f;
+                float f_sim  = 0.0f;
+
+                if (ckpt_store->find_best(task.tokens, index, f_keep, f_sim)) {
+                    server_tokens tokens;
+                    server_ckpt_store::full_state full;
+                    std::list<common_prompt_checkpoint> checkpoints;
+                    if (ckpt_store->adopt(ret->id, index, tokens, full, checkpoints)) {
+                        const bool use_full = full.valid() &&
+                            (ret->prompt.tokens.empty() || tokens.size() >= ret->prompt.tokens.size());
+
+                        bool loaded = !use_full;
+                        if (use_full) {
+                            std::vector<uint8_t> buf(full.size_tgt);
+                            if (ckpt_store->read(ret->id, full.off_tgt, full.size_tgt, buf.data()) &&
+                                    llama_state_seq_set_data_ext(ctx_tgt, buf.data(), buf.size(), ret->id, LLAMA_STATE_SEQ_FLAGS_NONE) == full.size_tgt) {
+                                loaded = true;
+                                if (ctx_dft != nullptr && full.size_dft > 0) {
+                                    buf.resize(full.size_dft);
+                                    if (ckpt_store->read(ret->id, full.off_dft, full.size_dft, buf.data())) {
+                                        llama_state_seq_set_data_ext(ctx_dft, buf.data(), buf.size(), ret->id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                                    }
+                                }
+                                ret->prompt.tokens = std::move(tokens);
+                            }
+                        }
+
+                        if (loaded) {
+                            if (ret->prompt.tokens.empty()) {
+                                ret->prompt.tokens = std::move(tokens);
+                            }
+                            const size_t n = checkpoints.size();
+                            for (auto & c : checkpoints) {
+                                ret->prompt.checkpoints.push_back(std::move(c));
+                            }
+                            SLT_INF(*ret, "adopted %zu on-disk context checkpoints from a previous session (full = %d, f_sim = %.3f)\n",
+                                    n, (int) use_full, f_sim);
+                        }
+                    }
+                }
             }
         }
 
@@ -2459,6 +2465,78 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
+    // persist the slot's full state (attention + recurrent) so a restart can
+    // rebuild the context instead of re-prefilling the whole prompt
+    void save_slot_full_state(int id_slot) {
+        if (!ckpt_store) {
+            return;
+        }
+
+        server_slot * slot = get_slot_by_id(id_slot);
+        if (slot == nullptr || slot->prompt.tokens.empty()) {
+            return;
+        }
+        if (!slot->task_prev || slot->task_prev->type != SERVER_TASK_TYPE_COMPLETION) {
+            return;
+        }
+
+        const size_t n_tgt = llama_state_seq_get_size_ext(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (n_tgt == 0) {
+            return;
+        }
+
+        std::vector<uint8_t> tgt(n_tgt);
+        if (llama_state_seq_get_data_ext(ctx_tgt, tgt.data(), n_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) != n_tgt) {
+            SLT_WRN(*slot, "%s", "failed to snapshot full target state\n");
+            return;
+        }
+
+        std::vector<uint8_t> dft;
+        if (ctx_dft != nullptr) {
+            const size_t n_dft = llama_state_seq_get_size_ext(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (n_dft > 0) {
+                dft.resize(n_dft);
+                if (llama_state_seq_get_data_ext(ctx_dft, dft.data(), n_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) != n_dft) {
+                    SLT_WRN(*slot, "%s", "failed to snapshot full draft state\n");
+                    dft.clear();
+                }
+            }
+        }
+
+        if (!ckpt_store->write_full(id_slot, tgt.data(), tgt.size(),
+                dft.empty() ? nullptr : dft.data(), dft.size())) {
+            SLT_WRN(*slot, "%s", "failed to append the full state\n");
+            return;
+        }
+
+        std::vector<std::pair<uint64_t, uint64_t>> remap;
+        ckpt_store->maybe_compact(id_slot, remap);
+        for (auto & c : slot->prompt.checkpoints) {
+            if (!c.on_disk) {
+                continue;
+            }
+            auto remap_off = [&](uint64_t & off) {
+                if (off == 0) {
+                    return;
+                }
+                for (const auto & m : remap) {
+                    if (m.first == off) {
+                        off = m.second;
+                        return;
+                    }
+                }
+            };
+            remap_off(c.off_tgt);
+            remap_off(c.off_dft);
+            remap_off(c.off_spec);
+        }
+
+        ckpt_store->write_meta(id_slot, slot->prompt.tokens, slot->prompt.checkpoints);
+
+        SLT_INF(*slot, "saved full state (%.1f MiB) with %zu checkpoints for restart\n",
+                tgt.size() / (1024.0 * 1024.0), slot->prompt.checkpoints.size());
+    }
+
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
@@ -2534,15 +2612,23 @@ private:
                 if (!c.on_disk) {
                     continue;
                 }
-                for (const auto & m : remap) {
-                    if (m.first == c.off_tgt) {
-                        c.off_tgt = m.second;
-                        break;
+                auto remap_off = [&](uint64_t & off) {
+                    if (off == 0) {
+                        return;
                     }
-                }
+                    for (const auto & m : remap) {
+                        if (m.first == off) {
+                            off = m.second;
+                            return;
+                        }
+                    }
+                };
+                remap_off(c.off_tgt);
+                remap_off(c.off_dft);
+                remap_off(c.off_spec);
             }
 
-            const size_t n = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            size_t n = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
             std::vector<uint8_t> buf(n);
             if (n > 0 && llama_state_seq_get_data_ext(ctx_tgt, buf.data(), n, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == n) {
                 const uint64_t off = ckpt_store->append(slot.id, buf.data(), n);
@@ -2552,14 +2638,44 @@ private:
                     cur.size_tgt = n;
                 }
             }
+
+            if (cur.on_disk) {
+                if (ctx_dft != nullptr) {
+                    n = llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    if (n > 0) {
+                        buf.resize(n);
+                        if (llama_state_seq_get_data_ext(ctx_dft, buf.data(), n, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == n) {
+                            const uint64_t off = ckpt_store->append(slot.id, buf.data(), n);
+                            if (off != UINT64_MAX) {
+                                cur.off_dft  = off;
+                                cur.size_dft = n;
+                            }
+                        }
+                    }
+                }
+
+                std::vector<uint8_t> spec_state;
+                common_speculative_get_state(spec.get(), slot.id, spec_state);
+                if (!spec_state.empty()) {
+                    const uint64_t off = ckpt_store->append(slot.id, spec_state.data(), spec_state.size());
+                    if (off != UINT64_MAX) {
+                        cur.off_spec  = off;
+                        cur.size_spec = spec_state.size();
+                    }
+                }
+            }
         }
 
         if (!cur.on_disk) {
             cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            // stash the draft's speculative state with the checkpoint
+            common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
         }
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        // stash the draft's speculative state with the checkpoint
-        common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+
+        if (ckpt_store) {
+            ckpt_store->write_meta(slot.id, slot.prompt.tokens, slot.prompt.checkpoints);
+        }
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -3567,12 +3683,24 @@ private:
                                             if (ckpt_store->read(slot.id, it->off_tgt, it->size_tgt, buf.data())) {
                                                 llama_state_seq_set_data_ext(ctx_tgt, buf.data(), buf.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                             }
+                                            if (ctx_dft != nullptr && it->size_dft > 0) {
+                                                buf.resize(it->size_dft);
+                                                if (ckpt_store->read(slot.id, it->off_dft, it->size_dft, buf.data())) {
+                                                    llama_state_seq_set_data_ext(ctx_dft, buf.data(), buf.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                                }
+                                            }
+                                            if (it->size_spec > 0) {
+                                                std::vector<uint8_t> spec_state(it->size_spec);
+                                                if (ckpt_store->read(slot.id, it->off_spec, it->size_spec, spec_state.data())) {
+                                                    common_speculative_set_state(spec.get(), slot.id, spec_state);
+                                                }
+                                            }
                                         } else {
                                             it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                            it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                            // restore the draft's speculative state
+                                            common_speculative_set_state(spec.get(), slot.id, it->data_spec);
                                         }
-                                        it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        // restore the draft's speculative state
-                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
@@ -3601,6 +3729,10 @@ private:
                                     } else {
                                         ++it;
                                     }
+                                }
+
+                                if (ckpt_store) {
+                                    ckpt_store->write_meta(slot.id, slot.prompt.tokens, slot.prompt.checkpoints);
                                 }
                             }
                         }
@@ -3753,7 +3885,7 @@ private:
                         slot.prompt.tokens.push_back(cur_tok);
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (!params_base.slot_ckpt_disk && do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
+                        if (ckpt_store == nullptr && do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
@@ -3767,7 +3899,7 @@ private:
                         //  - 4 + n_ubatch
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        if (!params_base.slot_ckpt_disk && do_checkpoint) {
+                        if (ckpt_store == nullptr && do_checkpoint) {
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
                             bool should_break = false;
@@ -3810,7 +3942,7 @@ private:
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
-                        if (!params_base.slot_ckpt_disk && !is_user_start && !near_prompt_end) {
+                        if (ckpt_store == nullptr && !is_user_start && !near_prompt_end) {
                             do_checkpoint = false;
                         }
                     }
@@ -3829,7 +3961,7 @@ private:
 
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
-                            params_base.slot_ckpt_disk ||
+                            ckpt_store != nullptr ||
                             slot.prompt.checkpoints.empty() ||
                             is_last_user_message || near_prompt_end ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
