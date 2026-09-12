@@ -1943,6 +1943,14 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched);
 }
 
+void ggml_backend_sched_release_buffers(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    // the caller must guarantee no graph is in flight before the buffers go away
+    ggml_backend_sched_synchronize(sched);
+    ggml_gallocr_release_buffers(sched->galloc);
+    ggml_backend_sched_reset(sched);
+}
+
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     // reset state for the next run

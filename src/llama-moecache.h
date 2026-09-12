@@ -128,6 +128,11 @@ class llama_moe_cache {
     // allocated (not enough free device memory for the requested budget).
     void reserve();
 
+    // add the device bytes reclaimed from the prefill compute buffer to the
+    // decode-time budget (called once at context creation, after reserve()).
+    // The --moe-expert-cache-budget-mib value stays the prefill-safe base
+    void set_decode_budget_extra(uint64_t extra_bytes);
+
     // called before every decode ubatch until activated: sizes the per-layer
     // capacities from the observed routing profile and binds the cache tensors
     // into the pool reserved by reserve(). Also called once per new prompt once

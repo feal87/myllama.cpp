@@ -613,6 +613,22 @@ llama_context::llama_context(
     if (moe_cache) {
         moe_cache->reserve();
     }
+
+    // VRAM swap: when a MoE cache is active, prefill keeps the compute buffers
+    // and decode hands them over to the cache. The pool reserved above is the
+    // user's prefill-safe base; the reclaimed prefill compute bytes are added to
+    // the budget used from the first decode on (see vram_swap). Start in prefill
+    // mode, where both are allocated as before this feature
+    if (moe_cache && cparams.n_ubatch > 1 && moe_cache->budget_bytes() > 0) {
+        const uint64_t extra = vram_reclaim_bytes();
+        if (extra > 0) {
+            moe_cache->set_decode_budget_extra(extra);
+            vram_swap_enabled = true;
+            vram_prefill_mode = true;
+            LLAMA_LOG_INFO("%s: VRAM swap enabled: %.1f MiB of the prefill compute buffer will be reclaimed for the MoE expert cache on decode\n",
+                    __func__, extra/(1024.0*1024.0));
+        }
+    }
 }
 
 llama_context::~llama_context() {
@@ -730,9 +746,13 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    // the max_nodes budget always stays at the prefill size: the graph contexts
+    // must be able to hold a prefill graph even while the compute buffer is
+    // reserved at the decode size (VRAM swap)
+    const uint32_t n_tokens_max = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_tokens = (vram_swap_enabled && !vram_prefill_mode) ? n_seqs : n_tokens_max;
 
-    const size_t max_nodes = this->graph_max_nodes(n_tokens);
+    const size_t max_nodes = this->graph_max_nodes(n_tokens_max);
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
@@ -770,6 +790,16 @@ void llama_context::sched_reserve() {
     int n_nodes_tg  = -1;
 
     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+
+    // measure the pp-only and tg-only compute sizes once, before the real
+    // reserves overwrite the allocator layout. The VRAM swap adds their
+    // difference to the decode-time MoE cache budget
+    if (moe_cache && cparams.n_ubatch > 1 && backend_buf_tg_size.empty()) {
+        backend_buf_pp_size.assign(backend_ptrs.size(), 0);
+        backend_buf_tg_size.assign(backend_ptrs.size(), 0);
+        graph_reserve(n_tokens_max, n_seqs, std::min(n_tokens_max, cparams.n_outputs_max), mctx.get(), true, backend_buf_pp_size.data());
+        graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), true, backend_buf_tg_size.data());
+    }
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
@@ -1999,6 +2029,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
     n_queued_tokens += n_tokens_all;
 
     output_swaps.clear();
+
+    // VRAM swap: the prefill compute buffers and the MoE expert cache pool never
+    // coexist. A multi-token batch is prefill (keeps the buffers), a single-token
+    // one is decode (keeps the cache). Before sched_reserve() so a re-reserve
+    // uses the mode
+    vram_swap(n_tokens_all > 1);
 
     sched_reserve();
 
@@ -3724,7 +3760,62 @@ bool llama_context::moe_cache_suspend() {
 }
 
 bool llama_context::moe_cache_resume() {
-    return moe_cache ? moe_cache->resume() : false;
+    if (!moe_cache) {
+        return false;
+    }
+    // during prefill the pool stays released for the compute buffers; it comes
+    // back at the next decode (see vram_swap)
+    if (vram_swap_enabled && vram_prefill_mode) {
+        return false;
+    }
+    return moe_cache->resume();
+}
+
+uint64_t llama_context::vram_reclaim_bytes() const {
+    if (!moe_cache) {
+        return 0;
+    }
+    const ggml_backend_dev_t dev = moe_cache->device();
+    if (dev == nullptr) {
+        return 0;
+    }
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        if (ggml_backend_get_device(backend_ptrs[i]) != dev) {
+            continue;
+        }
+        const size_t pp = i < backend_buf_pp_size.size() ? backend_buf_pp_size[i] : 0;
+        const size_t tg = i < backend_buf_tg_size.size() ? backend_buf_tg_size[i] : 0;
+        return pp > tg ? (uint64_t) (pp - tg) : 0;
+    }
+    return 0;
+}
+
+void llama_context::vram_swap(bool to_prefill) {
+    if (!moe_cache || !vram_swap_enabled || to_prefill == vram_prefill_mode) {
+        return;
+    }
+
+    // no graph may reference the buffers that are about to go away
+    synchronize();
+
+    if (to_prefill) {
+        // decode -> prefill: hand the VRAM back to the compute buffers
+        moe_cache->suspend();
+        ggml_backend_sched_release_buffers(sched.get());
+        vram_prefill_mode = true;
+    } else {
+        // prefill -> decode: hand the VRAM back to the MoE cache. The pool may
+        // still hold the prefill-safe base size (first decode after start-up)
+        moe_cache->suspend();
+        ggml_backend_sched_release_buffers(sched.get());
+        moe_cache->resume();
+        vram_prefill_mode = false;
+    }
+
+    // the graph that referenced the released buffers must not be reused
+    if (gf_res_prev) {
+        gf_res_prev->reset();
+    }
 }
 
 uint64_t llama_context::moe_cache_budget_bytes() const {

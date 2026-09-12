@@ -1128,6 +1128,30 @@ size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
     return ggml_vbuffer_size(galloc->buffers[buffer_id]);
 }
 
+void ggml_gallocr_release_buffers(ggml_gallocr_t galloc) {
+    if (galloc == NULL) {
+        return;
+    }
+
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        struct vbuffer * buf = galloc->buffers[i];
+        if (buf == NULL) {
+            continue;
+        }
+        // the same buffer is shared by all buffer types that point to the same allocator
+        for (int j = i; j < galloc->n_buffers; j++) {
+            if (galloc->buffers[j] == buf) {
+                galloc->buffers[j] = NULL;
+            }
+        }
+        ggml_vbuffer_free(buf);
+    }
+
+    // force the next ggml_gallocr_alloc_graph() to re-reserve
+    galloc->n_nodes = 0;
+    galloc->n_leafs = 0;
+}
+
 // utils
 
 static void free_buffers(ggml_backend_buffer_t ** buffers, const size_t * n_buffers) {

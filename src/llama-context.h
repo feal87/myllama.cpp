@@ -201,6 +201,13 @@ struct llama_context {
     uint64_t moe_cache_budget_bytes() const;
     ggml_backend_dev_t moe_cache_device() const;
 
+    // switch the VRAM between the prefill compute buffers and the MoE cache pool
+    // (no-op unless the swap is enabled and the side actually changes)
+    void vram_swap(bool to_prefill);
+    // device bytes the MoE cache reclaims when the prefill compute buffer is
+    // released (pp size - tg size on the cache's device, 0 when unavailable)
+    uint64_t vram_reclaim_bytes() const;
+
     //
     // training
     //
@@ -302,6 +309,20 @@ private:
     // --moe-expert-cache*: GPU-resident cache for host-offloaded MoE experts
     // (null when disabled or when the model has no cacheable layer)
     std::unique_ptr<llama_moe_cache> moe_cache;
+
+    // VRAM swap between the prefill compute buffers and the MoE expert cache:
+    // enabled automatically when a MoE cache is configured and n_ubatch > 1.
+    // Prefill keeps the compute buffers (the cache pool is suspended); decode
+    // keeps the cache pool (the prefill-sized compute buffers are released).
+    // vram_prefill_mode is the current side of the swap; the start-up state is
+    // prefill (both are allocated, as before this feature)
+    bool vram_swap_enabled = false;
+    bool vram_prefill_mode = false;
+    // compute buffer sizes measured at context creation: the prefill worst case
+    // and the single-token case. Their difference is the decode-time budget the
+    // MoE cache reclaims when the prefill buffers are released
+    std::vector<size_t> backend_buf_pp_size;
+    std::vector<size_t> backend_buf_tg_size;
 
     // --load-mode dio: direct-read streaming of the MoE expert weights into a
     // pinned host slab and a per-layer decode cache (null when not requested)

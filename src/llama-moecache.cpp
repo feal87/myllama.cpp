@@ -92,10 +92,12 @@ struct llama_moe_cache::impl {
     llama_hot_expert_cache * const hot;
     llama_disk_stage * disk = nullptr; // set by set_disk_stage() before reserve()
     bool disk_mode = false;            // == disk != nullptr
-    const uint64_t budget_bytes;   // total device footprint of the cache, reserved up-front as one pool
+    uint64_t budget_bytes;         // current total device footprint of the cache (budget_base + budget_extra)
+    const uint64_t budget_base;    // the user's prefill-safe --moe-expert-cache-budget-mib value
+    uint64_t budget_extra = 0;     // prefill compute bytes reclaimed for decode (VRAM swap)
     const int32_t  max_inserts;
-
     bool activated = false;
+    bool activated_once = false; // a layout was built at least once (survives suspend)
     bool failed    = false;
 
     // reserved at context creation (reserve()): the cacheable layers and the
@@ -201,7 +203,7 @@ struct llama_moe_cache::impl {
 
     impl(const llama_model & model_, llama_hot_expert_cache * hot_,
          uint64_t budget_, int32_t inserts_) :
-        model(model_), hot(hot_), budget_bytes(budget_), max_inserts(inserts_) {}
+        model(model_), hot(hot_), budget_bytes(budget_), budget_base(budget_), max_inserts(inserts_) {}
 
     layer_state * find_layer(int il) {
         for (auto & ls : layers) {
@@ -352,6 +354,16 @@ llama_moe_cache::~llama_moe_cache() {
 
 bool llama_moe_cache::is_active() const {
     return pimpl != nullptr && pimpl->activated;
+}
+
+void llama_moe_cache::set_decode_budget_extra(uint64_t extra_bytes) {
+    if (!pimpl) {
+        return;
+    }
+    // only the future resume() allocations use the enlarged budget; the pool
+    // currently held (if any) keeps its size until the next suspend()
+    pimpl->budget_extra = extra_bytes;
+    pimpl->budget_bytes = pimpl->budget_base + extra_bytes;
 }
 
 void llama_moe_cache::set_disk_stage(llama_disk_stage * disk) {
@@ -836,7 +848,8 @@ void llama_moe_cache::activate(bool relayout) {
 
     p->hot->set_vram_query(&llama_moe_cache::vram_resident_cb, this);
 
-    p->activated = true;
+    p->activated      = true;
+    p->activated_once = true;
     // decode graphs embed the cache tensors and the per-layer slot counts, so
     // the graph-reuse check compares this generation: every (re)build forces a
     // decode graph rebuild on the same ubatch (the initial activation also
@@ -929,7 +942,9 @@ bool llama_moe_cache::suspend() {
     // drop the layout contexts/tables and the pool itself
     p->free_retired();
     p->hot->set_vram_query(nullptr, nullptr);
+    uint64_t pool_size = 0;
     if (p->pool) {
+        pool_size = ggml_backend_buffer_get_size(p->pool);
         ggml_backend_buffer_free(p->pool);
         p->pool = nullptr;
     }
@@ -938,7 +953,7 @@ bool llama_moe_cache::suspend() {
     p->layout_gen++; // force a decode graph rebuild, the cache tensors are gone
 
     LLAMA_LOG_INFO("%s: MoE expert cache suspended, %.1f MiB of device memory released\n",
-            __func__, p->budget_bytes/(1024.0*1024.0));
+            __func__, pool_size/(1024.0*1024.0));
     return true;
 }
 
@@ -959,15 +974,20 @@ bool llama_moe_cache::resume() {
     const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(p->cands[0].router->buffer);
     p->pool = ggml_backend_buft_alloc_buffer(buft, p->budget_bytes);
     if (!p->pool) {
-        LLAMA_LOG_ERROR("%s: failed to re-reserve %.1f MiB of device memory for the MoE expert cache after the mmproj hot swap\n",
+        LLAMA_LOG_ERROR("%s: failed to re-reserve %.1f MiB of device memory for the MoE expert cache after it was released\n",
                 __func__, p->budget_bytes/(1024.0*1024.0));
-        GGML_ABORT("MoE expert cache could not be restored after the mmproj hot swap");
+        GGML_ABORT("MoE expert cache could not be restored after it was released");
     }
 
-    activate(/*relayout =*/ true);
+    // rebuild the layout from the ranking observed so far. Before the first
+    // activation there is nothing to rebuild: leave it to maybe_activate()
+    if (p->activated_once) {
+        activate(/*relayout =*/ true);
+    }
 
-    LLAMA_LOG_INFO("%s: MoE expert cache resumed, %.1f MiB of device memory re-reserved\n",
-            __func__, p->budget_bytes/(1024.0*1024.0));
+    LLAMA_LOG_INFO("%s: MoE expert cache resumed, %.1f MiB of device memory re-reserved (%.1f base + %.1f reclaimed from the prefill compute buffer)\n",
+            __func__, p->budget_bytes/(1024.0*1024.0), p->budget_base/(1024.0*1024.0),
+            p->budget_extra/(1024.0*1024.0));
     return true;
 }
 
