@@ -1220,6 +1220,13 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
+    // the request length that created this checkpoint and a fingerprint of its
+    // token prefix [0, n_tokens). A restore uses these to prove that the saved
+    // state covers the current request's tokens, so it may reuse a checkpoint
+    // whose pos_max reaches past the live cache's common prefix
+    int64_t  len_ctx     = -1;
+    uint64_t fingerprint = 0;
+
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
 
@@ -1245,6 +1252,10 @@ struct common_prompt_checkpoint {
             int64_t n_tokens,
             llama_pos pos_min,
             llama_pos pos_max);
+
+    // hash of a token prefix, used to verify that a checkpoint's saved state
+    // belongs to the request being restored
+    static uint64_t hash_tokens(const llama_token * toks, int64_t n);
 
     void update_tgt(
             llama_context * ctx,

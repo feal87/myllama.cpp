@@ -2756,6 +2756,15 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
+        // the checkpoint covers the request's tokens up to update_pos() above; record
+        // enough to verify that from the request being restored
+        {
+            const int64_t n_prefix = cur.n_tokens;
+            cur.len_ctx = slot.task->n_tokens();
+            const llama_tokens & toks = slot.prompt.tokens.get_tokens();
+            cur.fingerprint = common_prompt_checkpoint::hash_tokens(toks.data(), std::min<int64_t>(n_prefix, (int64_t) toks.size()));
+        }
+
         if (ckpt_store) {
             std::vector<std::pair<uint64_t, uint64_t>> remap;
             ckpt_store->maybe_compact(slot.id, remap);
@@ -2779,9 +2788,9 @@ private:
                 remap_off(c.off_spec);
             }
 
-            size_t n = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            size_t n = llama_state_seq_get_size_ext(ctx_tgt, slot.id, 0);
             std::vector<uint8_t> buf(n);
-            if (n > 0 && llama_state_seq_get_data_ext(ctx_tgt, buf.data(), n, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == n) {
+            if (n > 0 && llama_state_seq_get_data_ext(ctx_tgt, buf.data(), n, slot.id, 0) == n) {
                 const uint64_t off = ckpt_store->append(slot.id, buf.data(), n);
                 if (off != UINT64_MAX) {
                     cur.on_disk  = true;
@@ -2792,10 +2801,10 @@ private:
 
             if (cur.on_disk) {
                 if (ctx_dft != nullptr) {
-                    n = llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    n = llama_state_seq_get_size_ext(ctx_dft, slot.id, 0);
                     if (n > 0) {
                         buf.resize(n);
-                        if (llama_state_seq_get_data_ext(ctx_dft, buf.data(), n, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == n) {
+                        if (llama_state_seq_get_data_ext(ctx_dft, buf.data(), n, slot.id, 0) == n) {
                             const uint64_t off = ckpt_store->append(slot.id, buf.data(), n);
                             if (off != UINT64_MAX) {
                                 cur.off_dft  = off;
@@ -2818,8 +2827,8 @@ private:
         }
 
         if (!cur.on_disk) {
-            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            cur.update_tgt(ctx_tgt, slot.id, 0);
+            cur.update_dft(ctx_dft, slot.id, 0);
             // stash the draft's speculative state with the checkpoint
             common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
         }
@@ -3507,7 +3516,7 @@ private:
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
 
                         if (use_ckpt_dft) {
-                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, 0);
                         }
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
@@ -3546,7 +3555,7 @@ private:
 
             if (ctx_dft) {
                 if (use_ckpt_dft) {
-                    ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.load_dft(ctx_dft, slot.id, 0);
                 }
 
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
@@ -3565,7 +3574,7 @@ private:
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
 
-                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.update_tgt(ctx_tgt, slot.id, 0);
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -3577,7 +3586,7 @@ private:
                 }
 
                 if (use_ckpt_dft) {
-                    ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.update_dft(ctx_dft, slot.id, 0);
                 }
             }
         });
@@ -3834,20 +3843,59 @@ private:
                                 }
 
                                 if (pos_min >= pos_min_thold) {
-                                    // search for a context checkpoint
-                                    const auto it = std::find_if(
-                                        slot.prompt.checkpoints.rbegin(),
-                                        slot.prompt.checkpoints.rend(),
-                                        [&](const auto & cur) {
-                                            // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
-                                            SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
-                                            // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
-                                            if (cur.pos_max > pos_next) {
-                                                return false;
+                                    // the ubatch starts a cold fill of the current prompt would use:
+                                    // a restored checkpoint must sit on one of these, otherwise the
+                                    // reprocessed tail is grouped differently and the logits drift
+                                    auto request_batch_starts = [&](int64_t L) {
+                                        std::vector<int64_t> starts;
+                                        for (int64_t p = 0; p < L; ) {
+                                            starts.push_back(p);
+                                            int64_t next = p + n_batch;
+                                            // the trailing-break heuristic only applies without the
+                                            // disk store, which checkpoints every batch instead
+                                            if (ckpt_store == nullptr) {
+                                                for (const int offset : {4 + n_ubatch, 4}) {
+                                                    const int64_t n_last = std::min<int64_t>(n_batch, offset);
+                                                    const int64_t brk = L - n_last;
+                                                    if (brk > p && brk < next) {
+                                                        next = brk;
+                                                    }
+                                                }
                                             }
-                                            return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                                            if (next >= L) {
+                                                break;
+                                            }
+                                            p = next;
                                         }
-                                    );
+                                        return starts;
+                                    };
+                                    const auto batch_starts = request_batch_starts(slot.task->n_tokens());
+                                    const llama_tokens & req_tokens = slot.task->tokens.get_tokens();
+
+                                    // search for a context checkpoint
+                                    auto it = slot.prompt.checkpoints.rend();
+                                    for (auto cit = slot.prompt.checkpoints.rbegin(); cit != slot.prompt.checkpoints.rend(); ++cit) {
+                                        const auto & cur = *cit;
+                                        // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
+                                        SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
+                                        // the saved state must cover exactly the current request's tokens
+                                        if (cur.n_tokens <= 0 || cur.n_tokens > (int64_t) req_tokens.size()) {
+                                            continue;
+                                        }
+                                        if (cur.fingerprint != common_prompt_checkpoint::hash_tokens(req_tokens.data(), cur.n_tokens)) {
+                                            continue;
+                                        }
+                                        // a checkpoint from the same request is always on a ubatch
+                                        // start; one from an older request only when it lands on one
+                                        // of this request's starts
+                                        if (cur.len_ctx != slot.task->n_tokens() &&
+                                                std::find(batch_starts.begin(), batch_starts.end(), cur.n_tokens) == batch_starts.end()) {
+                                            continue;
+                                        }
+                                        if (it == slot.prompt.checkpoints.rend() || cur.n_tokens > it->n_tokens) {
+                                            it = cit;
+                                        }
+                                    }
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
@@ -3856,12 +3904,12 @@ private:
                                         if (it->on_disk && ckpt_store) {
                                             std::vector<uint8_t> buf(it->size_tgt);
                                             if (ckpt_store->read(slot.id, it->off_tgt, it->size_tgt, buf.data())) {
-                                                llama_state_seq_set_data_ext(ctx_tgt, buf.data(), buf.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                                llama_state_seq_set_data_ext(ctx_tgt, buf.data(), buf.size(), slot.id, 0);
                                             }
                                             if (ctx_dft != nullptr && it->size_dft > 0) {
                                                 buf.resize(it->size_dft);
                                                 if (ckpt_store->read(slot.id, it->off_dft, it->size_dft, buf.data())) {
-                                                    llama_state_seq_set_data_ext(ctx_dft, buf.data(), buf.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                                    llama_state_seq_set_data_ext(ctx_dft, buf.data(), buf.size(), slot.id, 0);
                                                 }
                                             }
                                             if (it->size_spec > 0) {
@@ -3871,14 +3919,16 @@ private:
                                                 }
                                             }
                                         } else {
-                                            it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                            it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                            it->load_tgt(ctx_tgt, slot.id, 0);
+                                            it->load_dft(ctx_dft, slot.id, 0);
                                             // restore the draft's speculative state
                                             common_speculative_set_state(spec.get(), slot.id, it->data_spec);
                                         }
 
-                                        pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                        n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                        // the verified checkpoint is authoritative: reprocess from
+                                        // exactly its token position, not from the live cache's prefix
+                                        n_past   = (int) it->n_tokens;
+                                        pos_next = (llama_pos) it->n_tokens;
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
                                     }
 
@@ -3892,20 +3942,8 @@ private:
                             }
 
                             {
-                                // erase any checkpoints with pos_max > pos_next
-                                for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
-                                    const auto & cur = *it;
-                                    if (cur.pos_max > pos_next) {
-                                        SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
-                                        if (ckpt_store && cur.on_disk) {
-                                            ckpt_store->release(slot.id, cur.off_tgt);
-                                        }
-                                        it = slot.prompt.checkpoints.erase(it);
-                                    } else {
-                                        ++it;
-                                    }
-                                }
-
+                                // checkpoints whose pos_max reaches past this request's prefix are
+                                // kept: a later, longer request can verify and reuse them
                                 if (ckpt_store) {
                                     ckpt_store->write_meta(slot.id, slot.prompt.tokens, slot.prompt.checkpoints);
                                 }
@@ -3923,6 +3961,16 @@ private:
                         slot.stats.n_prompt_processed = 0;
 
                         metrics.add_prompt_cached(n_past);
+
+                        // a verified checkpoint can cover more tokens than the live cache
+                        // prefix did; its tokens are this request's (fingerprint matched),
+                        // so rebuild the slot prompt from the request up to n_past
+                        if (!slot.prompt.tokens.has_mtmd && !slot.task->tokens.has_mtmd &&
+                                n_past > (int) slot.prompt.tokens.size()) {
+                            for (int i = (int) slot.prompt.tokens.size(); i < n_past && i < (int) slot.task->tokens.size(); ++i) {
+                                slot.prompt.tokens.push_back(slot.task->tokens[i]);
+                            }
+                        }
 
                         slot.prompt.tokens.keep_first(n_past);
 
@@ -4462,10 +4510,10 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
-                        ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        ckpt.load_tgt(slot.ctx_tgt, slot.id, 0);
 
                         if (slot.ctx_dft) {
-                            ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            ckpt.load_dft(slot.ctx_dft, slot.id, 0);
                         }
 
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);

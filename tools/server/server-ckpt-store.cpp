@@ -29,11 +29,11 @@ constexpr const char * FILE_PREFIX = "llama-slot-";
 constexpr const char * FILE_SUFFIX = ".bin";
 
 constexpr char META_MAGIC[8] = {'L', 'L', 'S', 'L', 'O', 'T', 'C', 'K'};
-constexpr uint32_t META_VERSION = 2;
+constexpr uint32_t META_VERSION = 3;
 constexpr uint32_t META_FLAG_MTMD     = 1u << 0;
 constexpr uint32_t META_FLAG_HAS_FULL = 1u << 1;
 constexpr uint64_t META_HEADER_SIZE = 80;
-constexpr uint64_t META_CKPT_SIZE   = 80;
+constexpr uint64_t META_CKPT_SIZE   = 96;
 
 const uint8_t zeros[server_ckpt_store::align_bytes] = {};
 
@@ -263,6 +263,8 @@ bool server_ckpt_store::read_meta(const std::filesystem::path & meta_path, sessi
         uint64_t size_dft = 0;
         uint64_t off_spec = 0;
         uint64_t size_spec = 0;
+        int64_t len_ctx = -1;
+        uint64_t fingerprint = 0;
 
         ok = server_disk_meta_read(input, n_tokens) &&
             server_disk_meta_read(input, id_task) &&
@@ -274,7 +276,9 @@ bool server_ckpt_store::read_meta(const std::filesystem::path & meta_path, sessi
             server_disk_meta_read(input, off_dft) &&
             server_disk_meta_read(input, size_dft) &&
             server_disk_meta_read(input, off_spec) &&
-            server_disk_meta_read(input, size_spec);
+            server_disk_meta_read(input, size_spec) &&
+            server_disk_meta_read(input, len_ctx) &&
+            server_disk_meta_read(input, fingerprint);
 
         ok = ok &&
             reserved == 0 &&
@@ -300,6 +304,8 @@ bool server_ckpt_store::read_meta(const std::filesystem::path & meta_path, sessi
         checkpoint.id_task   = -1; // task ids from a previous run are meaningless
         checkpoint.pos_min   = (llama_pos) pos_min;
         checkpoint.pos_max   = (llama_pos) pos_max;
+        checkpoint.len_ctx     = len_ctx;
+        checkpoint.fingerprint = fingerprint;
         checkpoint.on_disk   = true;
         checkpoint.off_tgt   = off_tgt;
         checkpoint.size_tgt  = size_tgt;
@@ -496,6 +502,8 @@ void server_ckpt_store::write_meta(int slot_id, const server_tokens & tokens, co
             const uint64_t size_dft  = c.size_dft;
             const uint64_t off_spec  = c.off_spec;
             const uint64_t size_spec = c.size_spec;
+            const int64_t  len_ctx     = c.len_ctx;
+            const uint64_t fingerprint = c.fingerprint;
 
             ok = ok &&
                 server_disk_meta_write(output, n_tokens) &&
@@ -508,7 +516,9 @@ void server_ckpt_store::write_meta(int slot_id, const server_tokens & tokens, co
                 server_disk_meta_write(output, off_dft) &&
                 server_disk_meta_write(output, size_dft) &&
                 server_disk_meta_write(output, off_spec) &&
-                server_disk_meta_write(output, size_spec);
+                server_disk_meta_write(output, size_spec) &&
+                server_disk_meta_write(output, len_ctx) &&
+                server_disk_meta_write(output, fingerprint);
         }
 
         return ok;

@@ -2321,6 +2321,18 @@ void common_prompt_checkpoint::update_pos(
     this->pos_max  = pos_max;
 }
 
+uint64_t common_prompt_checkpoint::hash_tokens(const llama_token * toks, int64_t n) {
+    // FNV-1a over the token prefix; collisions only cost a wasted reprocess
+    uint64_t h = 1469598103934665603ull;
+    for (int64_t i = 0; i < n; ++i) {
+        h ^= (uint64_t) (uint32_t) toks[i];
+        h *= 1099511628211ull;
+    }
+    h ^= (uint64_t) n;
+    h *= 1099511628211ull;
+    return h;
+}
+
 void common_prompt_checkpoint::update_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
