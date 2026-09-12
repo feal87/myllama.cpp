@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
+#include <cstdio>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -248,6 +249,9 @@ struct llama_disk_stage::impl {
         std::vector<int64_t>                      slot_key;  // slot -> key, -1 when empty
         std::vector<uint8_t>                      seg;       // slot -> 0 probation, 1 protected
         std::vector<int32_t>                      free_slots;
+        uint64_t hits      = 0; // counted only once the RAM tier is warm
+        uint64_t misses    = 0;
+        uint64_t evictions = 0;
     };
     std::vector<evict_pool> evict_pools;
     std::vector<int>        evict_pool_id;    // layer -> pool, -1 when not pooled
@@ -317,6 +321,7 @@ struct llama_disk_stage::impl {
         ep.slot_of.erase(key);
         ep.slot_key[(size_t) slot] = -1;
         n_l2_evictions++;
+        ep.evictions++;
         return slot;
     }
 
@@ -531,6 +536,18 @@ void llama_disk_stage::print_stats() {
                    " | disk avoided=%.2f MiB (promo %.2f MiB) | evictions=%" PRIu64 " | demotions=%" PRIu64 "\n",
                    d_look ? 100.0 * d_hits / d_look : 0.0, d_hits, d_look,
                    d_bytes / (1024.0 * 1024.0), d_promo / (1024.0 * 1024.0), d_evict, d_demote);
+
+    std::string pools;
+    for (size_t k = 0; k < p.evict_pools.size(); ++k) {
+        const impl::evict_pool & ep = p.evict_pools[k];
+        const uint64_t look = ep.hits + ep.misses;
+        char buf[128];
+        snprintf(buf, sizeof(buf), "%spool %zu: %zu/%d live, hit=%.1f%% (%" PRIu64 "/%" PRIu64 "), evictions=%" PRIu64,
+                 k ? " | " : "", k, ep.slot_of.size(), ep.cap,
+                 look ? 100.0 * (double) ep.hits / (double) look : 0.0, ep.hits, look, ep.evictions);
+        pools += buf;
+    }
+    LLAMA_LOG_INFO("[disk-stage] L2 per-pool: %s\n", pools.c_str());
 
     p.prev_l2_hits        = p.n_l2_hits;
     p.prev_l2_misses      = p.n_l2_misses;
@@ -1042,9 +1059,17 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                         }
 
                         // the prefill staging slabs are idle during decode: reuse
-                        // them as the L2 pool, one slab per expert-bundle type.
-                        // Requires aligned data: the pool reads an expert at its
-                        // slot start, so head must be zero
+                        // their memory as the L2 pool, one slab per expert-bundle
+                        // type. Requires aligned data: the pool reads an expert at
+                        // its slot start, so head must be zero.
+                        //
+                        // The pool and the staging tensors are never live at once:
+                        // every prefill clears the pool before it fills the slab,
+                        // and decode never reads the staging tensors. The pool can
+                        // therefore lay itself out compactly inside per_buffer
+                        // instead of following the prefill regions, so a bundle
+                        // with cheaper experts than the region budget fits more
+                        // slots
                         const char * l2_env = std::getenv("LLAMA_DISK_STAGE_L2");
                         const bool   l2_on  = l2_env == nullptr || (l2_env[0] != '\0' && l2_env[0] != '0');
                         if (!l2_on) {
@@ -1058,15 +1083,21 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                 }
                                 const int pid = (int) p.evict_pools.size();
 
-                                int32_t cap = INT32_MAX;
+                                size_t per_slot = 0;
+                                int    n_role   = 0;
                                 for (const auto & role : roles) {
                                     const size_t stride = src[il].r[role.slot].stride;
                                     if (stride > 0) {
-                                        cap = std::min<int32_t>(cap, (int32_t) (region_len[role.slot] / stride));
+                                        per_slot += align_up(stride, disk_stage_align);
+                                        n_role++;
                                     }
                                 }
-                                if (cap <= 0 || cap == INT32_MAX) {
+                                if (per_slot == 0 || per_buffer <= (size_t) n_role * disk_stage_align) {
                                     continue;  // cannot size this type; leave the L2 off
+                                }
+                                const int32_t cap = (int32_t) ((per_buffer - (size_t) n_role * disk_stage_align) / per_slot);
+                                if (cap <= 0) {
+                                    continue;
                                 }
 
                                 impl::evict_pool ep;
@@ -1074,9 +1105,15 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                 // protected gets three quarters: one-shot misses
                                 // enter probation and cannot displace a re-read
                                 ep.prot_cap = cap - std::max(1, cap / 4);
+                                size_t off = 0;
                                 for (const auto & role : roles) {
-                                    ep.data[role.slot]   = p.base + (size_t) pid * per_buffer + region_off[role.slot] + src[il].r[role.slot].head;
-                                    ep.stride[role.slot] = src[il].r[role.slot].stride;
+                                    const size_t stride = src[il].r[role.slot].stride;
+                                    if (stride == 0) {
+                                        continue;
+                                    }
+                                    ep.data[role.slot]   = p.base + (size_t) pid * per_buffer + off;
+                                    ep.stride[role.slot] = align_up(stride, disk_stage_align);
+                                    off += (size_t) ep.cap * ep.stride[role.slot] + disk_stage_align;
                                 }
                                 ep.slot_key.assign((size_t) ep.cap, -1);
                                 ep.iter_of.resize((size_t) ep.cap);
@@ -1607,6 +1644,7 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
                 if (hit < 0) {
                     if (l2_warm) {
                         p.n_l2_misses++;
+                        ep.misses++;
                     } else {
                         p.n_l2_cold++;
                     }
@@ -1622,6 +1660,7 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
                 } else {
                     if (l2_warm) {
                         p.n_l2_hits++;
+                        ep.hits++;
                     } else {
                         p.n_l2_cold++;
                     }
