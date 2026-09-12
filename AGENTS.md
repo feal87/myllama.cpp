@@ -1,5 +1,10 @@
 # Instructions for llama.cpp
 
+> [!IMPORTANT]
+> This is a personal fork (`feal87/myllama.cpp`), not upstream `ggml-org/llama.cpp`.
+> The git rules below do not apply here: the agent may `git commit` and `git push` to
+> `origin` directly when the user asks. The code style and comment rules still apply.
+
 ### Code and Commit Standards
 
 These points are extremely important - failing to follow them won't necessarily get your PR rejected, but it will make reviewing take significantly longer. Please follow them carefully:
@@ -132,9 +137,11 @@ gh search issues # better to check if anyone has the same issue
 gh search prs # avoid duplicated efforts
 grep ... # search the code base
 
-# BAD: act on the user's behalf
+# GOOD in this fork: commit and push to origin when the user asks
 git commit -m "..."
 git push
+
+# BAD: act on the user's behalf against upstream or other repos
 gh pr create
 gh pr comment
 gh issue create
