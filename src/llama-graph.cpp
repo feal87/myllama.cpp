@@ -2034,9 +2034,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // use the layer's decode cache instead and remap the expert ids through its
     // table (below). Only the plain separate gate/up/down layout without scales,
     // biases or LoRA is staged.
-    // Gate on the ubatch size, not on cur->ne[1]: a layer can be fed a 1-token
-    // slice (this model's attention layer) inside a multi-token ubatch, and the
-    // staged weight is still the right source for it
+    // Gate the prefill staging on the ubatch size, not on cur->ne[1]: a layer can
+    // be fed a 1-token slice (this model's attention layer) inside a multi-token
+    // ubatch, and the staged weight is still the right source for it. The decode
+    // cache instead indexes one token through its table, so it needs exactly one
+    // input row: the last layer drops its non-output rows, which can leave the
+    // input empty (n_tokens == 0) and must fall back to the plain weights
     const llama_disk_stage_cache_layer * dc = nullptr;
     if (disk_stage != nullptr && il >= 0 &&
             gate_up_exps == nullptr && gate_up_exps_b == nullptr &&
@@ -2051,7 +2054,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 up_exps   = ds->up;
                 down_exps = ds->down;
             }
-        } else {
+        } else if (n_tokens == 1) {
             dc = disk_stage->cache_layer(il);
             if (dc != nullptr) {
                 gate_exps = dc->gate;
