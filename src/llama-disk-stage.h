@@ -78,6 +78,15 @@ public:
     // flight, i.e. when this layer's compute was shorter than its read
     void fill(int il);
 
+    // fill only the routed experts of layer il into the layer slab, synchronously.
+    // Used for small ubatches, where the routed set is a small part of the slab;
+    // residents are copied from the decode cache and the rest is read from disk
+    void fill_selected(int il, const int32_t * ids, int64_t n_ids);
+
+    // whether a ubatch of n_tokens should use fill_selected() instead of fill():
+    // small ubatches route few experts, large ones touch almost every expert
+    bool sparse_ubatch(int64_t n_tokens) const;
+
     // persistent decode cache of layer il, or null when the cache is off
     const llama_disk_stage_cache_layer * cache_layer(int il) const;
 
@@ -142,6 +151,8 @@ private:
     std::unique_ptr<impl> pimpl;
 
     // build and run the blocking read batch for one layer; called by the
-    // staging reader thread, and directly by fill() when there is one buffer
-    void fill_run(int il);
+    // staging reader thread, and directly by fill() when there is one buffer.
+    // `used` selects sparse fill: only those experts are read, the rest of the
+    // slab keeps stale data and is never touched by the reader
+    void fill_run(int il, const uint8_t * used = nullptr);
 };

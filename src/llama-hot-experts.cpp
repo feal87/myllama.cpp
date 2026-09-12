@@ -257,6 +257,23 @@ bool llama_hot_expert_cache::wants_observe(int il) {
     return true;
 }
 
+// the top-k tensor is a view into the argsort workspace, so its row stride can
+// be much larger than its n_expert_used values: read it row by row
+static void read_topk_ids(const struct ggml_tensor * t, int32_t * ids) {
+    const int64_t n_used = t->ne[0];
+    const int64_t n_tok  = t->ne[1];
+    if (ggml_backend_buffer_is_host(t->buffer)) {
+        const char * src = (const char *) t->data;
+        for (int64_t i = 0; i < n_tok; ++i) {
+            std::memcpy(ids + i * n_used, src + i * t->nb[1], n_used * sizeof(int32_t));
+        }
+    } else {
+        for (int64_t i = 0; i < n_tok; ++i) {
+            ggml_backend_tensor_get(t, ids + i * n_used, i * t->nb[1], n_used * sizeof(int32_t));
+        }
+    }
+}
+
 void llama_hot_expert_cache::observe(int il, const struct ggml_tensor * t) {
     if (t->type != GGML_TYPE_I32) {
         return;  // unexpected, be defensive rather than misinterpret bytes
@@ -279,13 +296,13 @@ void llama_hot_expert_cache::observe(int il, const struct ggml_tensor * t) {
     if (disk_stage != nullptr) {
         obs_scratch.resize(n_ids);
         int32_t * ids = obs_scratch.data();
-        if (ggml_backend_buffer_is_host(t->buffer)) {
-            std::memcpy(ids, t->data, n_ids * sizeof(int32_t));
-        } else {
-            ggml_backend_tensor_get(t, ids, 0, n_ids * sizeof(int32_t));
-        }
+        read_topk_ids(t, ids);
         if (n_tokens_cur > 1) {
-            disk_stage->fill(il);
+            if (disk_stage->sparse_ubatch(n_tokens_cur)) {
+                disk_stage->fill_selected(il, ids, n_ids);
+            } else {
+                disk_stage->fill(il);
+            }
         } else {
             disk_stage->fill_cache(il, ids, n_ids);
         }
@@ -302,11 +319,7 @@ void llama_hot_expert_cache::observe(int il, const struct ggml_tensor * t) {
     // thread, so per-call allocation is pure churn
     obs_scratch.resize(n_ids);
     int32_t * ids = obs_scratch.data();
-    if (ggml_backend_buffer_is_host(t->buffer)) {
-        std::memcpy(ids, t->data, n_ids * sizeof(int32_t));
-    } else {
-        ggml_backend_tensor_get(t, ids, 0, n_ids * sizeof(int32_t));
-    }
+    read_topk_ids(t, ids);
 
     prefetch_ranges.clear();
     {

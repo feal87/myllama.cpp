@@ -35,6 +35,10 @@
 static const size_t disk_stage_align = 4096;
 // one request per chunk; a few dozen in flight saturate the drive
 static const size_t disk_stage_chunk = 1u << 20;
+// below this ubatch size the routed experts are few enough that reading only
+// them beats streaming the whole slab; the same cut makes the CUDA mul_mat_id
+// fall back to the CPU, which reads only the routed rows anyway
+static const int64_t disk_stage_sparse_tokens = 32;
 
 static size_t align_up(size_t v, size_t a) {
     return (v + a - 1) & ~(a - 1);
@@ -161,6 +165,7 @@ struct llama_disk_stage::impl {
         size_t              read_len = 0; // aligned length of the read
         size_t              head     = 0; // bytes between the aligned start and the tensor data
         size_t              stride   = 0; // bytes per expert in the file
+        int32_t             n_expert = 0; // experts in the tensor
         disk_stage_file *   file     = nullptr;
         uint64_t            file_off = 0; // aligned-down source offset
     };
@@ -498,6 +503,10 @@ bool llama_disk_stage::is_active() const {
     return pimpl->active;
 }
 
+bool llama_disk_stage::sparse_ubatch(int64_t n_tokens) const {
+    return n_tokens > 1 && n_tokens < disk_stage_sparse_tokens;
+}
+
 void llama_disk_stage::print_stats() {
     impl & p = *pimpl;
     if (p.evict_pools.empty()) {
@@ -626,6 +635,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
             src[il].t[role.slot] = t;
             src[il].r[role.slot].head     = head;
             src[il].r[role.slot].stride   = (size_t) t->nb[2];
+            src[il].r[role.slot].n_expert = (int32_t) t->ne[2];
             src[il].r[role.slot].read_len = align_up(head + size, disk_stage_align);
             src[il].r[role.slot].file_off = t_off - head;
             src[il].r[role.slot].file     = p.file_for(path);
@@ -1258,7 +1268,7 @@ static int64_t disk_stage_thread_cpu_us() {
 static int64_t disk_stage_thread_cpu_us() { return 0; }
 #endif
 
-void llama_disk_stage::fill_run(int il) {
+void llama_disk_stage::fill_run(int il, const uint8_t * used) {
 #if defined(_WIN32)
     impl & p = *pimpl;
     if (il < 0 || il >= (int) p.layer_regions.size() || p.layer_regions[il].empty()) {
@@ -1296,8 +1306,8 @@ void llama_disk_stage::fill_run(int il) {
         for (int role = 0; role < (int) p.layer_regions[il].size(); ++role) {
             const impl::region & r = p.layer_regions[il][role];
 
-            const size_t  stride   = c != nullptr ? r.stride : 0;
-            const int32_t n_expert = c != nullptr ? (int32_t) c->resident_slot.size() : 0;
+            const int32_t n_expert = c != nullptr ? (int32_t) c->resident_slot.size() : r.n_expert;
+            const size_t  stride   = (c != nullptr || used != nullptr) ? r.stride : 0;
 
             if (stride == 0 || n_expert <= 0) {
                 // no decode cache for this layer: read the whole region
@@ -1314,13 +1324,21 @@ void llama_disk_stage::fill_run(int il) {
             // has no RAM slot (vram_commit freed it), so it is read like any
             // non-resident. A promoted-but-unread resident must be read too
             auto resident = [&](int32_t id) {
-                return c->resident_slot[id] >= 0 && c->resident_filled[id] != 0 && c->vram[id] == 0;
+                return c != nullptr && c->resident_slot[id] >= 0 && c->resident_filled[id] != 0 && c->vram[id] == 0;
+            };
+            // sparse fill reads only the routed experts, the whole slab reads all
+            auto selected = [&](int32_t id) {
+                return used == nullptr || used[id] != 0;
             };
 
             char * slab = p.base + r.pool_off + r.head;
 
             int32_t id = 0;
             while (id < n_expert) {
+                if (!selected(id)) {
+                    ++id;
+                    continue;
+                }
                 if (resident(id)) {
                     const size_t slot = (size_t) c->resident_slot[id];
                     copies.push_back({ pool->data[role] + slot * pool->slot_stride[role],
@@ -1330,7 +1348,7 @@ void llama_disk_stage::fill_run(int il) {
                 }
 
                 int32_t last = id;
-                while (last < n_expert && !resident(last)) {
+                while (last < n_expert && selected(last) && !resident(last)) {
                     ++last;
                 }
 
@@ -1439,6 +1457,43 @@ void llama_disk_stage::fill_run(int il) {
     }
 #else
     GGML_UNUSED(il);
+#endif
+}
+
+void llama_disk_stage::fill_selected(int il, const int32_t * ids, int64_t n_ids) {
+#if defined(_WIN32)
+    impl & p = *pimpl;
+    if (!p.active || il < 0 || il >= (int) p.layer_regions.size() || p.layer_regions[il].empty() || n_ids <= 0) {
+        return;
+    }
+
+    const int32_t n_expert = p.layer_regions[il][0].n_expert;
+    if (n_expert <= 0) {
+        return;
+    }
+
+    // the routed experts; the rest of the slab keeps stale data and is never
+    // read, the CPU mul_mat_id and the VRAM copy both touch only these ids
+    std::vector<uint8_t> used((size_t) n_expert, 0);
+    for (int64_t i = 0; i < n_ids; ++i) {
+        const int32_t id = ids[i];
+        if (id >= 0 && id < n_expert) {
+            used[(size_t) id] = 1;
+        }
+    }
+
+    // a prefill clobbers the L2 pool decode reuses the staging slabs for
+    if (p.evict_populated) {
+        std::lock_guard<std::mutex> lock(p.cache_mu);
+        p.evict_clear();
+        p.evict_populated = false;
+    }
+
+    fill_run(il, used.data());
+#else
+    GGML_UNUSED(il);
+    GGML_UNUSED(ids);
+    GGML_UNUSED(n_ids);
 #endif
 }
 
