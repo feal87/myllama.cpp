@@ -526,7 +526,19 @@ void llama_moe_cache::maybe_activate() {
     } else if (p->hot->content_tokens() < kMinProfileContentTokens) {
         return;
     }
-    const bool relayout = p->activated;
+
+    activate(p->activated);
+}
+
+// size the per-layer capacities from the current ranking and carve the layout
+// into the reserved pool. Called after enough routing was observed (initial
+// activation, per-prompt rebuild) or directly by resume(), which rebuilds from
+// the ranking already collected instead of waiting for a new profile window.
+void llama_moe_cache::activate(bool relayout) {
+    auto * p = pimpl.get();
+    if (!p || p->failed || !p->pool) {
+        return;
+    }
 
     // Per-layer VRAM slot capacities, derived from the observed routing profile:
     // hand the GLOBAL byte budget to the globally hottest experts (top of the
@@ -859,6 +871,118 @@ void llama_moe_cache::maybe_activate() {
         fill_upload_queue(p);
     }
     p->wcv.notify_one();
+}
+
+// release the device pool and the layout so another consumer can use the VRAM.
+// Every published resident goes back to the RAM/disk tier, mirroring the
+// per-prompt relayout: the host chain must serve them again once the device
+// tables are gone. The caller has synchronized the context, so no graph can
+// still reference the cache tensors.
+bool llama_moe_cache::suspend() {
+    auto * p = pimpl.get();
+    if (!p || !p->pool) {
+        return false;
+    }
+
+    // stop the upload worker (a job in flight lands in done after the clear)
+    {
+        std::lock_guard<std::mutex> wlk(p->wmtx);
+        p->stop = true;
+        p->todo.clear();
+        p->done.clear();
+    }
+    p->wcv.notify_all();
+    if (p->worker.joinable()) {
+        p->worker.join();
+    }
+    {
+        std::lock_guard<std::mutex> wlk(p->wmtx);
+        p->done.clear();
+    }
+
+    std::vector<std::pair<int, int32_t>> evicted;
+    {
+        std::lock_guard<std::mutex> lock(p->mtx);
+        for (auto & ls : p->layers) {
+            for (int32_t s = 0; s < (int32_t) ls.slot_expert.size(); ++s) {
+                const int32_t e = ls.slot_expert[s];
+                if (e < 0) {
+                    continue;
+                }
+                ls.slot_expert[s] = -1;
+                ls.resident[(size_t) e] = 0;
+                evicted.emplace_back(ls.pub.il, e);
+            }
+            std::fill(ls.slot_target.begin(), ls.slot_target.end(), -1);
+            ls.pending_q.clear();
+        }
+        p->layers.clear();
+        p->retire_layout();
+    }
+    for (const auto & [il, e] : evicted) {
+        if (p->disk_mode) {
+            p->disk->vram_release(il, e);
+        }
+        p->hot->promote_expert(il, e);
+    }
+
+    // drop the layout contexts/tables and the pool itself
+    p->free_retired();
+    p->hot->set_vram_query(nullptr, nullptr);
+    if (p->pool) {
+        ggml_backend_buffer_free(p->pool);
+        p->pool = nullptr;
+    }
+
+    p->activated = false;
+    p->layout_gen++; // force a decode graph rebuild, the cache tensors are gone
+
+    LLAMA_LOG_INFO("%s: MoE expert cache suspended, %.1f MiB of device memory released\n",
+            __func__, p->budget_bytes/(1024.0*1024.0));
+    return true;
+}
+
+// re-reserve the pool and rebuild the layout from the ranking observed so far.
+// The budget and buffer type are the ones reserve() validated at load time, so
+// after releasing the pool to the mmproj and freeing it again the same block is
+// expected to come back; a failure here means the device allocator diverged and
+// is treated as fatal (the swap was gated on the sizes matching).
+bool llama_moe_cache::resume() {
+    auto * p = pimpl.get();
+    if (!p || p->failed) {
+        return false;
+    }
+    if (p->pool) {
+        return true; // already reserved
+    }
+
+    const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(p->cands[0].router->buffer);
+    p->pool = ggml_backend_buft_alloc_buffer(buft, p->budget_bytes);
+    if (!p->pool) {
+        LLAMA_LOG_ERROR("%s: failed to re-reserve %.1f MiB of device memory for the MoE expert cache after the mmproj hot swap\n",
+                __func__, p->budget_bytes/(1024.0*1024.0));
+        GGML_ABORT("MoE expert cache could not be restored after the mmproj hot swap");
+    }
+
+    activate(/*relayout =*/ true);
+
+    LLAMA_LOG_INFO("%s: MoE expert cache resumed, %.1f MiB of device memory re-reserved\n",
+            __func__, p->budget_bytes/(1024.0*1024.0));
+    return true;
+}
+
+uint64_t llama_moe_cache::budget_bytes() const {
+    if (!pimpl || pimpl->failed) {
+        return 0;
+    }
+    return pimpl->budget_bytes;
+}
+
+ggml_backend_dev_t llama_moe_cache::device() const {
+    if (!pimpl || pimpl->failed || pimpl->cands.empty() || pimpl->cands[0].router == nullptr) {
+        return nullptr;
+    }
+    return ggml_backend_buft_get_device(ggml_backend_buffer_get_type(pimpl->cands[0].router->buffer));
 }
 
 // a new prompt has begun (llama_context detects the decode -> prefill

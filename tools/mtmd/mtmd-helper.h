@@ -48,6 +48,10 @@ MTMD_API void mtmd_helper_log_set(ggml_log_callback log_callback, void * user_da
 // Returns true if this build includes video support (MTMD_VIDEO was ON at compile time).
 MTMD_API bool mtmd_helper_support_video(const mtmd_context * ctx);
 
+// Same as mtmd_helper_support_video(), without a context: lets callers report
+// video capability when the mmproj is not loaded (llama-server hot swap).
+MTMD_API bool mtmd_helper_video_supported(void);
+
 struct mtmd_helper_bitmap_wrapper {
     mtmd_bitmap * bitmap;
     mtmd_helper_video * video_ctx;

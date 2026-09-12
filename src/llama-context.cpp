@@ -3719,6 +3719,22 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
     return ret;
 }
 
+bool llama_context::moe_cache_suspend() {
+    return moe_cache ? moe_cache->suspend() : false;
+}
+
+bool llama_context::moe_cache_resume() {
+    return moe_cache ? moe_cache->resume() : false;
+}
+
+uint64_t llama_context::moe_cache_budget_bytes() const {
+    return moe_cache ? moe_cache->budget_bytes() : 0;
+}
+
+ggml_backend_dev_t llama_context::moe_cache_device() const {
+    return moe_cache ? moe_cache->device() : nullptr;
+}
+
 //
 // training
 //
@@ -4672,6 +4688,22 @@ void llama_opt_epoch(
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+bool llama_moe_cache_suspend(llama_context * ctx) {
+    return ctx->moe_cache_suspend();
+}
+
+bool llama_moe_cache_resume(llama_context * ctx) {
+    return ctx->moe_cache_resume();
+}
+
+uint64_t llama_moe_cache_budget_bytes(const llama_context * ctx) {
+    return ctx->moe_cache_budget_bytes();
+}
+
+ggml_backend_dev_t llama_moe_cache_device(const llama_context * ctx) {
+    return ctx->moe_cache_device();
 }
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {

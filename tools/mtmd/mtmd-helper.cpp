@@ -506,6 +506,14 @@ mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_file(const mtmd_context 
     return mtmd_helper_bitmap_init_from_buf(ctx, buf.data(), buf.size(), placeholder, opt);
 }
 
+bool mtmd_helper_video_supported(void) {
+#ifdef MTMD_VIDEO
+    return true;
+#else
+    return false;
+#endif
+}
+
 bool mtmd_helper_support_video(const mtmd_context * ctx) {
 #ifdef MTMD_VIDEO
     return mtmd_support_vision(ctx);

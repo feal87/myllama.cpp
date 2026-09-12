@@ -90,6 +90,16 @@ LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * m
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
+// --moe-expert-cache*: release / re-reserve the MoE expert cache's device pool
+// so its VRAM can serve another consumer (e.g. the mmproj) and be restored
+// afterwards. suspend() must be called with no graph in flight. Both are no-ops
+// that return false when the cache is disabled. budget_bytes() and device()
+// describe the pool (0 / null when disabled) for the caller's fit check.
+LLAMA_API bool         llama_moe_cache_suspend      (struct llama_context * ctx);
+LLAMA_API bool         llama_moe_cache_resume       (struct llama_context * ctx);
+LLAMA_API uint64_t     llama_moe_cache_budget_bytes (const struct llama_context * ctx);
+LLAMA_API ggml_backend_dev_t llama_moe_cache_device (const struct llama_context * ctx);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits

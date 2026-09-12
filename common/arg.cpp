@@ -2658,6 +2658,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples(mmproj_examples).set_env("MTMD_BACKEND_DEVICE")); // no LLAMA_ARG_ prefix for backward compatibility reason
     add_opt(common_arg(
+        {"--mmproj-hot-swap"},
+        {"--no-mmproj-hot-swap"},
+        "load the mmproj on demand and release the VRAM MoE expert cache pool while it is in use, so the two never hold device memory at the same time; requires --moe-expert-cache-budget-mib at least the mmproj worst-case device usage and --parallel 1",
+        [](common_params & params, bool value) {
+            params.mmproj_hot_swap = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MMPROJ_HOT_SWAP"));
+    add_opt(common_arg(
         {"--image", "--audio", "--video"}, "FILE",
         "path to an image, audio, or video file. use with multimodal models, use comma-separated values for multiple files\n",
         [](common_params & params, const std::string & value) {

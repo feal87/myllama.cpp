@@ -57,6 +57,8 @@
 //    (dummy slot), so the merge is exact by construction.
 //  - decode-only (n_tokens == 1); prefill/batch ubatches build the stock graph.
 
+#include "ggml-backend.h"
+
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -143,6 +145,25 @@ class llama_moe_cache {
     // window elapses and maybe_activate() rebuilds it from the new ranking.
     void on_prompt_begin();
 
+    // release the device pool so another consumer (e.g. the mmproj) can use the
+    // VRAM, and later re-reserve it. suspend() hands every published resident
+    // back to the RAM/disk tier and drops the layout; resume() reallocates the
+    // same budget and rebuilds the layout from the ranking observed so far, so
+    // the cache does not wait for a new profile window. The caller must ensure
+    // no graph referencing the cache tensors is in flight. Both are no-ops (and
+    // return false) when the cache is disabled; resume() aborts when the pool
+    // cannot be reallocated, as the swap was validated to fit at load time.
+    bool suspend();
+    bool resume();
+
+    // total device bytes of the pool (0 when disabled): the load-time gate for
+    // the mmproj hot swap compares this against the mmproj worst-case usage
+    uint64_t budget_bytes() const;
+
+    // device the pool is allocated from (null when disabled): the mmproj hot
+    // swap only makes sense when the mmproj lives on the same device
+    ggml_backend_dev_t device() const;
+
     // number of layout builds so far (initial activation + per-prompt rebuilds).
     // Decode graphs embed the cache tensors (and the per-layer slot counts), so
     // the graph-reuse check compares this generation to force a decode graph
@@ -174,6 +195,12 @@ class llama_moe_cache {
   private:
     struct impl;
     std::unique_ptr<impl> pimpl;
+
+    // size the per-layer capacities from the current ranking and carve the
+    // layout into the reserved pool. relayout = true tears the old layout down
+    // first (per-prompt rebuild, resume) and keeps the cache serving when the
+    // profile gives no layer a slot; false is the initial activation
+    void activate(bool relayout);
 
     // reconcile the residents with the current ranking (see llama-moecache.cpp)
     void rebalance();

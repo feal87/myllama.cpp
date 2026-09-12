@@ -15,6 +15,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "src/llama-ext.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -24,6 +25,7 @@
 #include <exception>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <memory>
 #include <filesystem>
 #include <random>
@@ -322,7 +324,6 @@ struct server_slot {
     common_memory mem;
 
     // multimodal
-    mtmd_context * mctx = nullptr;
     mtmd::batch_ptr mbatch = nullptr;
 
     // speculative decoding
@@ -816,9 +817,8 @@ struct server_slot {
 // note: this is not a member of server_slot because we want to run it inside yield_to_queue
 //       slot is passed as const to avoid accidental modification of the slot state
 //       some pointers are allowed to be used, they are not used by to_json()
-static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx, size_t & n_tokens_out) {
-    GGML_ASSERT(slot.mctx);
-    const auto & mctx = slot.mctx;
+static int process_mtmd_chunk(const server_slot & slot, mtmd_context * mctx, mtmd::batch_ptr & mbatch, size_t idx, size_t & n_tokens_out) {
+    GGML_ASSERT(mctx);
     const auto & input_tokens = slot.task->tokens;
     const auto & chunk = input_tokens.find_chunk(idx);
     int32_t res = 0;
@@ -917,8 +917,17 @@ public:
     llama_model * model_tgt = nullptr;
 
     mtmd_context * mctx = nullptr;
+    // transient mmproj of the current --mmproj-hot-swap prompt. Kept separate
+    // from mctx so HTTP threads reading mctx never see the transient pointer
+    mtmd_context * mctx_hot = nullptr;
+    // vision/audio capabilities of the configured mmproj. Valid whether or not
+    // mctx is resident (--mmproj-hot-swap keeps it unloaded between prompts)
+    mtmd_caps caps = {};
     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
+    // params used to (re)load the mmproj on demand (--mmproj-hot-swap). The
+    // progress callback is cleared: it points at a stack local of load_model()
+    mtmd_context_params mmproj_mparams = mtmd_context_params_default();
     const llama_vocab * vocab = nullptr;
 
     server_queue    queue_tasks;
@@ -1028,6 +1037,8 @@ private:
 
         mtmd_free(mctx);
         mctx = nullptr;
+        mtmd_free(mctx_hot);
+        mctx_hot = nullptr;
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -1101,6 +1112,28 @@ private:
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
 
+        // --mmproj-hot-swap: the mmproj is loaded per multimodal prompt, so the
+        // MoE expert cache pool can be released for it in between. Only the
+        // single-slot flow can guarantee no decode is in flight during the swap
+        if (params_base.mmproj_hot_swap) {
+            if (!has_mmproj) {
+                SRV_ERR("%s\n", "--mmproj-hot-swap requires --mmproj");
+                return false;
+            }
+            if (params_base.n_parallel != 1) {
+                SRV_ERR("--mmproj-hot-swap requires --parallel 1 (got %d)\n", params_base.n_parallel);
+                return false;
+            }
+            if (params_base.n_moe_cache_budget_mib == 0) {
+                SRV_ERR("%s\n", "--mmproj-hot-swap requires --moe-expert-cache-budget-mib: that pool is what gets released while the mmproj is loaded");
+                return false;
+            }
+            if (!params_base.mmproj_use_gpu) {
+                SRV_ERR("%s\n", "--mmproj-hot-swap requires --mmproj-offload: the mmproj must share the MoE cache's device");
+                return false;
+            }
+        }
+
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
             if (has_spec) {
@@ -1139,10 +1172,20 @@ private:
             mparams.progress_callback_user_data = &load_progress_mmproj;
         }
 
-        // optionally get the memory usage of mmproj
-        if (has_mmproj && params_base.fit_params) {
+        // keep the runtime params for the on-demand reloads (--mmproj-hot-swap)
+        if (has_mmproj) {
+            mmproj_mparams = mparams;
+            mmproj_mparams.progress_callback           = nullptr;
+            mmproj_mparams.progress_callback_user_data = nullptr;
+        }
+
+        // optionally get the memory usage of mmproj. This allocates the mmproj
+        // on its device to measure it, so it must run while the VRAM is still
+        // free (neither the model nor the MoE expert cache pool is resident yet)
+        std::map<ggml_backend_dev_t, size_t> mmproj_mem;
+        if (has_mmproj && (params_base.fit_params || params_base.mmproj_hot_swap)) {
             int64_t t_start = ggml_time_us();
-            auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
+            mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
             int64_t t_elapsed = ggml_time_us() - t_start;
             if (!mmproj_mem.empty()) {
                 size_t total = 0;
@@ -1150,20 +1193,44 @@ private:
                     total += size;
                 }
                 SRV_TRC("[mtmd] estimated worst-case memory usage of mmproj is %.2f MiB (took %.2f ms)\n", total / (1024.0 * 1024.0), t_elapsed / 1000.0);
-                GGML_ASSERT(!params_base.fit_params_target.empty());
-                for (auto & [dev, size] : mmproj_mem) {
-                    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-                        if (ggml_backend_dev_get(i) == dev) {
-                            if (i < params_base.fit_params_target.size()) {
-                                SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
-                                params_base.fit_params_target[i] += size;
+                if (params_base.fit_params) {
+                    GGML_ASSERT(!params_base.fit_params_target.empty());
+                    for (auto & [dev, size] : mmproj_mem) {
+                        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                            if (ggml_backend_dev_get(i) == dev) {
+                                if (i < params_base.fit_params_target.size()) {
+                                    SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
+                                    params_base.fit_params_target[i] += size;
+                                }
+                                break;
                             }
-                            break;
                         }
                     }
                 }
             } else {
                 SRV_ERR("%s", "[mtmd] failed to get memory usage of mmproj\n");
+            }
+        }
+
+        // --mmproj-hot-swap: the mmproj device and its worst-case usage. The MoE
+        // cache pool is compared against this once the context exists (the pool
+        // is only reserved there); the measurement itself must stay here, while
+        // the device still has room to allocate the mmproj
+        ggml_backend_dev_t mmproj_dev = nullptr;
+        size_t mmproj_dev_bytes = 0;
+        if (params_base.mmproj_hot_swap) {
+            for (const auto & [dev, size] : mmproj_mem) {
+                if (mmproj_dev == nullptr) {
+                    mmproj_dev = dev;
+                } else if (dev != mmproj_dev) {
+                    SRV_ERR("%s\n", "--mmproj-hot-swap: the mmproj spans multiple devices; pin it to the MoE cache's device with --mmproj-device");
+                    return false;
+                }
+                mmproj_dev_bytes += size;
+            }
+            if (mmproj_dev == nullptr || mmproj_dev_bytes == 0) {
+                SRV_ERR("%s\n", "--mmproj-hot-swap: could not determine the mmproj device memory usage");
+                return false;
             }
         }
 
@@ -1195,6 +1262,29 @@ private:
         n_ctx = llama_n_ctx(ctx_tgt);
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
+
+        // the swap is only sound when the mmproj lands on the same device as the
+        // MoE cache pool and fits inside it: the pool is what the mmproj uses
+        if (params_base.mmproj_hot_swap) {
+            const ggml_backend_dev_t moe_dev = llama_moe_cache_device(ctx_tgt);
+            const uint64_t moe_budget = llama_moe_cache_budget_bytes(ctx_tgt);
+            if (moe_dev == nullptr || moe_budget == 0) {
+                SRV_ERR("%s\n", "--mmproj-hot-swap: the MoE expert cache is disabled or failed to reserve, so there is no pool to release for the mmproj");
+                return false;
+            }
+            if (mmproj_dev != moe_dev) {
+                SRV_ERR("%s\n", "--mmproj-hot-swap: the mmproj and the MoE cache pool are on different devices; pin the mmproj with --mmproj-device so both share one device");
+                return false;
+            }
+            if (moe_budget < mmproj_dev_bytes) {
+                SRV_ERR("--mmproj-hot-swap is not possible: the MoE expert cache pool is %.1f MiB but the mmproj needs %.1f MiB on the same device; raise --moe-expert-cache-budget-mib to at least %d MiB or drop --mmproj-hot-swap\n",
+                        moe_budget/(1024.0*1024.0), mmproj_dev_bytes/(1024.0*1024.0),
+                        (int) ((mmproj_dev_bytes + 1024*1024 - 1)/(1024*1024)));
+                return false;
+            }
+            SRV_INF("mmproj hot swap enabled: MoE cache pool %.1f MiB >= mmproj worst-case usage %.1f MiB on the same device\n",
+                    moe_budget/(1024.0*1024.0), mmproj_dev_bytes/(1024.0*1024.0));
+        }
 
         if (has_spec) {
             // spec_mtp doesn't use load a model internally, so we report 0.0 and 1.0 manually
@@ -1238,12 +1328,20 @@ private:
                 mtmd_helper_log_set(common_log_default_callback, nullptr);
             }
 
-            mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
-            if (mctx == nullptr) {
-                SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
-                return false;
+            if (params_base.mmproj_hot_swap) {
+                caps = mtmd_get_cap_from_file(mmproj_path.c_str());
+                SRV_INF("mmproj hot swap: '%s' is loaded on demand (vision = %d, audio = %d)\n",
+                        mmproj_path.c_str(), (int) caps.inp_vision, (int) caps.inp_audio);
+            } else {
+                mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
+                if (mctx == nullptr) {
+                    SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
+                    return false;
+                }
+                caps.inp_vision = mtmd_support_vision(mctx);
+                caps.inp_audio  = mtmd_support_audio(mctx);
+                SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
             }
-            SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
 
             init_opt.video_params.fps_target = params_base.video_fps;
             init_opt.video_params.timestamp_interval_ms = params_base.video_timestamp_interval_ms;
@@ -1373,12 +1471,12 @@ private:
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot();
 
-            slot.mctx                   = mctx;
-            slot.prompt.tokens.has_mtmd = mctx != nullptr;
+            slot.prompt.tokens.has_mtmd = has_mmproj;
 
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
+                mmproj_hot_swap_end();
                 queue_tasks.pop_deferred_task(id_slot);
                 save_slot_full_state(id_slot);
             };
@@ -1470,7 +1568,7 @@ private:
             store_cfg.dir       = params_base.cache_disk_path;
             store_cfg.key       = server_prompt_cache_key(params_base, ctx_tgt, ctx_dft);
             store_cfg.use_dio   = use_dio;
-            store_cfg.has_mtmd  = mctx != nullptr;
+            store_cfg.has_mtmd  = has_mmproj;
             store_cfg.max_bytes = max_bytes;
 
             ckpt_store = std::make_unique<server_ckpt_store>(std::move(store_cfg));
@@ -1589,9 +1687,9 @@ private:
                 /* reasoning_format      */ params_base.reasoning_format,
                 /* chat_template_kwargs  */ params_base.default_template_kwargs,
                 /* tmpls                 */ std::move(chat_templates),
-                /* allow_image           */ mctx ? mtmd_support_vision(mctx) : false,
-                /* allow_audio           */ mctx ? mtmd_support_audio (mctx) : false,
-                /* allow_video           */ mctx ? mtmd_helper_support_video(mctx) : false,
+                /* allow_image           */ caps.inp_vision,
+                /* allow_audio           */ caps.inp_audio,
+                /* allow_video           */ caps.inp_vision && mtmd_helper_video_supported(),
                 /* enable_thinking       */ enable_thinking,
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
@@ -2406,6 +2504,59 @@ private:
         return true;
     }
 
+    // --mmproj-hot-swap: load the mmproj for this deferred multimodal task and
+    // tokenize its prompt. The MoE expert cache pool is released first (and
+    // restored on failure); the caller must ensure the slot is idle so no graph
+    // references the cache tensors. Returns false after sending an error.
+    bool mmproj_hot_swap_begin(server_task & task) {
+        llama_synchronize(ctx_tgt);
+        llama_moe_cache_suspend(ctx_tgt);
+
+        mctx_hot = mtmd_init_from_file(params_base.mmproj.path.c_str(), model_tgt, mmproj_mparams);
+        if (mctx_hot == nullptr) {
+            SRV_ERR("failed to load multimodal model, '%s'\n", params_base.mmproj.path.c_str());
+            llama_moe_cache_resume(ctx_tgt);
+            send_error(task, "failed to load multimodal model", ERROR_TYPE_SERVER);
+            return false;
+        }
+
+        try {
+            task.tokens = process_mtmd_prompt(mctx_hot, task.mtmd_prompt, task.mtmd_files, init_opt);
+        } catch (const std::exception & e) {
+            send_error(task, std::string("Failed to format input: ") + e.what(), ERROR_TYPE_INVALID_REQUEST);
+            mmproj_hot_swap_end();
+            return false;
+        }
+
+        task.params.message_spans = task.tokens.find_message_spans(task.mtmd_delims);
+        task.mtmd_deferred = false;
+        task.mtmd_prompt.clear();
+        task.mtmd_files.clear();
+        return true;
+    }
+
+    // free the on-demand mmproj and give the MoE expert cache pool back.
+    // Idempotent: a no-op when the cache is not in hot-swap mode or the mmproj is
+    // already unloaded, so every cleanup path can call it unconditionally
+    void mmproj_hot_swap_end() {
+        if (!params_base.mmproj_hot_swap || mctx_hot == nullptr) {
+            return;
+        }
+        // the per-slot batch holds a pointer to the mmproj, so drop it first
+        for (auto & s : slots) {
+            s.mbatch.reset();
+        }
+        mtmd_free(mctx_hot);
+        mctx_hot = nullptr;
+        llama_moe_cache_resume(ctx_tgt);
+    }
+
+    // mmproj used to process the current prompt: the transient hot-swap one when
+    // active, the resident one otherwise
+    mtmd_context * active_mctx() const {
+        return mctx_hot ? mctx_hot : mctx;
+    }
+
     std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot) {
         std::vector<server_slot *> free_slots;
         for (auto & slot : slots) {
@@ -2705,6 +2856,28 @@ private:
                         }
                     }
 
+                    // --mmproj-hot-swap: tokenize the deferred multimodal prompt
+                    // here, after releasing the MoE cache pool and loading the
+                    // mmproj. Only swap when the (single) slot is idle, else defer
+                    // the task untouched so the current generation keeps its cache
+                    if (task.mtmd_deferred) {
+                        bool any_busy = false;
+                        for (const auto & s : slots) {
+                            if (s.is_processing()) {
+                                any_busy = true;
+                                break;
+                            }
+                        }
+                        if (any_busy) {
+                            SRV_DBG("slot busy, defer multimodal task, id_task = %d\n", task.id);
+                            queue_tasks.defer(std::move(task));
+                            break;
+                        }
+                        if (!mmproj_hot_swap_begin(task)) {
+                            break; // error already sent
+                        }
+                    }
+
                     const int id_task = task.id;
 
                     server_slot * slot = get_available_slot(task);
@@ -2738,10 +2911,12 @@ private:
                         }
                         if (!launch_slots_with_parent_task(*slot, child_slots, std::move(task))) {
                             SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
+                            mmproj_hot_swap_end(); // release the mmproj if this was a hot-swap task
                             break; // drop the task
                         }
                     } else if (!launch_slot_with_task(*slot, std::move(task))) {
                         SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
+                        mmproj_hot_swap_end(); // release the mmproj if this was a hot-swap task
                         break; // drop the task
                     }
 
@@ -3831,12 +4006,13 @@ private:
                         size_t n_tokens_out = 0;
                         int32_t res = 0;
                         queue_tasks.yield_to_queue([&]() {
-                            res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
+                            res = process_mtmd_chunk(slot, active_mctx(), slot.mbatch, cur_token_idx, n_tokens_out);
                         });
 
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process mtmd chunk, res = %d\n", res);
                             send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
+                            mmproj_hot_swap_end();
                             slot.release();
                             return; // the slot is done, skip it entirely
                         }
@@ -3929,6 +4105,11 @@ private:
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
+
+                        // --mmproj-hot-swap: the mmproj is not needed anymore
+                        // once the whole prompt (image chunks included) is in the
+                        // KV cache; free it and give the MoE cache pool back
+                        mmproj_hot_swap_end();
 
                         GGML_ASSERT(batch.size() > 0);
 
@@ -4531,7 +4712,7 @@ server_context_meta server_context::get_meta() const {
         /* model_aliases          */ impl->model_aliases,
         /* model_tags             */ impl->model_tags,
         /* model_path             */ impl->params_base.model.path,
-        /* has_mtmd               */ impl->mctx != nullptr,
+        /* has_mtmd               */ impl->caps.inp_vision || impl->caps.inp_audio,
         /* has_inp_image          */ impl->chat_params.allow_image,
         /* has_inp_audio          */ impl->chat_params.allow_audio,
         /* has_inp_video          */ impl->chat_params.allow_video,
@@ -4630,12 +4811,19 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // process prompt
         std::vector<server_tokens> inputs;
 
-        if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
-            // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
-            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
-        } else {
-            // Everything else, including multimodal completions.
-            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
+        // --mmproj-hot-swap: defer tokenization of a multimodal prompt to the
+        // decode thread, where the MoE cache pool is released and the mmproj is
+        // loaded for it (see server_context_impl::mmproj_hot_swap_begin)
+        const bool defer_mtmd = params.mmproj_hot_swap && !files.empty() && prompt.is_string();
+
+        if (!defer_mtmd) {
+            if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
+                // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
+                inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
+            } else {
+                // Everything else, including multimodal completions.
+                inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
+            }
         }
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
@@ -4645,19 +4833,29 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         auto delimiters = common_chat_msg_delimiters_parse(delims);
         delimiters.tokenize(ctx_server.vocab);
 
-        for (size_t i = 0; i < inputs.size(); i++) {
+        const size_t n_inputs = defer_mtmd ? 1 : inputs.size();
+        for (size_t i = 0; i < n_inputs; i++) {
             server_task task = server_task(type);
 
             task.id = rd.get_new_id();
 
-            task.tokens = std::move(inputs[i]);
+            if (defer_mtmd) {
+                task.mtmd_deferred = true;
+                task.mtmd_prompt   = prompt.get<std::string>();
+                task.mtmd_files    = files;
+                task.mtmd_delims   = delimiters;
+            } else {
+                task.tokens = std::move(inputs[i]);
+            }
             task.params = server_schema::eval_llama_cmpl_schema(
                     ctx_server.vocab,
                     params,
                     meta->logit_bias_eog,
                     data);
 
-            task.params.message_spans = task.tokens.find_message_spans(delimiters);
+            if (!defer_mtmd) {
+                task.params.message_spans = task.tokens.find_message_spans(delimiters);
+            }
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
@@ -5864,6 +6062,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const l
         }
         n_tokens = process_mtmd_prompt(mctx, prompt.get<std::string>(), files, init_opt, true).size();
     } else {
+        if (meta->has_mtmd && !files.empty()) {
+            res->error(format_error_response(
+                    "multimodal token counting is not supported with --mmproj-hot-swap",
+                    ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
         n_tokens = tokenize_mixed(vocab, prompt, true, true).size();
     }
 

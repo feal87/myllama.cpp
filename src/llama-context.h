@@ -192,6 +192,15 @@ struct llama_context {
 
     llama_memory_breakdown memory_breakdown() const;
 
+    // --moe-expert-cache*: release / re-reserve the device pool of the MoE
+    // expert cache so its VRAM can serve another consumer (e.g. the mmproj) and
+    // be restored afterwards. suspend() must be called with no graph in flight.
+    // Both are no-ops when the cache is disabled.
+    bool moe_cache_suspend();
+    bool moe_cache_resume();
+    uint64_t moe_cache_budget_bytes() const;
+    ggml_backend_dev_t moe_cache_device() const;
+
     //
     // training
     //

@@ -159,6 +159,14 @@ struct server_task {
     std::string             cli_prompt;
     std::vector<raw_buffer> cli_files;
 
+    // --mmproj-hot-swap: multimodal inputs are tokenized later, on the decode
+    // thread, so the MoE expert cache pool can be released before the mmproj is
+    // loaded. Holds the raw prompt, its files and the parsed message delimiters
+    bool                        mtmd_deferred = false;
+    std::string                 mtmd_prompt;
+    std::vector<raw_buffer>     mtmd_files;
+    common_chat_msg_delimiters  mtmd_delims;
+
     server_task_type type;
 
     // used by SERVER_TASK_TYPE_SLOT_SAVE, SERVER_TASK_TYPE_SLOT_RESTORE, SERVER_TASK_TYPE_SLOT_ERASE
