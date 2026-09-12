@@ -589,65 +589,28 @@ struct server_prompt_data {
     std::vector<uint8_t> main;
     std::vector<uint8_t> drft;
 
-    std::string cache_file;
-    uint8_t * mapping = nullptr;
-    size_t mapping_size = 0;
-    size_t main_size = 0;
-    size_t drft_size = 0;
-
-    // Newly-created files are removed if saving is interrupted. Once the
-    // metadata sidecar is committed, they survive object destruction and are
-    // removed only by explicit cache eviction.
-    bool remove_file_on_destroy = true;
-
-#ifdef _WIN32
-    void * file_handle = nullptr;
-    void * mapping_handle = nullptr;
-#endif
-
     server_prompt_data() = default;
-    ~server_prompt_data();
+    ~server_prompt_data() = default;
 
     server_prompt_data(const server_prompt_data &) = delete;
     server_prompt_data & operator=(const server_prompt_data &) = delete;
 
-    server_prompt_data(server_prompt_data && other) noexcept;
-    server_prompt_data & operator=(server_prompt_data && other) noexcept;
+    server_prompt_data(server_prompt_data && other) noexcept = default;
+    server_prompt_data & operator=(server_prompt_data && other) noexcept = default;
 
-    bool is_disk() const {
-        return !cache_file.empty();
+    void clear() {
+        main.clear();
+        drft.clear();
     }
-
-    void clear();
-    void discard();
 
     size_t size() const {
-        if (is_disk()) {
-            return mapping_size;
-        }
         return main.size() + drft.size();
     }
-};
-
-struct server_prompt_cache_checkpoint {
-    int64_t n_tokens = 0;
-    int id_task = -1;
-
-    llama_pos pos_min = 0;
-    llama_pos pos_max = 0;
-
-    size_t offset_tgt = 0;
-    size_t size_tgt = 0;
-    size_t offset_dft = 0;
-    size_t size_dft = 0;
-    size_t offset_spec = 0;
-    size_t size_spec = 0;
 };
 
 struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
-    std::vector<server_prompt_cache_checkpoint> checkpoints_disk;
 
     size_t size() const {
         size_t res = data.size();
@@ -661,12 +624,7 @@ struct server_prompt_cache_state {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(
-        int32_t limit_size_mib,
-        size_t limit_tokens,
-        const std::string & cache_dir = "",
-        const std::string & cache_key = "",
-        bool has_mtmd = false);
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens);
 
     std::list<server_prompt_cache_state> states;
 
@@ -676,21 +634,11 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
-    std::string cache_dir;
-    std::string cache_key;
-
-    bool has_mtmd = false;
-
-    uint64_t next_file_id = 0;
-
     size_t size() const;
 
     size_t n_tokens() const;
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
-
-    bool commit(server_prompt_cache_state * state);
-    void discard(server_prompt_cache_state * state);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 

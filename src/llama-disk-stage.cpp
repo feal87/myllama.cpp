@@ -226,16 +226,22 @@ struct llama_disk_stage::impl {
     // executes from; a later hit copies from the pool instead of reading the
     // disk. One pool per expert-bundle type (one slab each): a slot stride is
     // fixed per tensor, and this model mixes Q8_0 and Q5_1 down projections.
-    // Evicted residents enter at the MRU end and outlive mere miss entries.
+    //
+    // SLRU: a miss enters the probation segment, a hit promotes it to the
+    // protected segment, and evictions come from the probation LRU, so a
+    // one-shot miss cannot push out an expert that keeps being re-read.
+    // Demotions (recently resident experts) enter protected directly.
     struct evict_pool {
         char *  data[3]   = { nullptr, nullptr, nullptr }; // role -> slab region
         size_t  stride[3] = { 0, 0, 0 };
         int32_t cap       = 0;
-        // LRU: lru.front() is the most recent; key = ((int64_t) il << 32) | id
-        std::list<int64_t>                        lru;
+        int32_t prot_cap  = 0; // protected cap; probation holds the rest
+        std::list<int64_t> prob; // probation, front = MRU
+        std::list<int64_t> prot; // protected, front = MRU
         std::unordered_map<int64_t, int32_t>      slot_of;   // key -> slot
-        std::vector<std::list<int64_t>::iterator> iter_of;   // slot -> position in lru
+        std::vector<std::list<int64_t>::iterator> iter_of;   // slot -> position
         std::vector<int64_t>                      slot_key;  // slot -> key, -1 when empty
+        std::vector<uint8_t>                      seg;       // slot -> 0 probation, 1 protected
         std::vector<int32_t>                      free_slots;
     };
     std::vector<evict_pool> evict_pools;
@@ -248,14 +254,68 @@ struct llama_disk_stage::impl {
     uint64_t n_l2_evictions   = 0;
     uint64_t n_l2_demotions   = 0;
     uint64_t n_l2_hit_bytes   = 0;
-    uint64_t n_l2_promos      = 0; // resident fills served from the L2 instead of the disk
-    uint64_t n_l2_promo_bytes = 0;
+    uint64_t n_l2_promo_bytes = 0; // resident fills served from the L2 instead of the disk
     bool     l2_warm          = false; // latched when every resident pool is full
+
+    // previous stats report, for the per-interval delta line
+    uint64_t prev_l2_hits        = 0;
+    uint64_t prev_l2_misses      = 0;
+    uint64_t prev_l2_evictions   = 0;
+    uint64_t prev_l2_demotions   = 0;
+    uint64_t prev_l2_hit_bytes   = 0;
+    uint64_t prev_l2_promo_bytes = 0;
 
     int evict_pool_for(int il) const {
         return (il >= 0 && il < (int) evict_pool_id.size()) ? evict_pool_id[(size_t) il] : -1;
     }
 
+    static void evict_mru(evict_pool & ep, int32_t slot) {
+        std::list<int64_t> & l = ep.seg[(size_t) slot] != 0 ? ep.prot : ep.prob;
+        if (ep.iter_of[(size_t) slot] != l.begin()) {
+            l.splice(l.begin(), l, ep.iter_of[(size_t) slot]);
+            ep.iter_of[(size_t) slot] = l.begin();
+        }
+    }
+
+    static void evict_push(evict_pool & ep, int64_t key, int32_t slot, uint8_t seg) {
+        std::list<int64_t> & l = seg != 0 ? ep.prot : ep.prob;
+        l.push_front(key);
+        ep.iter_of[(size_t) slot] = l.begin();
+        ep.seg[(size_t) slot] = seg;
+        ep.slot_key[(size_t) slot] = key;
+        ep.slot_of[key] = slot;
+    }
+
+    // demote the protected LRU into probation so protected stays at its cap
+    static void evict_trim(evict_pool & ep) {
+        while ((int32_t) ep.prot.size() > ep.prot_cap) {
+            const int64_t key = ep.prot.back();
+            const int32_t slot = ep.slot_of.at(key);
+            ep.prot.pop_back();
+            ep.prob.push_front(key);
+            ep.iter_of[(size_t) slot] = ep.prob.begin();
+            ep.seg[(size_t) slot] = 0;
+        }
+    }
+
+    // a free slot, or the probation LRU's slot. Probation is non-empty whenever
+    // the cache is full and the free list is empty
+    int32_t evict_take_slot(evict_pool & ep) {
+        if (!ep.free_slots.empty()) {
+            const int32_t s = ep.free_slots.back();
+            ep.free_slots.pop_back();
+            return s;
+        }
+        const int64_t key = ep.prob.back();
+        const int32_t slot = ep.slot_of.at(key);
+        ep.prob.pop_back();
+        ep.slot_of.erase(key);
+        ep.slot_key[(size_t) slot] = -1;
+        n_l2_evictions++;
+        return slot;
+    }
+
+    // a hit: promote probation -> protected, or refresh protected
     int32_t evict_touch(int pool, int64_t key) {
         evict_pool & ep = evict_pools[(size_t) pool];
         const auto it = ep.slot_of.find(key);
@@ -263,37 +323,39 @@ struct llama_disk_stage::impl {
             return -1;
         }
         const int32_t slot = it->second;
-        if (ep.iter_of[(size_t) slot] != ep.lru.begin()) {
-            ep.lru.splice(ep.lru.begin(), ep.lru, ep.iter_of[(size_t) slot]);
-            ep.iter_of[(size_t) slot] = ep.lru.begin();
+        if (ep.seg[(size_t) slot] == 0) {
+            ep.prob.erase(ep.iter_of[(size_t) slot]);
+            ep.seg[(size_t) slot] = 1;
+            ep.prot.push_front(key);
+            ep.iter_of[(size_t) slot] = ep.prot.begin();
+            evict_trim(ep);
+        } else {
+            evict_mru(ep, slot);
         }
         return slot;
     }
 
+    // a miss: insert into probation
     int32_t evict_alloc(int pool, int64_t key) {
         evict_pool & ep = evict_pools[(size_t) pool];
-        int32_t slot;
-        if (!ep.free_slots.empty()) {
-            slot = ep.free_slots.back();
-            ep.free_slots.pop_back();
-        } else {
-            const int64_t victim = ep.lru.back();
-            ep.lru.pop_back();
-            slot = ep.slot_of.at(victim);
-            ep.slot_of.erase(victim);
-            ep.slot_key[(size_t) slot] = -1;
-            n_l2_evictions++;
-        }
-        ep.slot_key[(size_t) slot] = key;
-        ep.slot_of[key] = slot;
-        ep.lru.push_front(key);
-        ep.iter_of[(size_t) slot] = ep.lru.begin();
+        const int32_t slot = evict_take_slot(ep);
+        evict_push(ep, key, slot, 0);
+        evict_trim(ep);
+        return slot;
+    }
+
+    // a demotion (recently resident expert): insert into protected
+    int32_t evict_alloc_prot(int pool, int64_t key) {
+        evict_pool & ep = evict_pools[(size_t) pool];
+        const int32_t slot = evict_take_slot(ep);
+        evict_push(ep, key, slot, 1);
+        evict_trim(ep);
         return slot;
     }
 
     int32_t evict_put(int pool, int64_t key) {
         const int32_t slot = evict_touch(pool, key);
-        return slot >= 0 ? slot : evict_alloc(pool, key);
+        return slot >= 0 ? slot : evict_alloc_prot(pool, key);
     }
 
     void evict_remove(int pool, int64_t key) {
@@ -303,7 +365,11 @@ struct llama_disk_stage::impl {
             return;
         }
         const int32_t slot = it->second;
-        ep.lru.erase(ep.iter_of[(size_t) slot]);
+        if (ep.seg[(size_t) slot] != 0) {
+            ep.prot.erase(ep.iter_of[(size_t) slot]);
+        } else {
+            ep.prob.erase(ep.iter_of[(size_t) slot]);
+        }
         ep.slot_of.erase(it);
         ep.slot_key[(size_t) slot] = -1;
         ep.free_slots.push_back(slot);
@@ -311,7 +377,8 @@ struct llama_disk_stage::impl {
 
     void evict_clear() {
         for (evict_pool & ep : evict_pools) {
-            ep.lru.clear();
+            ep.prob.clear();
+            ep.prot.clear();
             ep.slot_of.clear();
             ep.free_slots.resize((size_t) ep.cap);
             for (int32_t s = 0; s < ep.cap; ++s) {
@@ -431,17 +498,37 @@ bool llama_disk_stage::is_active() const {
     return pimpl->active;
 }
 
-void llama_disk_stage::print_stats() const {
-    const impl & p = *pimpl;
+void llama_disk_stage::print_stats() {
+    impl & p = *pimpl;
     if (p.evict_pools.empty()) {
         return;
     }
-    const uint64_t lookups = p.n_l2_hits + p.n_l2_misses;
+
+    const uint64_t lookups  = p.n_l2_hits + p.n_l2_misses;
+    const uint64_t d_hits   = p.n_l2_hits - p.prev_l2_hits;
+    const uint64_t d_look   = d_hits + (p.n_l2_misses - p.prev_l2_misses);
+    const uint64_t d_bytes  = p.n_l2_hit_bytes - p.prev_l2_hit_bytes;
+    const uint64_t d_promo  = p.n_l2_promo_bytes - p.prev_l2_promo_bytes;
+    const uint64_t d_evict  = p.n_l2_evictions - p.prev_l2_evictions;
+    const uint64_t d_demote = p.n_l2_demotions - p.prev_l2_demotions;
+
     LLAMA_LOG_INFO("[disk-stage] L2 pool: hit=%.1f%% (%" PRIu64 "/%" PRIu64 " warm routed, %" PRIu64 " cold fill skipped)"
                    " | disk avoided=%.2f MiB (promo %.2f MiB) | evictions=%" PRIu64 " | demotions=%" PRIu64 "\n",
                    lookups ? 100.0 * p.n_l2_hits / lookups : 0.0, p.n_l2_hits, lookups, p.n_l2_cold,
                    p.n_l2_hit_bytes / (1024.0 * 1024.0), p.n_l2_promo_bytes / (1024.0 * 1024.0),
                    p.n_l2_evictions, p.n_l2_demotions);
+
+    LLAMA_LOG_INFO("[disk-stage] L2 pool: delta hit=%.1f%% (%" PRIu64 "/%" PRIu64 ")"
+                   " | disk avoided=%.2f MiB (promo %.2f MiB) | evictions=%" PRIu64 " | demotions=%" PRIu64 "\n",
+                   d_look ? 100.0 * d_hits / d_look : 0.0, d_hits, d_look,
+                   d_bytes / (1024.0 * 1024.0), d_promo / (1024.0 * 1024.0), d_evict, d_demote);
+
+    p.prev_l2_hits        = p.n_l2_hits;
+    p.prev_l2_misses      = p.n_l2_misses;
+    p.prev_l2_evictions   = p.n_l2_evictions;
+    p.prev_l2_demotions   = p.n_l2_demotions;
+    p.prev_l2_hit_bytes   = p.n_l2_hit_bytes;
+    p.prev_l2_promo_bytes = p.n_l2_promo_bytes;
 }
 
 const llama_disk_stage_layer * llama_disk_stage::layer(int il) const {
@@ -974,12 +1061,16 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
 
                                 impl::evict_pool ep;
                                 ep.cap = cap;
+                                // protected gets three quarters: one-shot misses
+                                // enter probation and cannot displace a re-read
+                                ep.prot_cap = cap - std::max(1, cap / 4);
                                 for (const auto & role : roles) {
                                     ep.data[role.slot]   = p.base + (size_t) pid * per_buffer + region_off[role.slot] + src[il].r[role.slot].head;
                                     ep.stride[role.slot] = src[il].r[role.slot].stride;
                                 }
                                 ep.slot_key.assign((size_t) ep.cap, -1);
                                 ep.iter_of.resize((size_t) ep.cap);
+                                ep.seg.assign((size_t) ep.cap, 0);
                                 ep.free_slots.resize((size_t) ep.cap);
                                 for (int32_t s = 0; s < ep.cap; ++s) {
                                     ep.free_slots[(size_t) s] = s;
@@ -1421,7 +1512,6 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
                                                pool.data[r] + (size_t) slot * pool.slot_stride[r], len });
                             p.n_l2_promo_bytes += len;
                         }
-                        p.n_l2_promos++;
                         p.evict_populated = true;
                         l2_consume.emplace_back(epid, key);
                     } else {

@@ -23,6 +23,8 @@ add_library(${TARGET} STATIC
     server-common.h
     server-context.cpp
     server-context.h
+    server-ckpt-store.cpp
+    server-ckpt-store.h
     server-stream.cpp
     server-stream.h
     server-tools.cpp

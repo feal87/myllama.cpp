@@ -1737,14 +1737,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--cache-disk"}, "PATH",
-        "persist prompt cache state under this directory and restore it after server restart",
+        "store slot context checkpoints in this directory and restore them after server restart, one checkpoint per prefill batch (set -b == -ub for one checkpoint per ubatch)",
         [](common_params & params, const std::string & value) {
             params.cache_disk_path = value;
         }
     ).set_env("LLAMA_ARG_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--cache-disk-max"}, "N",
-        string_format("set the maximum disk cache size in MiB (default: %d, -1 - no limit, 0 - disable)", params.cache_disk_max_mib),
+        string_format("set the maximum on-disk checkpoint store size in MiB (default: %d, -1 - no limit, 0 - disable)", params.cache_disk_max_mib),
         [](common_params & params, int value) {
             if (value < -1) {
                 throw std::invalid_argument("cache-disk-max must be -1 or non-negative");
