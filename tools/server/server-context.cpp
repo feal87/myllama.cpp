@@ -3869,31 +3869,33 @@ private:
                                         }
                                         return starts;
                                     };
-                                    const auto batch_starts = request_batch_starts(slot.task->n_tokens());
-                                    const llama_tokens & req_tokens = slot.task->tokens.get_tokens();
-
                                     // search for a context checkpoint
                                     auto it = slot.prompt.checkpoints.rend();
-                                    for (auto cit = slot.prompt.checkpoints.rbegin(); cit != slot.prompt.checkpoints.rend(); ++cit) {
-                                        const auto & cur = *cit;
-                                        // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
-                                        SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
-                                        // the saved state must cover exactly the current request's tokens
-                                        if (cur.n_tokens <= 0 || cur.n_tokens > (int64_t) req_tokens.size()) {
-                                            continue;
-                                        }
-                                        if (cur.fingerprint != common_prompt_checkpoint::hash_tokens(req_tokens.data(), cur.n_tokens)) {
-                                            continue;
-                                        }
-                                        // a checkpoint from the same request is always on a ubatch
-                                        // start; one from an older request only when it lands on one
-                                        // of this request's starts
-                                        if (cur.len_ctx != slot.task->n_tokens() &&
-                                                std::find(batch_starts.begin(), batch_starts.end(), cur.n_tokens) == batch_starts.end()) {
-                                            continue;
-                                        }
-                                        if (it == slot.prompt.checkpoints.rend() || cur.n_tokens > it->n_tokens) {
-                                            it = cit;
+                                    // a request that contains media has no verifiable checkpoint
+                                    if (!slot.task->tokens.has_media()) {
+                                        const auto batch_starts = request_batch_starts(slot.task->n_tokens());
+                                        const llama_tokens & req_tokens = slot.task->tokens.get_tokens();
+                                        for (auto cit = slot.prompt.checkpoints.rbegin(); cit != slot.prompt.checkpoints.rend(); ++cit) {
+                                            const auto & cur = *cit;
+                                            // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
+                                            SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
+                                            // the saved state must cover exactly the current request's tokens
+                                            if (cur.n_tokens <= 0 || cur.n_tokens > (int64_t) req_tokens.size()) {
+                                                continue;
+                                            }
+                                            if (cur.fingerprint != common_prompt_checkpoint::hash_tokens(req_tokens.data(), cur.n_tokens)) {
+                                                continue;
+                                            }
+                                            // a checkpoint from the same request is always on a ubatch
+                                            // start; one from an older request only when it lands on one
+                                            // of this request's starts
+                                            if (cur.len_ctx != slot.task->n_tokens() &&
+                                                    std::find(batch_starts.begin(), batch_starts.end(), cur.n_tokens) == batch_starts.end()) {
+                                                continue;
+                                            }
+                                            if (it == slot.prompt.checkpoints.rend() || cur.n_tokens > it->n_tokens) {
+                                                it = cit;
+                                            }
                                         }
                                     }
 
@@ -4187,6 +4189,9 @@ private:
 
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
+
+                    // a checkpoint of a request with media cannot be hashed or verified
+                    do_checkpoint = do_checkpoint && !slot.task->tokens.has_media() && !slot.prompt.tokens.has_media();
 
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
