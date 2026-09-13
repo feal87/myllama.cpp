@@ -536,6 +536,8 @@ struct common_params {
 
     int32_t ple_cache_mib = 64; // RAM budget for the lazy PLE row cache, 0 disables it
 
+    enum llama_qsa_mode qsa_mode = LLAMA_QSA_MODE_AUTO; // sparse (QSA) attention
+
     enum common_context_seq_rm_type seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_AUTO; // probe or pin the context's seq_rm capability
 
     common_cpu_params cpuparams;

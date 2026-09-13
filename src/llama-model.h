@@ -690,6 +690,9 @@ struct llama_model {
 
     std::vector<llama_layer> layers;
 
+    // sparse (QSA) attention mode, chosen with --qsa
+    enum llama_qsa_mode get_qsa_mode() const { return params.qsa_mode; }
+
     //Dense linear projections for SentenceTransformers models like embeddinggemma
     // For Sentence Transformers models structure see
     // https://sbert.net/docs/sentence_transformer/usage/custom_models.html#structure-of-sentence-transformer-models

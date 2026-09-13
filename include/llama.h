@@ -222,6 +222,12 @@ extern "C" {
         LLAMA_LAZY_MODE_DIRECT = 3, // like ON, but the arch reads the rows with explicit offset reads instead of demand paging the mmap
     };
 
+    enum llama_qsa_mode {
+        LLAMA_QSA_MODE_AUTO = 0, // use the sparse-attention metadata stored in the model
+        LLAMA_QSA_MODE_ON   = 1, // force sparse attention on every layer that has an indexer
+        LLAMA_QSA_MODE_OFF  = 2, // force dense attention everywhere
+    };
+
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
         LLAMA_CONTEXT_TYPE_MTP     = 1,
@@ -326,6 +332,9 @@ extern "C" {
         enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
 
         int32_t ple_cache_mib; // RAM budget for the lazy PLE row cache, 0 disables it
+
+        // sparse (QSA) attention, for architectures that support it
+        enum llama_qsa_mode qsa_mode;
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;

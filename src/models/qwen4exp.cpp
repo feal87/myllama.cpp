@@ -1219,6 +1219,18 @@ public:
     const bool blk_bias;
 };
 
+// --qsa on can turn the indexer on for a layer whose block metadata is missing from the
+// model. there is no block size to pool with then, so fall back to one cell per block.
+static int64_t qwen4exp_qsa_ratio(const llama_hparams & hparams, enum llama_qsa_mode mode, int il) {
+    const int64_t r = hparams.dsv4_compress_ratios[il];
+
+    if (r > 0 || mode != LLAMA_QSA_MODE_ON) {
+        return r;
+    }
+
+    return 1;
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         const llama_memory_hybrid_idx_context * mctx_hyb,
         ggml_tensor *                           cur,
@@ -1231,7 +1243,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     const int64_t idx_dim  = hparams.indexer_head_size;
     const int64_t n_idx_h  = hparams.indexer_n_head;
-    const int64_t r        = hparams.dsv4_compress_ratios[il];
+    const int64_t r        = qwen4exp_qsa_ratio(hparams, model.get_qsa_mode(), il);
     const int64_t n_kv     = mctx_idx->get_n_kv();
 
     GGML_ASSERT(r > 0);
@@ -1540,8 +1552,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
-    // indexer reads the same block input as q/k/v; no cache or no ratio means dense
-    const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
+    const int64_t n_stream = mctx_hyb->get_n_stream();
+
+    // indexer reads the same block input as q/k/v; no cache or no ratio means dense.
+    // QSA is decode-only: a multi-token ubatch keeps the dense path, so the prefill
+    // graph does not carry the O(n_kv * n_ubatch) top-k layout. n_tokens == n_stream
+    // means one token per stream.
+    const bool qsa = mctx_hyb->get_idx() != nullptr && model.get_qsa_mode() != LLAMA_QSA_MODE_OFF &&
+                     qwen4exp_qsa_ratio(hparams, model.get_qsa_mode(), il) > 0 && n_tokens == n_stream;
 
     // gather-based QSA decode: worth it once the cache is meaningfully deeper than the
     // top-k width; below that the masked path costs about the same. QWEN4EXP_QSA_GATHER=0
@@ -1553,11 +1571,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
     bool gather = false;
     if (qsa && gather_enabled) {
-        const int64_t r     = hparams.dsv4_compress_ratios[il];
+        const int64_t r     = qwen4exp_qsa_ratio(hparams, model.get_qsa_mode(), il);
         const int64_t n_kv  = mctx_hyb->get_idx()->get_n_kv();
         const int64_t width = GGML_PAD((int64_t) hparams.indexer_top_k + r - 1, 256);
-
-        const int64_t n_stream = mctx_hyb->get_n_stream();
 
         // the masked path only gets more expensive than the gather overhead once n_kv is well
         // past the top-k width; the crossover measured on sm_89 is ~20k cells, and below it
@@ -1625,7 +1641,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
     if (top_k) {
-        ggml_tensor * qsa_bias = gather ? qsa_inps.at((uint32_t) hparams.dsv4_compress_ratios[il])->bias : nullptr;
+        ggml_tensor * qsa_bias = gather ? qsa_inps.at((uint32_t) qwen4exp_qsa_ratio(hparams, model.get_qsa_mode(), il))->bias : nullptr;
 
         cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, top_k, qsa_bias, kq_scale, il, gather);
     } else {
