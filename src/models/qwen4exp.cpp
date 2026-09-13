@@ -1464,9 +1464,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         // top_k [n_topk, 1, 1, ns] -> the index layout ggml_get_rows expects: [n_topk, 1, ns, 1]
         ggml_tensor * idx = ggml_reshape_4d(ctx0, top_k, n_topk, 1, ns, 1);
 
-        // get_rows dequantizes the cells to F32; build_attn_mha casts to F16 for flash attention
-        ggml_tensor * k_g = ggml_get_rows(ctx0, k_cells, idx); // F32 [hd_k*n_h_kv, n_topk, 1, ns]
-        ggml_tensor * v_g = ggml_get_rows(ctx0, v_cells, idx); // F32 [hd_v*n_h_kv, n_topk, 1, ns]
+        // gather straight to F16: flash attention wants F16, so this avoids the F32
+        // round trip that build_attn_mha would otherwise insert as a separate cast
+        ggml_tensor * k_g = ggml_get_rows_f16(ctx0, k_cells, idx); // F16 [hd_k*n_h_kv, n_topk, 1, ns]
+        ggml_tensor * v_g = ggml_get_rows_f16(ctx0, v_cells, idx); // F16 [hd_v*n_h_kv, n_topk, 1, ns]
 
         k_g = ggml_reshape_4d(ctx0, k_g, hd_k, n_h_kv, n_topk, ns);
         v_g = ggml_reshape_4d(ctx0, v_g, hd_v, n_h_kv, n_topk, ns);

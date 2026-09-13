@@ -1730,6 +1730,13 @@ extern "C" {
             struct ggml_tensor  * a,  // data
             struct ggml_tensor  * b); // row indices
 
+    // same as ggml_get_rows, but the selected rows are written as F16 instead of F32.
+    // saves the F32 round trip when the rows feed flash attention, which wants F16.
+    GGML_API struct ggml_tensor * ggml_get_rows_f16(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // data
+            struct ggml_tensor  * b); // row indices
+
     GGML_API struct ggml_tensor * ggml_get_rows_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // gradients of ggml_get_rows result
