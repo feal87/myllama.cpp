@@ -2634,9 +2634,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         };
 
                         if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
-                            // QSA runs on the dense-attention layers only
+                            // QSA runs on the dense-attention layers only, and only where the
+                            // metadata gives a block size. A GGUF whose compress_ratios are all
+                            // zero never runs sparse attention, so filtering every layer keeps
+                            // the indexer cache from reserving buffers nothing will ever touch
                             filter_idx = [&](uint32_t il) {
-                                return il < hparams.n_layer() && !hparams.is_recr(il);
+                                return il < hparams.n_layer() && !hparams.is_recr(il) &&
+                                       hparams.dsv4_compress_ratios[il] > 0;
                             };
                         }
                     }

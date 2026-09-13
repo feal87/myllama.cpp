@@ -785,6 +785,36 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         }
     }
 
+    // the sparse-attention layers are the ones the indexer serves. All-zero compress_ratios means
+    // dense attention everywhere, which is the mode that keeps long-range recall, so sparse
+    // attention must never activate silently: a converter or a loader that reconstructs the
+    // ratios would otherwise turn it back on without a trace
+    {
+        uint32_t n_qsa  = 0;
+        uint32_t n_full = 0;
+
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            if (hparams.is_recr(il)) {
+                continue;
+            }
+
+            n_full++;
+
+            if (hparams.dsv4_compress_ratios[il] > 0) {
+                n_qsa++;
+            }
+        }
+
+        if (n_qsa > 0) {
+            LLAMA_LOG_WARN("%s: sparse attention (QSA) ACTIVE on %u of %u dense-attention layers, "
+                           "long-range context is limited to the indexer budget\n",
+                    __func__, n_qsa, n_full);
+        } else {
+            LLAMA_LOG_INFO("%s: sparse attention (QSA) inactive, all %u dense-attention layers run full attention\n",
+                    __func__, n_full);
+        }
+    }
+
     switch (hparams.n_layer()) {
         case 48: type = LLM_TYPE_A3B; break;
         default: type = LLM_TYPE_UNKNOWN;
