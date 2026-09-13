@@ -6,9 +6,11 @@
 #include <algorithm>
 #include <cerrno>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <cstdint>
 #include <exception>
+#include <mutex>
 #include <string>
 #include <stdexcept>
 #include <thread>
@@ -81,17 +83,25 @@ struct ple_win_handle {
 struct llama_model_qwen4exp::ple_direct_reader {
 #ifdef _WIN32
     ple_direct_reader(HANDLE handle, size_t base, size_t row_size, int64_t n_rows, int n_threads,
-                      enum ggml_type type, int64_t head_dim)
+                      enum ggml_type type, int64_t head_dim, size_t cache_bytes)
         : handle(handle), base(base), row_size(row_size), n_rows(n_rows), n_threads(n_threads),
-          head_dim(head_dim), to_float(type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(type)->to_float) {
+          head_dim(head_dim), to_float(type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(type)->to_float),
+          cache_bytes(cache_bytes) {
 #else
     ple_direct_reader(int fd, size_t base, size_t row_size, int64_t n_rows, int n_threads,
-                      enum ggml_type type, int64_t head_dim)
+                      enum ggml_type type, int64_t head_dim, size_t cache_bytes)
         : fd(fd), base(base), row_size(row_size), n_rows(n_rows), n_threads(n_threads),
-          head_dim(head_dim), to_float(type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(type)->to_float) {
+          head_dim(head_dim), to_float(type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(type)->to_float),
+          cache_bytes(cache_bytes) {
 #endif
         // F32 rows have no dequantizer; they are staged as-is, like ggml_get_rows
         GGML_ASSERT((type == GGML_TYPE_F32 || to_float != nullptr) && head_dim > 0);
+
+        if (cache_bytes > 0) {
+            cache.init(row_size, cache_bytes);
+            LLAMA_LOG_INFO("%s: PLE row cache: %u slots, %.1f MiB payload for %" PRId64 " rows\n",
+                           __func__, cache.n_slots, cache.payload_bytes() / (1024.0 * 1024.0), n_rows);
+        }
     }
     ~ple_direct_reader() {
 #ifdef _WIN32
@@ -116,6 +126,254 @@ struct llama_model_qwen4exp::ple_direct_reader {
     const int      n_threads;  // in-flight read workers
     const int64_t  head_dim;   // F32 elements per staged row
     ggml_to_float_t to_float;  // same dequantizer the ggml_get_rows CPU kernel uses
+    const size_t   cache_bytes; // PLE row cache budget, 0 = disabled
+
+    // Read-through segmented LRU of quantized PLE table rows, keyed by row id.
+    // A compact open-addressed index maps row id -> slot; the SLRU order is an
+    // intrusive doubly-linked list over the slots. Per slot: row_size payload
+    // bytes plus 21 bytes of metadata (key, two links, segment, hash load).
+    struct row_cache {
+        static constexpr uint32_t EMPTY = 0xFFFFFFFFu;
+        static constexpr uint32_t TOMB  = 0xFFFFFFFEu;
+
+        size_t   row_size = 0;
+        uint32_t n_slots  = 0;
+        uint32_t mask     = 0;
+        uint32_t prot_cap = 0;
+
+        std::vector<uint8_t>  payload;  // n_slots * row_size
+        std::vector<uint32_t> slot_key; // 0 empty, else key + 1
+        std::vector<int32_t>  slot_prev;
+        std::vector<int32_t>  slot_next;
+        std::vector<uint8_t>  slot_seg; // 0 probation, 1 protected
+        std::vector<uint32_t> table;    // slot + 1, EMPTY or TOMB
+
+        int32_t  free_head = -1;
+        int32_t  prob_head = -1, prob_tail = -1;
+        int32_t  prot_head = -1, prot_tail = -1;
+        uint32_t prob_count = 0, prot_count = 0;
+        uint32_t n_tomb = 0;
+
+        uint64_t n_hits  = 0;
+        uint64_t n_miss  = 0;
+        uint64_t n_evict = 0;
+        mutable std::mutex mu;
+
+        static uint32_t hash(uint32_t k) {
+            k ^= k >> 16;
+            k *= 0x7feb352du;
+            k ^= k >> 15;
+            k *= 0x846ca68bu;
+            k ^= k >> 16;
+            return k;
+        }
+
+        void init(size_t rs, size_t bytes) {
+            row_size = rs;
+            // ~21 B of metadata per slot (key, two links, segment, hash load);
+            // 24 leaves headroom for the power-of-two table
+            n_slots = (uint32_t) std::max<size_t>(1, bytes / (row_size + 24));
+            uint32_t ts = 1;
+            while (ts < (uint32_t) n_slots * 2) {
+                ts <<= 1;
+            }
+            mask = ts - 1;
+            table.assign(ts, EMPTY);
+            payload.assign((size_t) n_slots * row_size, 0);
+            slot_key.assign(n_slots, 0);
+            slot_prev.assign(n_slots, -1);
+            slot_next.assign(n_slots, -1);
+            slot_seg.assign(n_slots, 0);
+            for (int32_t s = (int32_t) n_slots - 1; s >= 0; --s) {
+                slot_next[(size_t) s] = free_head;
+                free_head = s;
+            }
+            prot_cap = (uint32_t) ((size_t) n_slots * 4 / 5);
+        }
+
+        uint32_t live() const { return prob_count + prot_count; }
+        size_t payload_bytes() const { return (size_t) n_slots * row_size; }
+
+        void free_push(int32_t s) {
+            slot_prev[(size_t) s] = -1;
+            slot_next[(size_t) s] = free_head;
+            free_head = s;
+        }
+        int32_t free_pop() {
+            const int32_t s = free_head;
+            free_head = slot_next[(size_t) s];
+            return s;
+        }
+
+        void lpush(int32_t & h, int32_t & t, uint32_t & c, int32_t s) {
+            slot_prev[(size_t) s] = -1;
+            slot_next[(size_t) s] = h;
+            if (h != -1) {
+                slot_prev[(size_t) h] = s;
+            } else {
+                t = s;
+            }
+            h = s;
+            c++;
+        }
+        void ldel(int32_t & h, int32_t & t, uint32_t & c, int32_t s) {
+            const int32_t p = slot_prev[(size_t) s];
+            const int32_t n = slot_next[(size_t) s];
+            if (p != -1) {
+                slot_next[(size_t) p] = n;
+            } else {
+                h = n;
+            }
+            if (n != -1) {
+                slot_prev[(size_t) n] = p;
+            } else {
+                t = p;
+            }
+            c--;
+        }
+
+        int32_t hash_find(uint32_t kp1) const {
+            uint32_t i = hash(kp1) & mask;
+            for (;;) {
+                const uint32_t e = table[i];
+                if (e == EMPTY) {
+                    return -1;
+                }
+                if (e != TOMB && slot_key[e - 1] == kp1) {
+                    return (int32_t) (e - 1);
+                }
+                i = (i + 1) & mask;
+            }
+        }
+        void hash_put(uint32_t kp1, int32_t slot) {
+            uint32_t i = hash(kp1) & mask;
+            int32_t  tomb = -1;
+            for (;;) {
+                const uint32_t e = table[i];
+                if (e == EMPTY) {
+                    if (tomb >= 0) {
+                        table[(size_t) tomb] = (uint32_t) slot + 1;
+                        n_tomb--;
+                    } else {
+                        table[i] = (uint32_t) slot + 1;
+                    }
+                    return;
+                }
+                if (e == TOMB && tomb < 0) {
+                    tomb = (int32_t) i;
+                }
+                i = (i + 1) & mask;
+            }
+        }
+        void hash_erase(uint32_t kp1) {
+            uint32_t i = hash(kp1) & mask;
+            for (;;) {
+                const uint32_t e = table[i];
+                if (e == EMPTY) {
+                    return;
+                }
+                if (e != TOMB && slot_key[e - 1] == kp1) {
+                    table[i] = TOMB;
+                    n_tomb++;
+                    return;
+                }
+                i = (i + 1) & mask;
+            }
+        }
+        void rehash() {
+            std::fill(table.begin(), table.end(), EMPTY);
+            n_tomb = 0;
+            for (uint32_t s = 0; s < n_slots; ++s) {
+                if (slot_key[s] != 0) {
+                    hash_put(slot_key[s], (int32_t) s);
+                }
+            }
+        }
+
+        void trim() {
+            while (prot_count > prot_cap) {
+                const int32_t s = prot_tail;
+                ldel(prot_head, prot_tail, prot_count, s);
+                slot_seg[(size_t) s] = 0;
+                lpush(prob_head, prob_tail, prob_count, s);
+            }
+        }
+        void evict_one() {
+            int32_t s;
+            if (prob_tail != -1) {
+                s = prob_tail;
+                ldel(prob_head, prob_tail, prob_count, s);
+            } else {
+                s = prot_tail;
+                ldel(prot_head, prot_tail, prot_count, s);
+            }
+            if (slot_key[(size_t) s] != 0) {
+                hash_erase(slot_key[(size_t) s]);
+            }
+            slot_key[(size_t) s] = 0;
+            slot_seg[(size_t) s] = 0;
+            free_push(s);
+            n_evict++;
+        }
+
+        // copy the cached row into dst; false on miss
+        bool lookup(uint32_t key, uint8_t * dst) {
+            std::lock_guard<std::mutex> lock(mu);
+            const int32_t s = hash_find(key + 1);
+            if (s < 0) {
+                n_miss++;
+                return false;
+            }
+            if (slot_seg[(size_t) s] == 0) {
+                ldel(prob_head, prob_tail, prob_count, s);
+                slot_seg[(size_t) s] = 1;
+                lpush(prot_head, prot_tail, prot_count, s);
+                trim();
+            } else {
+                ldel(prot_head, prot_tail, prot_count, s);
+                lpush(prot_head, prot_tail, prot_count, s);
+            }
+            std::memcpy(dst, payload.data() + (size_t) s * row_size, row_size);
+            n_hits++;
+            return true;
+        }
+
+        void insert(uint32_t key, const uint8_t * src) {
+            std::lock_guard<std::mutex> lock(mu);
+            const uint32_t kp1   = key + 1;
+            const int32_t  found = hash_find(kp1);
+            if (found >= 0) {
+                std::memcpy(payload.data() + (size_t) found * row_size, src, row_size);
+                return; // a concurrent gather won the race: refresh in place
+            }
+            if (free_head < 0) {
+                evict_one();
+            }
+            const int32_t s = free_pop();
+            std::memcpy(payload.data() + (size_t) s * row_size, src, row_size);
+            slot_key[(size_t) s] = kp1;
+            slot_seg[(size_t) s] = 0;
+            lpush(prob_head, prob_tail, prob_count, s);
+            hash_put(kp1, s);
+            if ((size_t) n_tomb * 4 > table.size()) {
+                rehash();
+            }
+        }
+    };
+
+    mutable row_cache cache;
+
+    void print_stats() const {
+        if (cache_bytes == 0) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(cache.mu);
+        const uint64_t look = cache.n_hits + cache.n_miss;
+        LLAMA_LOG_INFO("[ple-cache] hit=%.1f%% (%" PRIu64 "/%" PRIu64 " rows)"
+                       " | slots=%u/%u live (%.1f MiB payload) | evictions=%" PRIu64 "\n",
+                       look ? 100.0 * cache.n_hits / look : 0.0, cache.n_hits, look,
+                       cache.live(), cache.n_slots, cache.payload_bytes() / (1024.0 * 1024.0), cache.n_evict);
+    }
 
     // fill dst with the n gathered rows, dequantized to F32:
     // dst[slot * head_dim, ...) = to_float(table[rows[slot]])
@@ -130,13 +388,42 @@ struct llama_model_qwen4exp::ple_direct_reader {
 
         std::sort(pairs.begin(), pairs.end()); // equal rows adjacent, file order
 
-        // decodes gather a handful of rows; threads are not worth it there
-        const int n_workers = (int) std::min<int64_t>(n_threads, std::max<int64_t>(1, n / 32));
+        // split into cache hits (filled here) and misses (read from disk below)
+        std::vector<std::pair<int32_t, int32_t>> misses;
+        if (cache_bytes > 0) {
+            misses.reserve(pairs.size());
+            std::vector<uint8_t> cached_row(row_size);
+            for (size_t i = 0; i < pairs.size(); ) {
+                size_t j = i;
+                while (j + 1 < pairs.size() && pairs[j + 1].first == pairs[i].first) {
+                    ++j;
+                }
+                if (cache.lookup((uint32_t) pairs[i].first, cached_row.data())) {
+                    for (size_t k = i; k <= j; ++k) {
+                        store_row(cached_row.data(), dst + (size_t) pairs[k].second * head_dim);
+                    }
+                } else {
+                    for (size_t k = i; k <= j; ++k) {
+                        misses.push_back(pairs[k]);
+                    }
+                }
+                i = j + 1;
+            }
+        }
 
-        // worker w reads rows pairs[n*w/n_workers, n*(w+1)/n_workers)
+        const std::vector<std::pair<int32_t, int32_t>> & todo = cache_bytes > 0 ? misses : pairs;
+        if (todo.empty()) {
+            return;
+        }
+
+        // decodes gather a handful of rows; threads are not worth it there
+        const int64_t m = (int64_t) todo.size();
+        const int n_workers = (int) std::min<int64_t>(n_threads, std::max<int64_t>(1, m / 32));
+
+        // worker w reads rows todo[m*w/n_workers, m*(w+1)/n_workers)
         auto run_chunk = [&](int w, std::exception_ptr & err) {
             try {
-                run_range(pairs, n * w / n_workers, n * (w + 1) / n_workers, dst);
+                run_range(todo, m * w / n_workers, m * (w + 1) / n_workers, dst, cache_bytes > 0);
             } catch (...) {
                 err = std::current_exception();
             }
@@ -172,8 +459,16 @@ struct llama_model_qwen4exp::ple_direct_reader {
     }
 
 private:
+    void store_row(const uint8_t * qrow, float * dst_row) const {
+        if (to_float) {
+            to_float(qrow, dst_row, head_dim);
+        } else {
+            std::memcpy(dst_row, qrow, (size_t) head_dim * sizeof(float));
+        }
+    }
+
     void run_range(const std::vector<std::pair<int32_t, int32_t>> & pairs,
-                   int64_t begin, int64_t end, float * dst) const {
+                   int64_t begin, int64_t end, float * dst, bool cache_fill) const {
 #ifdef _WIN32
         // the handle is FILE_FLAG_NO_BUFFERING (same flags as the disk-stage slab
         // reads), so every read must be sector-aligned in offset, length AND buffer.
@@ -271,6 +566,9 @@ private:
                     for (int64_t kk = f[r].run_beg + 1; kk <= f[r].run_end; ++kk) {
                         memcpy(dst + (size_t) pairs[kk].second * head_dim, first, (size_t) head_dim * sizeof(float));
                     }
+                    if (cache_fill) {
+                        cache.insert((uint32_t) pairs[f[r].run_beg].first, f[r].buf + f[r].head);
+                    }
                 }
 
                 i = k;
@@ -321,11 +619,20 @@ private:
             for (int64_t k = i + 1; k <= j; ++k) {
                 memcpy(dst + (size_t) pairs[k].second * head_dim, first, (size_t) head_dim * sizeof(float));
             }
+            if (cache_fill) {
+                cache.insert((uint32_t) pairs[i].first, bounce.data());
+            }
             i = j + 1;
         }
 #endif
     }
 };
+
+void llama_model_qwen4exp::print_extra_stats() const {
+    if (ple_reader) {
+        ple_reader->print_stats();
+    }
+}
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
@@ -539,6 +846,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                 // in-flight reads are IO queue depth, not compute; 2x cores worked
                 // well on NVMe and stays sane on smaller machines
                 const int n_threads = 2 * (int) std::max(1u, std::thread::hardware_concurrency());
+                const size_t ple_cache_bytes = (size_t) std::max(0, params.ple_cache_mib) * 1024 * 1024;
 
 #ifdef _WIN32
                 ple_reader = std::make_unique<ple_direct_reader>(direct_handle.handle, ple_w->offs,
@@ -546,7 +854,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                 ple_reader = std::make_unique<ple_direct_reader>(fd, ple_w->offs,
 #endif
                         ggml_row_size(per_layer_tok_embd->type, per_layer_tok_embd->ne[0]), ple_rows, n_threads,
-                        per_layer_tok_embd->type, hparams.ple_head_dim);
+                        per_layer_tok_embd->type, hparams.ple_head_dim, ple_cache_bytes);
 
                 LLAMA_LOG_INFO("%s: PLE direct read enabled: %" PRId64 " rows of %zu bytes at file offset %zu, %d threads\n",
                         __func__, ple_rows, ple_reader->row_size, ple_w->offs, n_threads);

@@ -1690,6 +1690,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             if (moe_cache && moe_cache->is_active()) {
                 moe_cache->print_stats();
             }
+            model.print_extra_stats();
         }
     }
 

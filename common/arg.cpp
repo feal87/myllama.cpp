@@ -2763,6 +2763,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_LAZY_MODE"));
     add_opt(common_arg(
+        {"--ple-cache-mib"}, "N",
+        string_format(
+            "RAM budget, in MiB, for the lazy PLE row cache used by --lazy-mode on-direct\n"
+            "(default: %d, 0 disables it). The cache holds the most recently used PLE\n"
+            "table rows (quantized), so repeated n-grams are served from RAM instead of\n"
+            "read from disk. A few tens of MiB capture the working set of a typical\n"
+            "session",
+            params.ple_cache_mib
+        ),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --ple-cache-mib must be >= 0");
+            }
+            params.ple_cache_mib = value;
+        }
+    ).set_env("LLAMA_ARG_PLE_CACHE_MIB"));
+    add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"
