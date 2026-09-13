@@ -1274,6 +1274,13 @@ void llama_hot_expert_cache::vram_stats(int il, uint64_t & n_hit, uint64_t & n_m
     n_miss = it->second.n_vram_miss;
 }
 
+void llama_hot_expert_cache::route_stats(uint64_t & n_hit, uint64_t & n_miss) const {
+    std::lock_guard<std::mutex> lock(mu);
+
+    n_hit  = n_route_hit;
+    n_miss = n_route_miss;
+}
+
 uint64_t llama_hot_expert_cache::content_tokens() const {
     std::lock_guard<std::mutex> lock(mu);
     return n_content_tokens;

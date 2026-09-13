@@ -195,6 +195,11 @@ class llama_hot_expert_cache {
     // VRAM tier is active; read by its stats report (both are 0 while inactive).
     void vram_stats(int il, uint64_t & n_hit, uint64_t & n_miss) const;
 
+    // decode-time host-path routed counters: every observed route the VRAM tier
+    // did not serve. The VRAM tier's true denominator is its own hits plus these,
+    // so routes seen before the tier activated still count as misses
+    void route_stats(uint64_t & n_hit, uint64_t & n_miss) const;
+
     // an expert just became VRAM-resident: drop its RAM mlock (the VRAM copy
     // serves it; the mlock would only waste a RAM slot for a deeper expert)
     void vram_takeover(int il, int32_t expert_id);

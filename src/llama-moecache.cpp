@@ -1237,7 +1237,6 @@ void llama_moe_cache::print_stats() {
 
     std::vector<layer_report> report;
     uint64_t n_hit_total = 0;
-    uint64_t n_miss_total = 0;
     size_t   n_slots_total = 0;
     size_t   n_res_total   = 0;
     size_t   n_new         = 0;  // residents that arrived since the previous report
@@ -1284,10 +1283,16 @@ void llama_moe_cache::print_stats() {
     for (auto & r : report) {
         p->hot->vram_stats(r.il, r.n_hit, r.n_miss);
         n_hit_total  += r.n_hit;
-        n_miss_total += r.n_miss;
     }
 
-    const uint64_t t_total = n_hit_total + n_miss_total;
+    // the true denominator is every observed route: the per-layer VRAM misses
+    // miss the routes seen before the tier activated (warm-up), while the host
+    // path counters cover them. This keeps VRAM total - hits == RAM routed
+    uint64_t route_hit  = 0;
+    uint64_t route_miss = 0;
+    p->hot->route_stats(route_hit, route_miss);
+
+    const uint64_t t_total = n_hit_total + route_hit + route_miss;
     LLAMA_LOG_INFO("[moe-cache] VRAM tier: resident=%zu/%zu slots (%zu layer(s), queue cap=%d)"
                    " | hit=%.1f%% (%" PRIu64 "/%" PRIu64 " routed)"
                    " | churn=%.1f%% (%zu/%zu changed since last report)"
