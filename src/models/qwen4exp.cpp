@@ -157,6 +157,12 @@ struct llama_model_qwen4exp::ple_direct_reader {
         uint64_t n_hits  = 0;
         uint64_t n_miss  = 0;
         uint64_t n_evict = 0;
+
+        // snapshot at the previous stats report, for the delta line
+        uint64_t prev_hits  = 0;
+        uint64_t prev_miss  = 0;
+        uint64_t prev_evict = 0;
+
         mutable std::mutex mu;
 
         static uint32_t hash(uint32_t k) {
@@ -368,11 +374,21 @@ struct llama_model_qwen4exp::ple_direct_reader {
             return;
         }
         std::lock_guard<std::mutex> lock(cache.mu);
-        const uint64_t look = cache.n_hits + cache.n_miss;
+        const uint64_t look   = cache.n_hits + cache.n_miss;
+        const uint64_t d_hit  = cache.n_hits - cache.prev_hits;
+        const uint64_t d_look = d_hit + (cache.n_miss - cache.prev_miss);
+        const uint64_t d_evict = cache.n_evict - cache.prev_evict;
+
         LLAMA_LOG_INFO("[ple-cache] hit=%.1f%% (%" PRIu64 "/%" PRIu64 " rows)"
                        " | slots=%u/%u live (%.1f MiB payload) | evictions=%" PRIu64 "\n",
                        look ? 100.0 * cache.n_hits / look : 0.0, cache.n_hits, look,
                        cache.live(), cache.n_slots, cache.payload_bytes() / (1024.0 * 1024.0), cache.n_evict);
+        LLAMA_LOG_INFO("[ple-cache] delta hit=%.1f%% (%" PRIu64 "/%" PRIu64 " rows) | evictions=%" PRIu64 "\n",
+                       d_look ? 100.0 * (double) d_hit / (double) d_look : 0.0, d_hit, d_look, d_evict);
+
+        cache.prev_hits  = cache.n_hits;
+        cache.prev_miss  = cache.n_miss;
+        cache.prev_evict = cache.n_evict;
     }
 
     // fill dst with the n gathered rows, dequantized to F32:
