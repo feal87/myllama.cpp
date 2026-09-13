@@ -1219,18 +1219,6 @@ public:
     const bool blk_bias;
 };
 
-// --qsa on can turn the indexer on for a layer whose block metadata is missing from the
-// model. there is no block size to pool with then, so fall back to one cell per block.
-static int64_t qwen4exp_qsa_ratio(const llama_hparams & hparams, enum llama_qsa_mode mode, int il) {
-    const int64_t r = hparams.dsv4_compress_ratios[il];
-
-    if (r > 0 || mode != LLAMA_QSA_MODE_ON) {
-        return r;
-    }
-
-    return 1;
-}
-
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         const llama_memory_hybrid_idx_context * mctx_hyb,
         ggml_tensor *                           cur,
@@ -1243,7 +1231,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     const int64_t idx_dim  = hparams.indexer_head_size;
     const int64_t n_idx_h  = hparams.indexer_n_head;
-    const int64_t r        = qwen4exp_qsa_ratio(hparams, model.get_qsa_mode(), il);
+    const int64_t r        = hparams.dsv4_compress_ratios[il];
     const int64_t n_kv     = mctx_idx->get_n_kv();
 
     GGML_ASSERT(r > 0);
@@ -1464,10 +1452,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         // top_k [n_topk, 1, 1, ns] -> the index layout ggml_get_rows expects: [n_topk, 1, ns, 1]
         ggml_tensor * idx = ggml_reshape_4d(ctx0, top_k, n_topk, 1, ns, 1);
 
-        // gather straight to F16: flash attention wants F16, so this avoids the F32
-        // round trip that build_attn_mha would otherwise insert as a separate cast
-        ggml_tensor * k_g = ggml_get_rows_f16(ctx0, k_cells, idx); // F16 [hd_k*n_h_kv, n_topk, 1, ns]
-        ggml_tensor * v_g = ggml_get_rows_f16(ctx0, v_cells, idx); // F16 [hd_v*n_h_kv, n_topk, 1, ns]
+        // get_rows dequantizes the cells to F32; build_attn_mha casts to F16 for flash attention
+        ggml_tensor * k_g = ggml_get_rows(ctx0, k_cells, idx); // F32 [hd_k*n_h_kv, n_topk, 1, ns]
+        ggml_tensor * v_g = ggml_get_rows(ctx0, v_cells, idx); // F32 [hd_v*n_h_kv, n_topk, 1, ns]
 
         k_g = ggml_reshape_4d(ctx0, k_g, hd_k, n_h_kv, n_topk, ns);
         v_g = ggml_reshape_4d(ctx0, v_g, hd_v, n_h_kv, n_topk, ns);
@@ -1553,14 +1540,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
-    const int64_t n_stream = mctx_hyb->get_n_stream();
-
-    // indexer reads the same block input as q/k/v; no cache or no ratio means dense.
-    // QSA is decode-only: a multi-token ubatch keeps the dense path, so the prefill
-    // graph does not carry the O(n_kv * n_ubatch) top-k layout. n_tokens == n_stream
-    // means one token per stream.
-    const bool qsa = mctx_hyb->get_idx() != nullptr && model.get_qsa_mode() != LLAMA_QSA_MODE_OFF &&
-                     qwen4exp_qsa_ratio(hparams, model.get_qsa_mode(), il) > 0 && n_tokens == n_stream;
+    // indexer reads the same block input as q/k/v; no cache or no ratio means dense
+    const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
 
     // gather-based QSA decode: worth it once the cache is meaningfully deeper than the
     // top-k width; below that the masked path costs about the same. QWEN4EXP_QSA_GATHER=0
@@ -1572,20 +1553,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
     bool gather = false;
     if (qsa && gather_enabled) {
-        const int64_t r     = qwen4exp_qsa_ratio(hparams, model.get_qsa_mode(), il);
+        const int64_t r     = hparams.dsv4_compress_ratios[il];
         const int64_t n_kv  = mctx_hyb->get_idx()->get_n_kv();
         const int64_t width = GGML_PAD((int64_t) hparams.indexer_top_k + r - 1, 256);
 
-        // the masked path pays for the full n_kv mask, the gather path pays to copy the
-        // top-k cells out, so the crossover sits near the top-k width rather than far
-        // past it: measured ~4.5k cells on sm_89, gather loses ~0.5 ms below 3k.
+        const int64_t n_stream = mctx_hyb->get_n_stream();
+
+        // the masked path only gets more expensive than the gather overhead once n_kv is well
+        // past the top-k width; the crossover measured on sm_89 is ~20k cells, and below it
+        // gather loses up to 10%. gate at 9*width instead of 2*width.
         // QWEN4EXP_QSA_GATHER_MIN overrides the threshold in cells (0 = default).
         static const int64_t gather_min = [] {
             const char * e = getenv("QWEN4EXP_QSA_GATHER_MIN");
             return e == nullptr ? int64_t(0) : (int64_t) atoll(e);
         }();
 
-        const int64_t min_kv = gather_min > 0 ? gather_min : 2*width;
+        const int64_t min_kv = gather_min > 0 ? gather_min : 9*width;
         gather = n_tokens == n_stream && n_kv >= min_kv;
     }
 
@@ -1642,7 +1625,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
     if (top_k) {
-        ggml_tensor * qsa_bias = gather ? qsa_inps.at((uint32_t) qwen4exp_qsa_ratio(hparams, model.get_qsa_mode(), il))->bias : nullptr;
+        ggml_tensor * qsa_bias = gather ? qsa_inps.at((uint32_t) hparams.dsv4_compress_ratios[il])->bias : nullptr;
 
         cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, top_k, qsa_bias, kq_scale, il, gather);
     } else {

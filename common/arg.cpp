@@ -2780,23 +2780,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PLE_CACHE_MIB"));
     add_opt(common_arg(
-        {"--qsa"}, "MODE",
-        "sparse (QSA) attention, for architectures that support it (default: auto)\n"
-        "- auto: use the sparse-attention metadata stored in the model\n"
-        "- off: force dense attention everywhere\n"
-        "- on: force sparse attention on every layer that has an indexer; a layer whose\n"
-        "  block metadata is missing falls back to one cell per block\n"
-        "sparse attention keeps the top-k blocks per token, so it is far cheaper than\n"
-        "dense attention at long context. the selection is discrete though, so a near-tie\n"
-        "can flip it and greedy output varies between runs",
-        [](common_params & params, const std::string & value) {
-            /**/ if (value == "auto") { params.qsa_mode = LLAMA_QSA_MODE_AUTO; }
-            else if (value == "on")   { params.qsa_mode = LLAMA_QSA_MODE_ON;   }
-            else if (value == "off")  { params.qsa_mode = LLAMA_QSA_MODE_OFF;  }
-            else { throw std::invalid_argument("invalid value"); }
-        }
-    ).set_env("LLAMA_ARG_QSA"));
-    add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"

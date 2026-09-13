@@ -5142,74 +5142,11 @@ static void ggml_compute_forward_get_rows_f32(
     }
 }
 
-// rows written as F16: the source row goes through a float row instead of being
-// stored as F32. needed because ggml_get_rows_f16 types the destination F16.
-static void ggml_compute_forward_get_rows_to_f16(
-        const ggml_compute_params * params,
-              ggml_tensor * dst) {
-
-    const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
-
-    GGML_TENSOR_BINARY_OP_LOCALS
-
-    const int64_t nc = ne00;
-    const int64_t nr = ggml_nelements(src1);
-
-    ggml_to_float_t const to_float = ggml_get_type_traits(src0->type)->to_float;
-
-    assert(ne0  == nc);
-    assert(ne02 == ne11);
-    assert(nb00 == ggml_type_size(src0->type));
-    assert(ggml_nrows(dst) == nr);
-
-    const int ith = params->ith;
-    const int nth = params->nth;
-
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
-
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
-
-    float * row = (float *) malloc(nc * sizeof(float));
-    GGML_ASSERT(row != NULL);
-
-    for (int64_t i = ir0; i < ir1; ++i) {
-        const int64_t i12 = i/(ne11*ne10);
-        const int64_t i11 = (i - i12*ne11*ne10)/ne10;
-        const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
-        const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
-
-        GGML_ASSERT(i01 >= 0 && i01 < ne01);
-
-        const char * src     = (const char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03;
-        char       * dst_row = (char *)       dst->data  + i10*nb1  + i11*nb2  + i12*nb3;
-
-        // F32 and I32 have no to_float, they already hold floats
-        if (to_float != NULL) {
-            to_float(src, row, nc);
-        } else {
-            memcpy(row, src, nc*sizeof(float));
-        }
-
-        ggml_fp32_to_fp16_row(row, (ggml_fp16_t *) dst_row, nc);
-    }
-
-    free(row);
-}
-
 void ggml_compute_forward_get_rows(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
-
-    if (dst->type == GGML_TYPE_F16) {
-        ggml_compute_forward_get_rows_to_f16(params, dst);
-        return;
-    }
 
     switch (src0->type) {
         case GGML_TYPE_Q1_0:
