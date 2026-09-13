@@ -805,13 +805,17 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
             }
         }
 
-        if (n_qsa > 0) {
+        if (n_qsa == 0) {
+            LLAMA_LOG_INFO("%s: sparse attention (QSA) inactive, all %u dense-attention layers run full attention\n",
+                    __func__, n_full);
+        } else if (!llama_qsa_allowed()) {
+            LLAMA_LOG_INFO("%s: sparse attention (QSA) available on %u of %u dense-attention layers but disabled, "
+                           "running full attention (set LLAMA_QSA_ALLOW=1 to enable)\n",
+                    __func__, n_qsa, n_full);
+        } else {
             LLAMA_LOG_WARN("%s: sparse attention (QSA) ACTIVE on %u of %u dense-attention layers, "
                            "long-range context is limited to the indexer budget\n",
                     __func__, n_qsa, n_full);
-        } else {
-            LLAMA_LOG_INFO("%s: sparse attention (QSA) inactive, all %u dense-attention layers run full attention\n",
-                    __func__, n_full);
         }
     }
 
@@ -1570,8 +1574,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
-    // indexer reads the same block input as q/k/v; no cache or no ratio means dense
-    const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
+    // indexer reads the same block input as q/k/v; no opt-in, no cache or no ratio means dense
+    const bool qsa = llama_qsa_allowed() && mctx_hyb->get_idx() != nullptr &&
+                     hparams.dsv4_compress_ratios[il] > 0;
 
     // gather-based QSA decode: worth it once the cache is meaningfully deeper than the
     // top-k width; below that the masked path costs about the same. QWEN4EXP_QSA_GATHER=0

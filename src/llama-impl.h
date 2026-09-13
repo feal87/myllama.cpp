@@ -2,6 +2,7 @@
 
 #include "ggml.h" // for ggml_log_level
 
+#include <cstdlib>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -40,6 +41,18 @@ struct no_init {
     T value;
     no_init() = default;
 };
+
+// sparse attention is opt-in: a model can carry the indexer metadata and still be served better
+// by full attention, because the indexer keeps only a small budget of cells per token and drops
+// long-range detail. the metadata alone must never switch it on
+static inline bool llama_qsa_allowed() {
+    static const bool allowed = [] {
+        const char * e = getenv("LLAMA_QSA_ALLOW");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+
+    return allowed;
+}
 
 template <typename dst_t, typename src_t>
 static inline dst_t llama_cast(src_t v) {
