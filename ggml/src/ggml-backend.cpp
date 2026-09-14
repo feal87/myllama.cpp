@@ -829,8 +829,6 @@ struct ggml_backend_sched {
     ggml_backend_sched_node_prepare_callback callback_node_prepare;
     void * callback_node_prepare_user_data;
 
-    struct ggml_backend_sched_stats stats;
-
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -1655,16 +1653,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
-    sched->stats = {};
-    sched->stats.n_splits = sched->n_splits;
-
-    auto stat_sync = [&](ggml_backend_t backend) {
-        const int64_t t0 = ggml_time_us();
-        ggml_backend_synchronize(backend);
-        sched->stats.t_sync_us += ggml_time_us() - t0;
-        sched->stats.n_syncs++;
-    };
-
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -1676,7 +1664,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
-                stat_sync(sched->backends[prev_backend_id]);
+                ggml_backend_synchronize(sched->backends[prev_backend_id]);
             }
         }
 
@@ -1686,14 +1674,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
-            sched->stats.n_copies++;
-
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
-                    stat_sync(split_backend);
+                    ggml_backend_synchronize(split_backend);
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
@@ -1701,7 +1687,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
-                    stat_sync(split_backend);
+                    ggml_backend_synchronize(split_backend);
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -1716,7 +1702,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
 
-                    stat_sync(input_backend);
+                    ggml_backend_synchronize(input_backend);
 
                     // get the ids
                     ggml_tensor * ids_tensor = node->src[2];
@@ -1739,7 +1725,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (ids_tensor != prev_ids_tensor) {
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
-                        stat_sync(ids_backend);
+                        ggml_backend_synchronize(ids_backend);
 
                         // find the used experts
                         used_ids.clear();
@@ -1797,11 +1783,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-                        stat_sync(input_backend);
+                        ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         } else {
-                            stat_sync(split_backend);
+                            ggml_backend_synchronize(split_backend);
                         }
                         ggml_backend_tensor_copy(input, input_cpy);
                     }
@@ -1812,18 +1798,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // host-side preparation of the nodes, after their inputs were copied to the
         // split backend: used to stage MoE experts for host-resident weights
         if (sched->callback_node_prepare) {
-            const int64_t t_prep0 = ggml_time_us();
             for (int j = 0; j < split->graph.n_nodes; j++) {
                 sched->callback_node_prepare(split->graph.nodes[j], sched->callback_node_prepare_user_data);
             }
-            sched->stats.t_cb_prepare_us += ggml_time_us() - t_prep0;
         }
 
         if (!sched->callback_eval) {
-            const int64_t t0 = ggml_time_us();
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
-            sched->stats.n_chunks++;
-            sched->stats.t_compute_us += ggml_time_us() - t0;
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -1833,40 +1814,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 struct ggml_tensor * t = split->graph.nodes[j0];
 
                 // check if the user needs data from this node
-                const int64_t t_ask0 = ggml_time_us();
                 bool need = sched->callback_eval(t, true, sched->callback_eval_user_data);
-                sched->stats.t_cb_ask_us += ggml_time_us() - t_ask0;
 
                 int j1 = j0;
 
                 // determine the range [j0, j1] of nodes that can be computed together
                 while (!need && j1 < split->graph.n_nodes - 1) {
                     t = split->graph.nodes[++j1];
-                    const int64_t t_ask = ggml_time_us();
                     need = sched->callback_eval(t, true, sched->callback_eval_user_data);
-                    sched->stats.t_cb_ask_us += ggml_time_us() - t_ask;
                 }
 
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
 
-                const int64_t t0 = ggml_time_us();
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
-                sched->stats.n_chunks++;
-                sched->stats.t_compute_us += ggml_time_us() - t0;
                 if (ec != GGML_STATUS_SUCCESS) {
                     return ec;
                 }
 
                 // TODO: pass backend to the callback, then the user can decide if they want to synchronize
-                stat_sync(split_backend);
+                ggml_backend_synchronize(split_backend);
 
-                if (need) {
-                    const int64_t t_obs = ggml_time_us();
-                    const bool keep = sched->callback_eval(t, false, sched->callback_eval_user_data);
-                    sched->stats.t_cb_observe_us += ggml_time_us() - t_obs;
-                    if (!keep) {
-                        break;
-                    }
+                if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
+                    break;
                 }
 
                 j0 = j1;
@@ -2104,12 +2073,6 @@ void ggml_backend_sched_set_node_prepare_callback(ggml_backend_sched_t sched, gg
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_splits;
-}
-
-void ggml_backend_sched_get_stats(ggml_backend_sched_t sched, struct ggml_backend_sched_stats * stats) {
-    GGML_ASSERT(sched);
-    GGML_ASSERT(stats);
-    *stats = sched->stats;
 }
 
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {

@@ -1675,13 +1675,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         hot_experts->observe_decode_finish();
     }
 
-    // decode graph scheduling counters, for the eval-callback overhead report
-    if (disk_stage && ubatch.n_tokens == 1) {
-        struct ggml_backend_sched_stats sstats;
-        ggml_backend_sched_get_stats(sched.get(), &sstats);
-        disk_stage->note_graph_stats(sstats);
-    }
-
     // graph boundary: publish the completed MoE expert-cache uploads and schedule
     // new ones (evictions + table updates are only safe between graph executions).
     // Runs on single-token decode ubatches only: the VRAM tier serves decode

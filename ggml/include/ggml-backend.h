@@ -341,23 +341,6 @@ extern "C" {
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
 
-    // Timing and call counts of the last ggml_backend_sched_graph_compute_async()
-    // call. n_chunks counts backend graph compute calls (== n_splits when no eval
-    // callback is set, more when the callback splits a split); the callbacks and
-    // the synchronize calls are timed separately. For profiling only.
-    struct ggml_backend_sched_stats {
-        int64_t n_splits;
-        int64_t n_chunks;
-        int64_t n_copies;
-        int64_t n_syncs;
-        int64_t t_compute_us;
-        int64_t t_sync_us;
-        int64_t t_cb_ask_us;
-        int64_t t_cb_observe_us;
-        int64_t t_cb_prepare_us;
-    };
-    GGML_API void                 ggml_backend_sched_get_stats(ggml_backend_sched_t sched, struct ggml_backend_sched_stats * stats);
-
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
 

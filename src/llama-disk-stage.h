@@ -146,10 +146,6 @@ public:
     // --experts-stats-interval report.
     void print_stats();
 
-    // accumulate the scheduler call counts/timings of one decode graph, reported
-    // per interval by print_stats(). For profiling the eval-callback overhead
-    void note_graph_stats(const struct ggml_backend_sched_stats & stats);
-
     // true when decode is served by the internal scheduler hook instead of the
     // mid-graph eval callback (the decode cache maps each layer's expert ids)
     bool internal_decode_fill() const;

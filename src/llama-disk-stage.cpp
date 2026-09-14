@@ -267,9 +267,17 @@ struct llama_disk_stage::impl {
     uint64_t n_l2_promo_bytes = 0; // resident fills served from the L2 instead of the disk
     bool     l2_warm          = false; // latched when every resident pool is full
 
-    // accumulated decode graph scheduling stats, for the eval-overhead report
-    struct ggml_backend_sched_stats gr_sum    = {};
-    uint64_t                        gr_graphs = 0;
+    // fill_cache() scratch: the decode fill runs once per layer per token on the
+    // compute thread, so reuse these instead of reallocating per call
+    struct pool_copy {
+        const char * src;
+        char *       dst;
+        size_t       len;
+    };
+    std::vector<disk_stage_job>          fs_jobs;
+    std::vector<int32_t>                 fs_newly_filled;
+    std::vector<pool_copy>               fs_copies;
+    std::vector<std::pair<int, int64_t>> fs_l2_consume;
 
     // previous stats report, for the per-interval delta line
     uint64_t prev_l2_hits        = 0;
@@ -547,45 +555,20 @@ void llama_disk_stage::node_prepare_callback(struct ggml_tensor * node, void * u
         return;
     }
 
-    // ids are a view into the argsort workspace: read row by row (n_tokens == 1)
-    std::vector<int32_t> ids((size_t) n_used);
-    std::memcpy(ids.data(), t->data, (size_t) n_used * sizeof(int32_t));
+    // ne[1] == 1, so the routed ids are one contiguous I32 row: read it in place
+    if (t->data == nullptr || t->nb[0] != sizeof(int32_t)) {
+        return;
+    }
 
-    self->fill_cache(it->second, ids.data(), n_used);
+    self->fill_cache(it->second, (const int32_t *) t->data, n_used);
 #else
     GGML_UNUSED(node);
     GGML_UNUSED(user_data);
 #endif
 }
 
-void llama_disk_stage::note_graph_stats(const struct ggml_backend_sched_stats & stats) {
-    impl & p = *pimpl;
-    p.gr_sum.n_splits        += stats.n_splits;
-    p.gr_sum.n_chunks        += stats.n_chunks;
-    p.gr_sum.n_copies        += stats.n_copies;
-    p.gr_sum.n_syncs         += stats.n_syncs;
-    p.gr_sum.t_compute_us    += stats.t_compute_us;
-    p.gr_sum.t_sync_us       += stats.t_sync_us;
-    p.gr_sum.t_cb_ask_us     += stats.t_cb_ask_us;
-    p.gr_sum.t_cb_observe_us += stats.t_cb_observe_us;
-    p.gr_sum.t_cb_prepare_us += stats.t_cb_prepare_us;
-    p.gr_graphs++;
-}
-
 void llama_disk_stage::print_stats() {
     impl & p = *pimpl;
-
-    if (p.gr_graphs > 0) {
-        const double n = (double) p.gr_graphs;
-        LLAMA_LOG_INFO("[disk-stage] decode sched: per graph %.1f splits | %.1f backend computes | %.1f input copies | %.1f syncs |"
-                       " compute %.3f ms | sync %.3f ms | cb ask %.3f ms | cb fill %.3f ms | prep %.3f ms (%" PRIu64 " graphs)\n",
-                       p.gr_sum.n_splits / n, p.gr_sum.n_chunks / n, p.gr_sum.n_copies / n, p.gr_sum.n_syncs / n,
-                       p.gr_sum.t_compute_us / n / 1000.0, p.gr_sum.t_sync_us / n / 1000.0,
-                       p.gr_sum.t_cb_ask_us / n / 1000.0, p.gr_sum.t_cb_observe_us / n / 1000.0,
-                       p.gr_sum.t_cb_prepare_us / n / 1000.0, p.gr_graphs);
-        p.gr_sum    = {};
-        p.gr_graphs = 0;
-    }
 
     if (p.evict_pools.empty()) {
         return;
@@ -1620,17 +1603,28 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
     }
     impl::cache_pool & pool = p.pools[c.pool];
 
-    struct pool_copy {
-        const char * src;
-        char *       dst;
-        size_t       len;
-    };
-
     int32_t * table = (int32_t *) c.table->data;
-    std::vector<disk_stage_job> jobs;
-    std::vector<int32_t>    newly_filled; // residents whose slot was just read
-    std::vector<pool_copy>  copies;       // L2 pool rows to copy into a transient or resident slot
-    std::vector<std::pair<int, int64_t>> l2_consume; // L2 entries consumed by a resident fill
+
+    std::vector<disk_stage_job> & jobs            = p.fs_jobs;
+    std::vector<int32_t>        & newly_filled    = p.fs_newly_filled;
+    std::vector<impl::pool_copy>& copies          = p.fs_copies;
+    std::vector<std::pair<int, int64_t>> & l2_consume = p.fs_l2_consume;
+    jobs.clear();
+    newly_filled.clear();
+    copies.clear();
+    l2_consume.clear();
+
+    const std::vector<impl::region> & regions = p.layer_regions[il];
+    const int epid = p.evict_pool_for(il);
+
+    // per-expert aligned read length per role (region.read_len is the whole-slab
+    // length, one expert is shorter)
+    size_t expert_read_len[3] = { 0, 0, 0 };
+    for (int r = 0; r < 3; ++r) {
+        if (regions[r].file != nullptr && regions[r].stride != 0) {
+            expert_read_len[r] = align_up(regions[r].head + regions[r].stride, disk_stage_align);
+        }
+    }
 
     // this layer's own transient window inside the pool: [0, res_base) is split
     // into one n_trans-wide window per layer
@@ -1664,13 +1658,12 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
                 if (c.resident_filled[id] == 0) {
                     // a promoted expert may still sit in the L2 pool from its
                     // first route: copy it in instead of reading the disk again
-                    const int epid = p.evict_pool_for(il);
                     const int64_t key = ((int64_t) il << 32) | (uint32_t) id;
                     const int32_t eslot = epid >= 0 ? p.evict_touch(epid, key) : -1;
                     if (eslot >= 0) {
                         impl::evict_pool & ep = p.evict_pools[(size_t) epid];
                         for (int r = 0; r < 3; ++r) {
-                            const size_t len = p.layer_regions[il][r].stride;
+                            const size_t len = regions[r].stride;
                             if (len == 0) {
                                 continue;
                             }
@@ -1682,12 +1675,12 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
                         l2_consume.emplace_back(epid, key);
                     } else {
                         for (int r = 0; r < 3; ++r) {
-                            const impl::region & sr = p.layer_regions[il][r];
+                            const impl::region & sr = regions[r];
                             if (sr.file == nullptr || sr.stride == 0) {
                                 continue;
                             }
                             char * dst = pool.data[r] + (size_t) slot * pool.slot_stride[r] - sr.head;
-                            jobs.push_back({ sr.file->h, dst, sr.file_off + (size_t) id * sr.stride, align_up(sr.head + sr.stride, disk_stage_align) });
+                            jobs.push_back({ sr.file->h, dst, sr.file_off + (size_t) id * sr.stride, expert_read_len[r] });
                         }
                     }
                     newly_filled.push_back(id);
@@ -1704,7 +1697,6 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
             }
             const int32_t use = transient++;
 
-            const int epid = p.evict_pool_for(il);
             if (epid >= 0) {
                 impl::evict_pool & ep = p.evict_pools[(size_t) epid];
                 const int64_t      key = ((int64_t) il << 32) | (uint32_t) id;
@@ -1723,13 +1715,13 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
                         p.n_l2_cold++;
                     }
                     for (int r = 0; r < 3; ++r) {
-                        const impl::region & sr = p.layer_regions[il][r];
+                        const impl::region & sr = regions[r];
                         if (sr.file == nullptr || sr.stride == 0) {
                             continue;
                         }
                         char * dst = ep.data[r] + (size_t) eslot * ep.stride[r] - sr.head;
                         jobs.push_back({ sr.file->h, dst, sr.file_off + (size_t) id * sr.stride,
-                                         align_up(sr.head + sr.stride, disk_stage_align) });
+                                         expert_read_len[r] });
                     }
                 } else {
                     if (l2_warm) {
@@ -1739,13 +1731,13 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
                         p.n_l2_cold++;
                     }
                     for (int r = 0; r < 3; ++r) {
-                        p.n_l2_hit_bytes += p.layer_regions[il][r].stride;
+                        p.n_l2_hit_bytes += regions[r].stride;
                     }
                 }
 
                 // the graph reads the transient slot: copy the pool rows there
                 for (int r = 0; r < 3; ++r) {
-                    const size_t len = p.layer_regions[il][r].stride;
+                    const size_t len = regions[r].stride;
                     if (len == 0) {
                         continue;
                     }
@@ -1762,12 +1754,12 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
             // sector size the unbuffered read requires (the extra bytes fall in
             // the per-tensor slack)
             for (int r = 0; r < 3; ++r) {
-                const impl::region & sr = p.layer_regions[il][r];
+                const impl::region & sr = regions[r];
                 if (sr.file == nullptr || sr.stride == 0) {
                     continue;
                 }
                 char * dst = pool.data[r] + (size_t) use * pool.slot_stride[r] - sr.head;
-                jobs.push_back({ sr.file->h, dst, sr.file_off + (size_t) id * sr.stride, align_up(sr.head + sr.stride, disk_stage_align) });
+                jobs.push_back({ sr.file->h, dst, sr.file_off + (size_t) id * sr.stride, expert_read_len[r] });
             }
             table[id] = use;
         }
@@ -1780,22 +1772,18 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
 
     // pool rows are copied after the reads above, so a miss always copies the
     // bytes the read just landed in its pool slot
-    for (const pool_copy & cp : copies) {
+    for (const impl::pool_copy & cp : copies) {
         std::memcpy(cp.dst, cp.src, cp.len);
     }
 
     // resident fills that consumed an L2 entry: drop the now-redundant copy so
     // it does not hold a slot. The entry was touched to the MRU above, so it is
     // still present (evict_remove is a no-op otherwise)
-    if (!l2_consume.empty()) {
+    if (!l2_consume.empty() || !newly_filled.empty()) {
         std::lock_guard<std::mutex> lock(p.cache_mu);
-        for (const auto & [epid, key] : l2_consume) {
-            p.evict_remove(epid, key);
+        for (const auto & [e, key] : l2_consume) {
+            p.evict_remove(e, key);
         }
-    }
-
-    if (!newly_filled.empty()) {
-        std::lock_guard<std::mutex> lock(p.cache_mu);
         for (const int32_t id : newly_filled) {
             c.resident_filled[id] = 1;
         }
