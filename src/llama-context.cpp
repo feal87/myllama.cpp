@@ -1621,13 +1621,32 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     // The mid-graph eval callback serves two readers: the multi-token
-    // (batch/prefill) prefetch read-ahead, and any ubatch that has to fill the
-    // disk staging or the disk decode cache before its MoE chunk runs. Without
-    // the latter a single-token ubatch would read the experts from the unmapped
-    // model file. Applied every ubatch (also on graph reuse).
+    // (batch/prefill) prefetch read-ahead, and the disk staging fill on
+    // batch/prefill ubatches. Single-token decode is served by the internal
+    // node-prepare hook instead: the expert fill runs at the CPU get_rows that
+    // remaps the ids, so the graph is not chunked at every layer. Applied every
+    // ubatch (also on graph reuse).
+    //
+    // LLAMA_DISK_STAGE_OLD_DECODE_CB=1 forces the old mid-graph decode callback
+    // (A/B, same output)
+    static const bool force_old_cb = [] {
+        const char * v = std::getenv("LLAMA_DISK_STAGE_OLD_DECODE_CB");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+
+    const bool disk_internal = disk_stage != nullptr && !force_old_cb;
+    if (disk_internal) {
+        ggml_backend_sched_set_node_prepare_callback(sched.get(),
+                llama_disk_stage::node_prepare_callback, disk_stage.get());
+    } else {
+        ggml_backend_sched_set_node_prepare_callback(sched.get(), nullptr, nullptr);
+    }
+
     if (hot_experts) {
-        const bool need_eval_cb = (ubatch.n_tokens > 1 && cparams.hot_experts_prefetch) ||
-                                  disk_stage != nullptr;
+        const bool decode_internal = ubatch.n_tokens == 1 && disk_internal &&
+                                     disk_stage->internal_decode_fill();
+        const bool need_eval_cb = (ubatch.n_tokens > 1 && (cparams.hot_experts_prefetch || disk_stage != nullptr)) ||
+                                  (ubatch.n_tokens == 1 && disk_stage != nullptr && !decode_internal);
         ggml_backend_sched_set_eval_callback(sched.get(),
                 need_eval_cb ? llama_hot_expert_cache::eval_callback : nullptr,
                 need_eval_cb ? hot_experts.get() : nullptr);
@@ -1654,6 +1673,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         hot_experts->observe_decode_begin(hot_topk_tensors, sched.get());
         ggml_backend_sched_synchronize(sched.get());
         hot_experts->observe_decode_finish();
+    }
+
+    // decode graph scheduling counters, for the eval-callback overhead report
+    if (disk_stage && ubatch.n_tokens == 1) {
+        struct ggml_backend_sched_stats sstats;
+        ggml_backend_sched_get_stats(sched.get(), &sstats);
+        disk_stage->note_graph_stats(sstats);
     }
 
     // graph boundary: publish the completed MoE expert-cache uploads and schedule

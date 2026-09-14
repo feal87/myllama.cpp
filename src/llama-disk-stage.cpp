@@ -222,6 +222,7 @@ struct llama_disk_stage::impl {
     std::unique_ptr<llama_mlock> cache_lock; // decode cache held in RAM for the process lifetime
     std::vector<cache_pool>  pools;
     std::vector<cache_layer> cache;
+    std::unordered_map<const ggml_tensor *, int32_t> table_layer; // cache id table -> layer id
     std::mutex   cache_mu;       // guards resident_slot / free_slots and table writes
     std::mutex   io_mu;          // one reaper at a time: the IOCP is shared by all reads
     int32_t      n_trans = 0;    // transient slots per layer, 0 when no cache
@@ -265,6 +266,10 @@ struct llama_disk_stage::impl {
     uint64_t n_l2_hit_bytes   = 0;
     uint64_t n_l2_promo_bytes = 0; // resident fills served from the L2 instead of the disk
     bool     l2_warm          = false; // latched when every resident pool is full
+
+    // accumulated decode graph scheduling stats, for the eval-overhead report
+    struct ggml_backend_sched_stats gr_sum    = {};
+    uint64_t                        gr_graphs = 0;
 
     // previous stats report, for the per-interval delta line
     uint64_t prev_l2_hits        = 0;
@@ -512,8 +517,76 @@ bool llama_disk_stage::sparse_ubatch(int64_t n_tokens) const {
     return n_tokens > 1 && n_tokens < disk_stage_sparse_tokens;
 }
 
+bool llama_disk_stage::internal_decode_fill() const {
+    return !pimpl->table_layer.empty();
+}
+
+void llama_disk_stage::node_prepare_callback(struct ggml_tensor * node, void * user_data) {
+#if defined(_WIN32)
+    auto * self = static_cast<llama_disk_stage *>(user_data);
+    impl & p = *self->pimpl;
+    if (!p.active || node == nullptr || node->op != GGML_OP_GET_ROWS || node->src[0] == nullptr || node->src[1] == nullptr) {
+        return;
+    }
+
+    // the layer whose decode-cache id table this get_rows reads
+    const auto it = p.table_layer.find(node->src[0]);
+    if (it == p.table_layer.end()) {
+        return;
+    }
+
+    // the original routed ids: a split input of this CPU get_rows, so already
+    // host-side. Only single-token decode uses the table remap
+    const ggml_tensor * t = node->src[1];
+    if (t->type != GGML_TYPE_I32 || t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer) || t->ne[1] != 1) {
+        return;
+    }
+
+    const int64_t n_used = t->ne[0];
+    if (n_used <= 0) {
+        return;
+    }
+
+    // ids are a view into the argsort workspace: read row by row (n_tokens == 1)
+    std::vector<int32_t> ids((size_t) n_used);
+    std::memcpy(ids.data(), t->data, (size_t) n_used * sizeof(int32_t));
+
+    self->fill_cache(it->second, ids.data(), n_used);
+#else
+    GGML_UNUSED(node);
+    GGML_UNUSED(user_data);
+#endif
+}
+
+void llama_disk_stage::note_graph_stats(const struct ggml_backend_sched_stats & stats) {
+    impl & p = *pimpl;
+    p.gr_sum.n_splits        += stats.n_splits;
+    p.gr_sum.n_chunks        += stats.n_chunks;
+    p.gr_sum.n_copies        += stats.n_copies;
+    p.gr_sum.n_syncs         += stats.n_syncs;
+    p.gr_sum.t_compute_us    += stats.t_compute_us;
+    p.gr_sum.t_sync_us       += stats.t_sync_us;
+    p.gr_sum.t_cb_ask_us     += stats.t_cb_ask_us;
+    p.gr_sum.t_cb_observe_us += stats.t_cb_observe_us;
+    p.gr_sum.t_cb_prepare_us += stats.t_cb_prepare_us;
+    p.gr_graphs++;
+}
+
 void llama_disk_stage::print_stats() {
     impl & p = *pimpl;
+
+    if (p.gr_graphs > 0) {
+        const double n = (double) p.gr_graphs;
+        LLAMA_LOG_INFO("[disk-stage] decode sched: per graph %.1f splits | %.1f backend computes | %.1f input copies | %.1f syncs |"
+                       " compute %.3f ms | sync %.3f ms | cb ask %.3f ms | cb fill %.3f ms | prep %.3f ms (%" PRIu64 " graphs)\n",
+                       p.gr_sum.n_splits / n, p.gr_sum.n_chunks / n, p.gr_sum.n_copies / n, p.gr_sum.n_syncs / n,
+                       p.gr_sum.t_compute_us / n / 1000.0, p.gr_sum.t_sync_us / n / 1000.0,
+                       p.gr_sum.t_cb_ask_us / n / 1000.0, p.gr_sum.t_cb_observe_us / n / 1000.0,
+                       p.gr_sum.t_cb_prepare_us / n / 1000.0, p.gr_graphs);
+        p.gr_sum    = {};
+        p.gr_graphs = 0;
+    }
+
     if (p.evict_pools.empty()) {
         return;
     }
@@ -1038,6 +1111,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
 
                                 c.table     = tab;
                                 c.slot_skip = skip;
+                                p.table_layer.emplace(tab, il);
                                 c.pub.gate      = pool.gate;
                                 c.pub.up        = pool.up;
                                 c.pub.down      = pool.down;
