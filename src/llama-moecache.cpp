@@ -19,7 +19,6 @@
 #include <string>
 #include <thread>
 #include <tuple>
-#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -107,6 +106,10 @@ struct llama_moe_cache::impl {
     ggml_backend_buffer_t  pool = nullptr;
 
     std::vector<layer_state> layers;
+    // layers indexed by transformer layer id (-1 = not cached). `layers` is
+    // stable while the layout is live, so the id -> index lookup is O(1); the
+    // observation calls this once per cached layer per decode token.
+    std::vector<int32_t> layer_idx;
 
     // tensor metadata (per-layer device cache tensors + one shared host context
     // for the tables). The device tensors are bound into `pool` at activation
@@ -123,16 +126,29 @@ struct llama_moe_cache::impl {
     std::vector<upload_job>  done;
     bool                     stop = false;
 
-    // guards the bookkeeping above. The hot cache calls vram_resident_cb() (holding
-    // its own mutex) from the router observation, which runs during graph compute,
-    // while tick()/rebalance() run between graphs - so contention is negligible.
-    // hot.mu -> this mutex is the only lock order (never take hot's mutex while
-    // holding this one).
+    // guards the bookkeeping above. All of it is mutated on the decode thread
+    // (tick/rebalance/activate/suspend) and only the upload worker's own queue
+    // crosses threads, so the lock is held for short sections. hot.mu -> this
+    // mutex is the only lock order (never take hot's mutex while holding this
+    // one). vram_resident_cb() reads `resident` without the lock: the decode
+    // thread is its only writer and no graph runs while it is called.
     std::mutex mtx;
 
     uint64_t n_content      = 0;
     uint64_t last_rebalance = 0;
     uint64_t n_ticks        = 0;
+
+    // rebalance scratch, reused across calls so the periodic reconciliation does
+    // not allocate (rank snapshot, per-layer top sets, O(1) membership marks)
+    std::vector<std::tuple<int, int32_t, uint64_t>> rank_scratch;
+    std::vector<std::vector<int32_t>>               desired_scratch;
+    std::vector<uint32_t>                           desired_mark;
+    std::vector<uint32_t>                           inflight_mark;
+    uint32_t                                        mark_stamp = 0;
+    int32_t                                         max_n_expert = 0;
+
+    // helper scratch for tick()'s one-table-refresh-per-changed-layer pass
+    std::vector<char> dirty;
 
     // (layer, expert) residents at the previous stats report; diffed against the
     // current residents to measure list churn (key = (uint32 layer << 32) | expert)
@@ -203,15 +219,24 @@ struct llama_moe_cache::impl {
 
     impl(const llama_model & model_, llama_hot_expert_cache * hot_,
          uint64_t budget_, int32_t inserts_) :
-        model(model_), hot(hot_), budget_bytes(budget_), budget_base(budget_), max_inserts(inserts_) {}
+        model(model_), hot(hot_), budget_bytes(budget_), budget_base(budget_), max_inserts(inserts_),
+        layer_idx(model_.layers.size(), -1) {}
 
     layer_state * find_layer(int il) {
-        for (auto & ls : layers) {
-            if (ls.pub.il == il) {
-                return &ls;
-            }
+        if (il < 0 || il >= (int) layer_idx.size()) {
+            return nullptr;
         }
-        return nullptr;
+        const int32_t li = layer_idx[il];
+        return li < 0 ? nullptr : &layers[(size_t) li];
+    }
+
+    int32_t layer_index(int il) const {
+        return (il >= 0 && il < (int) layer_idx.size()) ? layer_idx[il] : -1;
+    }
+
+    // drop the id -> index map when the layers are torn down
+    void clear_layer_index() {
+        std::fill(layer_idx.begin(), layer_idx.end(), -1);
     }
 
     ~impl() {
@@ -374,20 +399,18 @@ void llama_moe_cache::set_disk_stage(llama_disk_stage * disk) {
     pimpl->disk_mode = disk != nullptr;
 }
 
-// llama_hot_expert_cache::vram_query_fn: copy this layer's residency flags (one
-// 0/1 byte per expert) for the RAM tier's observation, which snapshots each layer
-// once per ubatch instead of querying per routed expert.
-void llama_moe_cache::vram_resident_cb(void * ud, int il, std::vector<uint8_t> & flags) {
+// llama_hot_expert_cache::vram_query_fn: return the layer's per-expert 0/1
+// residency table for the RAM tier's observation, which reads it in place once
+// per cached layer per decode token instead of copying it. `resident` is only
+// written on the decode thread (tick/rebalance/activate/suspend) and no graph
+// runs while the observation reads it, so no lock is needed.
+const uint8_t * llama_moe_cache::vram_resident_cb(void * ud, int il) {
     auto * self = static_cast<llama_moe_cache *>(ud);
     if (!self || !self->pimpl || !self->pimpl->activated) {
-        return;
+        return nullptr;
     }
-    std::lock_guard<std::mutex> lock(self->pimpl->mtx);
     auto * ls = self->pimpl->find_layer(il);
-    if (!ls) {
-        return;  // not a cached layer: leave `flags` empty
-    }
-    flags.assign(ls->resident.begin(), ls->resident.end());
+    return ls ? ls->resident.data() : nullptr;  // null = layer has no device cache
 }
 
 void llama_moe_cache::reserve() {
@@ -640,6 +663,7 @@ void llama_moe_cache::activate(bool relayout) {
                 std::fill(ls.slot_target.begin(), ls.slot_target.end(), -1);
                 ls.pending_q.clear();
             }
+            p->clear_layer_index();
             p->layers.clear();
             p->retire_layout();
         }
@@ -647,9 +671,9 @@ void llama_moe_cache::activate(bool relayout) {
         // when the VRAM copy took over, so they must be resident again before the
         // VRAM copies below are rebuilt. The disk tier must also stop skipping
         // them (vram_release), or the rebuilt device table would not serve them
-        // while the host chain still skips them. No impl lock held here - the hot
-        // cache locks its own mutex and re-enters this one through the VRAM
-        // residency query (hot.mu -> impl.mtx is the documented lock order).
+        // while the host chain still skips them. The layer index is already
+        // cleared, so the residency query reports the old residents as gone. No
+        // impl lock held here (never take hot's mutex while holding this one).
         for (const auto & [il, e] : evicted) {
             if (p->disk_mode) {
                 p->disk->vram_release(il, e);
@@ -676,6 +700,7 @@ void llama_moe_cache::activate(bool relayout) {
     }
 
     p->layers.reserve(p->cands.size());
+    p->max_n_expert = 0;
     int n_cached = 0;
 
     // bind every cached layer's device tensors into the reserved pool, one
@@ -753,6 +778,7 @@ void llama_moe_cache::activate(bool relayout) {
         ls.slot_expert.assign(n_slots, -1);
         ls.slot_target.assign(n_slots, -1);
         ls.resident.assign(c.n_expert, 0);
+        p->max_n_expert = std::max(p->max_n_expert, (int32_t) c.n_expert);
         n_cached++;
     }
 
@@ -762,6 +788,17 @@ void llama_moe_cache::activate(bool relayout) {
         p->failed    = true;
         return;
     }
+
+    // index the cached layers by id and size the rebalance marks to the widest
+    // expert table, so the per-token layer lookup and the rebalance membership
+    // tests are O(1) with no per-call allocation
+    p->clear_layer_index();
+    for (size_t li = 0; li < p->layers.size(); ++li) {
+        p->layer_idx[p->layers[li].pub.il] = (int32_t) li;
+    }
+    p->desired_mark.assign((size_t) p->max_n_expert, 0);
+    p->inflight_mark.assign((size_t) p->max_n_expert, 0);
+    p->mark_stamp = 0;
 
     // zero the whole pool once: the dummy slot (n_slots) of every cached layer
     // must stay zeros for the cache-side mul_mat chain to contribute nothing
@@ -929,6 +966,7 @@ bool llama_moe_cache::suspend() {
             std::fill(ls.slot_target.begin(), ls.slot_target.end(), -1);
             ls.pending_q.clear();
         }
+        p->clear_layer_index();
         p->layers.clear();
         p->retire_layout();
     }
@@ -1042,64 +1080,67 @@ const llama_moe_cache_layer * llama_moe_cache::lookup(int il) const {
 void llama_moe_cache::rebalance() {
     auto * p = pimpl.get();
 
-    // snapshot each cached layer's current counts and pick its top n_slots
-    struct plan {
-        size_t               li;
-        std::vector<int32_t> desired; // top of the ranking, hottest first
-    };
-    std::vector<plan> plans;
-    plans.reserve(p->layers.size());
-
-    // index the cached layers by transformer layer id, then walk the shared
-    // ranking ONCE: per-layer queries used to rescan the whole table once per
-    // cached layer (quadratic in the number of cached layers)
-    std::unordered_map<int, size_t> idx;
-    idx.reserve(p->layers.size());
-    for (size_t li = 0; li < p->layers.size(); ++li) {
-        idx.emplace(p->layers[li].pub.il, li);
-    }
-
-    std::vector<std::tuple<int, int32_t, uint64_t>> all;
+    // walk the shared ranking ONCE for every cached layer: sort it by
+    // (layer, count desc, expert) and group the runs, which gives each layer
+    // its top n_slots without a per-layer query, a per-layer sort or a
+    // per-layer intermediate vector
+    auto & all = p->rank_scratch;
     p->hot->all_counts(all); // locks the hot cache's mutex
+    std::sort(all.begin(), all.end(), [](const auto & a, const auto & b) {
+        if (std::get<0>(a) != std::get<0>(b)) {
+            return std::get<0>(a) < std::get<0>(b);
+        }
+        if (std::get<2>(a) != std::get<2>(b)) {
+            return std::get<2>(a) > std::get<2>(b);
+        }
+        return std::get<1>(a) < std::get<1>(b);
+    });
 
-    std::vector<std::vector<std::pair<int32_t, uint64_t>>> raw(p->layers.size());
+    // top n_slots of every cached layer, hottest first (reused scratch)
+    auto & desired = p->desired_scratch;
+    desired.resize(p->layers.size());
+    for (auto & d : desired) {
+        d.clear();
+    }
     for (const auto & [layer, expert, count] : all) {
-        const auto it = idx.find(layer);
-        if (it != idx.end()) {
-            raw[it->second].emplace_back(expert, count);
+        (void) count;
+        const int32_t li = p->layer_index(layer);
+        if (li < 0) {
+            continue; // not a cached layer
         }
+        auto & d = desired[(size_t) li];
+        if ((int32_t) d.size() >= p->layers[(size_t) li].pub.n_slots) {
+            continue;
+        }
+        d.push_back(expert);
     }
 
-    for (size_t li = 0; li < p->layers.size(); ++li) {
-        auto & ls = p->layers[li];
-
-        std::sort(raw[li].begin(), raw[li].end(), [](const auto & a, const auto & b) {
-            return a.second > b.second || (a.second == b.second && a.first < b.first);
-        });
-
-        plan pl;
-        pl.li = li;
-        pl.desired.reserve(ls.pub.n_slots);
-        for (const auto & [id, cnt] : raw[li]) {
-            if ((int32_t) pl.desired.size() >= ls.pub.n_slots) {
-                break;
-            }
-            pl.desired.push_back(id);
-        }
-        plans.push_back(std::move(pl));
-    }
-
-    // apply: evict residents that left the top set, queue additions
+    // apply: evict residents that left the top set, queue additions. The
+    // membership tests use generation-stamped mark arrays (O(1) per slot and
+    // per candidate) instead of a linear scan of the desired list.
     std::vector<std::pair<int, int32_t>> evicted;
     {
         std::lock_guard<std::mutex> lock(p->mtx);
-        for (auto & pl : plans) {
-            auto & ls = p->layers[pl.li];
+        for (size_t li = 0; li < p->layers.size(); ++li) {
+            auto & ls = p->layers[li];
+            auto & d  = desired[li];
             const int32_t n_slots = ls.pub.n_slots;
 
-            auto in_desired = [&](int32_t e) {
-                return std::find(pl.desired.begin(), pl.desired.end(), e) != pl.desired.end();
-            };
+            if (p->mark_stamp == UINT32_MAX) {
+                std::fill(p->desired_mark.begin(), p->desired_mark.end(), 0);
+                std::fill(p->inflight_mark.begin(), p->inflight_mark.end(), 0);
+                p->mark_stamp = 0;
+            }
+            const uint32_t stamp = ++p->mark_stamp;
+            for (int32_t e : d) {
+                p->desired_mark[(size_t) e] = stamp;
+            }
+            for (int32_t s = 0; s < n_slots; ++s) {
+                const int32_t e = ls.slot_target[s];
+                if (e >= 0) {
+                    p->inflight_mark[(size_t) e] = stamp;
+                }
+            }
 
             // evict published residents that are no longer in the top set
             bool changed = false;
@@ -1108,7 +1149,7 @@ void llama_moe_cache::rebalance() {
                 if (e < 0) {
                     continue;
                 }
-                if (in_desired(e)) {
+                if (p->desired_mark[(size_t) e] == stamp) {
                     continue;
                 }
                 ls.slot_expert[s] = -1;
@@ -1122,7 +1163,7 @@ void llama_moe_cache::rebalance() {
 
             // queue the additions (in ranking order) for the ticks to drain
             ls.pending_q.clear();
-            for (int32_t e : pl.desired) {
+            for (int32_t e : d) {
                 if (ls.resident[e]) {
                     continue;
                 }
@@ -1131,17 +1172,10 @@ void llama_moe_cache::rebalance() {
                 if (p->disk_mode && !p->disk->resident_filled(ls.pub.il, e)) {
                     continue;
                 }
-                // skip ids whose upload is already in flight
-                bool inflight = false;
-                for (int32_t s = 0; s < n_slots; ++s) {
-                    if (ls.slot_target[s] == e) {
-                        inflight = true;
-                        break;
-                    }
+                if (p->inflight_mark[(size_t) e] == stamp) {
+                    continue; // upload already in flight
                 }
-                if (!inflight) {
-                    ls.pending_q.push_back(e);
-                }
+                ls.pending_q.push_back(e);
             }
         }
     }
@@ -1174,25 +1208,29 @@ void llama_moe_cache::tick(int64_t n_content_tokens) {
         p->n_content += (uint64_t) std::max<int64_t>(0, n_content_tokens);
         p->n_ticks++;
 
-        std::vector<char> dirty(p->layers.size(), 0);
-        for (const auto & j : p->done) {
-            auto & ls = p->layers[j.layer_idx];
-            ls.slot_target[j.slot] = -1;
-            if (j.failed) {
-                continue; // source was gone; retried by the next rebalance
+        if (!p->done.empty()) {
+            // the reused scratch is only touched when an upload completed, so
+            // the steady-state token does not even clear it
+            p->dirty.assign(p->layers.size(), 0);
+            for (const auto & j : p->done) {
+                auto & ls = p->layers[j.layer_idx];
+                ls.slot_target[j.slot] = -1;
+                if (j.failed) {
+                    continue; // source was gone; retried by the next rebalance
+                }
+                ls.slot_expert[j.slot] = j.expert;
+                ls.resident[j.expert]  = 1;
+                p->dirty[j.layer_idx]  = 1;
+                became_resident.emplace_back(ls.pub.il, j.expert);
             }
-            ls.slot_expert[j.slot] = j.expert;
-            ls.resident[j.expert]  = 1;
-            dirty[j.layer_idx]     = 1;
-            became_resident.emplace_back(ls.pub.il, j.expert);
-        }
-        // publish the new mappings in one table refresh per changed layer
-        for (size_t li = 0; li < p->layers.size(); ++li) {
-            if (dirty[li]) {
-                sync_tables(p->layers[li].pub, p->layers[li].slot_expert);
+            // publish the new mappings in one table refresh per changed layer
+            for (size_t li = 0; li < p->layers.size(); ++li) {
+                if (p->dirty[li]) {
+                    sync_tables(p->layers[li].pub, p->layers[li].slot_expert);
+                }
             }
+            p->done.clear();
         }
-        p->done.clear();
     }
 
     // residents are served from VRAM now: the host chain skips them (its disk

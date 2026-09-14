@@ -191,11 +191,13 @@ class llama_moe_cache {
     // --experts-stats-interval cadence; also refreshes the churn snapshot.
     void print_stats();
 
-    // llama_hot_expert_cache::vram_query_fn-compatible: fills `flags` with the
-    // 0/1 residency of every expert of layer `il` (empty when the layer has no
-    // device cache). The RAM tier uses it to skip double-covering residents and
-    // to feed this cache's decode-time hit/miss stats (see vram_stats).
-    static void vram_resident_cb(void * ud, int il, std::vector<uint8_t> & flags);
+    // llama_hot_expert_cache::vram_query_fn-compatible: returns the layer's
+    // per-expert 0/1 residency table (n_expert bytes), or null when the layer
+    // has no device cache. The RAM tier uses it to skip double-covering
+    // residents and to feed this cache's decode-time hit/miss stats (see
+    // vram_stats). The pointer is read in place, so the observation does not
+    // copy the table once per layer per token.
+    static const uint8_t * vram_resident_cb(void * ud, int il);
 
   private:
     struct impl;

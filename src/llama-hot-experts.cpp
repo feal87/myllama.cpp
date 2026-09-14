@@ -38,6 +38,7 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
     }
     n_pin_total = n_pin * n_moe_layers;
     n_pinned_layer.assign((size_t) model.hparams.n_layer(), 0);
+    layers.resize((size_t) model.hparams.n_layer());
     pinned_rank_pool.resize((size_t) n_pools);
 
     if (n_moe_layers == 0) {
@@ -406,8 +407,10 @@ void llama_hot_expert_cache::observe_decode_begin(const std::vector<ggml_tensor 
             continue;  // decode graphs route a single token per ubatch
         }
 
+        // lock only when a layer still needs resolving: after warm-up this pass
+        // takes no lock at all instead of one acquisition per layer
         layer_state & ls = layers[il];
-        {
+        if (!ls.resolved_tensors) {
             std::lock_guard<std::mutex> lock(mu);
             if (!ls.resolved_tensors) {
                 resolve_tensors(il, ls);
@@ -528,14 +531,10 @@ void llama_hot_expert_cache::observe_decode_finish() {
 
         // snapshot this layer's VRAM residency: the VRAM tier only publishes and
         // evicts at the ubatch boundary (tick), never during a graph, so the flags
-        // read here describe exactly what the decode graph just used
-        vram_flags.clear();
-        if (vram_query) {
-            vram_query(vram_ud, il, vram_flags);
-        }
-        // only layers the VRAM tier actually caches carry a full flag table;
-        // everything else stays empty and reads as "not served from VRAM"
-        const bool vram_tier_layer = !vram_flags.empty();
+        // read here describe exactly what the decode graph just used. The table
+        // is borrowed in place (null when the layer has no device cache)
+        const uint8_t * vram_flags = vram_query ? vram_query(vram_ud, il) : nullptr;
+        const bool vram_tier_layer = vram_flags != nullptr;
 
         // flat per-expert tables, indexed by routed expert id
         const int   n_experts = (int) ls.n_experts;
@@ -547,7 +546,7 @@ void llama_hot_expert_cache::observe_decode_finish() {
             if (id < 0 || id >= n_experts) {
                 continue;
             }
-            const bool served = (size_t) id < vram_flags.size() && vram_flags[(size_t) id] != 0;
+            const bool served = vram_flags != nullptr && vram_flags[(size_t) id] != 0;
             if (served) {
                 // decode-time VRAM-tier hit: the VRAM copy served the expert
                 // and this host read was skipped
@@ -619,15 +618,14 @@ void llama_hot_expert_cache::resolve_tensors(int il, layer_state & ls) {
 
 uint64_t llama_hot_expert_cache::count_of(int il, int32_t expert_id) const {
     // caller holds mu. Cold path: any layer may be queried, resolved or not
-    const auto it = layers.find(il);
-    if (it == layers.end() || !it->second.resolved_tensors) {
+    const layer_state * ls = layer_of(il);
+    if (ls == nullptr || !ls->resolved_tensors) {
         return 0;
     }
-    const layer_state & ls = it->second;
-    if (expert_id < 0 || (uint32_t) expert_id >= ls.n_experts) {
+    if (expert_id < 0 || (uint32_t) expert_id >= ls->n_experts) {
         return 0;
     }
-    return ls.counts[(size_t) expert_id];
+    return ls->counts[(size_t) expert_id];
 }
 
 void llama_hot_expert_cache::set_disk_stage(llama_disk_stage * ds) {
@@ -941,14 +939,20 @@ void llama_hot_expert_cache::complete_disk_pin(int il, layer_state & ls, int32_t
 }
 
 bool llama_hot_expert_cache::is_vram_resident(int il, int32_t expert_id) const {
-    // caller holds mu. Cold path (VRAM eviction re-admission): allocates its own
-    // snapshot rather than sharing the observation scratch
+    // caller holds mu. Cold path (VRAM eviction re-admission): borrows the
+    // residency table instead of copying it
     if (vram_query == nullptr) {
         return false;
     }
-    std::vector<uint8_t> flags;
-    vram_query(vram_ud, il, flags);
-    return expert_id >= 0 && (size_t) expert_id < flags.size() && flags[(size_t) expert_id] != 0;
+    const layer_state * ls = layer_of(il);
+    if (ls == nullptr || !ls->resolved_tensors) {
+        return false;
+    }
+    if (expert_id < 0 || (uint32_t) expert_id >= ls->n_experts) {
+        return false;
+    }
+    const uint8_t * flags = vram_query(vram_ud, il);
+    return flags != nullptr && flags[(size_t) expert_id] != 0;
 }
 
 size_t llama_hot_expert_cache::expert_row_bytes(const layer_state & ls, int32_t expert_id) const {
@@ -1185,8 +1189,8 @@ void llama_hot_expert_cache::on_ubatch_begin(int64_t n_tokens) {
 void llama_hot_expert_cache::decay_counts() {
     std::lock_guard<std::mutex> lock(mu);
 
-    for (auto & [il, ls] : layers) {
-        (void) il;
+    for (size_t il = 0; il < layers.size(); ++il) {
+        auto & ls = layers[il];
         if (!ls.resolved_tensors) {
             continue;
         }
@@ -1217,8 +1221,8 @@ void llama_hot_expert_cache::on_prompt_begin() {
     // immediately (same floor-at-1 rounding as the periodic halving), so the
     // pin/VRAM sets can re-converge on the new prompt's expert mix instead of
     // letting the previous prompt's lifetime leaders hold their slots.
-    for (auto & [il, ls] : layers) {
-        (void) il;
+    for (size_t il = 0; il < layers.size(); ++il) {
+        auto & ls = layers[il];
         if (!ls.resolved_tensors) {
             continue;
         }
@@ -1243,15 +1247,14 @@ void llama_hot_expert_cache::on_prompt_begin() {
 bool llama_hot_expert_cache::is_pinned(int il, int32_t expert_id) const {
     std::lock_guard<std::mutex> lock(mu);
 
-    const auto it = layers.find(il);
-    if (it == layers.end() || !it->second.resolved_tensors) {
+    const layer_state * ls = layer_of(il);
+    if (ls == nullptr || !ls->resolved_tensors) {
         return false;
     }
-    const layer_state & ls = it->second;
-    if (expert_id < 0 || (uint32_t) expert_id >= ls.n_experts) {
+    if (expert_id < 0 || (uint32_t) expert_id >= ls->n_experts) {
         return false;
     }
-    return (ls.pin_state[(size_t) expert_id] & PIN_RESIDENT) != 0;
+    return (ls->pin_state[(size_t) expert_id] & PIN_RESIDENT) != 0;
 }
 
 void llama_hot_expert_cache::set_vram_query(vram_query_fn fn, void * ud) {
@@ -1264,14 +1267,14 @@ void llama_hot_expert_cache::set_vram_query(vram_query_fn fn, void * ud) {
 void llama_hot_expert_cache::vram_stats(int il, uint64_t & n_hit, uint64_t & n_miss) const {
     std::lock_guard<std::mutex> lock(mu);
 
-    const auto it = layers.find(il);
-    if (it == layers.end()) {
+    const layer_state * ls = layer_of(il);
+    if (ls == nullptr) {
         n_hit  = 0;
         n_miss = 0;
         return;
     }
-    n_hit  = it->second.n_vram_hit;
-    n_miss = it->second.n_vram_miss;
+    n_hit  = ls->n_vram_hit;
+    n_miss = ls->n_vram_miss;
 }
 
 void llama_hot_expert_cache::route_stats(uint64_t & n_hit, uint64_t & n_miss) const {
@@ -1291,14 +1294,15 @@ void llama_hot_expert_cache::all_counts(std::vector<std::tuple<int, int32_t, uin
 
     out.clear();
     out.reserve(n_distinct);
-    for (const auto & [il, ls] : layers) {
+    for (size_t il = 0; il < layers.size(); ++il) {
+        const auto & ls = layers[il];
         if (!ls.resolved_tensors) {
             continue;
         }
         for (uint32_t id = 0; id < ls.n_experts; ++id) {
             const uint64_t c = ls.counts[(size_t) id];
             if (c > 0) {
-                out.emplace_back(il, (int32_t) id, c);
+                out.emplace_back((int) il, (int32_t) id, c);
             }
         }
     }
@@ -1319,14 +1323,15 @@ int32_t llama_hot_expert_cache::assign_global_capacity(uint64_t budget_bytes,
     // its first slot is granted, so the final layout always fits the budget.
     std::vector<std::tuple<uint64_t, int, int32_t>> all;
     all.reserve(n_distinct);
-    for (const auto & [il, ls] : layers) {
+    for (size_t il = 0; il < layers.size(); ++il) {
+        const auto & ls = layers[il];
         if (!ls.resolved_tensors) {
             continue;
         }
         for (uint32_t id = 0; id < ls.n_experts; ++id) {
             const uint64_t c = ls.counts[(size_t) id];
             if (c > 0) {
-                all.emplace_back(c, il, (int32_t) id);
+                all.emplace_back(c, (int) il, (int32_t) id);
             }
         }
     }

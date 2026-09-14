@@ -183,10 +183,12 @@ class llama_hot_expert_cache {
 
     // The experts currently served from VRAM are reported through this query so
     // the RAM tier skips them (and prefetches nothing for them). The callback
-    // fills `flags` with one 0/1 byte per expert id of layer `il` (empty when
-    // the layer has no device cache) and runs while this cache's mutex is held,
-    // once per observed layer per ubatch. Call with null to clear.
-    using vram_query_fn = void (*)(void * ud, int il, std::vector<uint8_t> & flags);
+    // returns a pointer to layer `il`'s per-expert 0/1 table (n_experts bytes),
+    // or null when the layer has no device cache; it runs once per observed
+    // layer per ubatch. The table is read in place (no copy): the VRAM tier
+    // only mutates residency at the ubatch boundary, so the pointer stays valid
+    // for the whole observation. Call with null to clear.
+    using vram_query_fn = const uint8_t * (*)(void * ud, int il);
     void set_vram_query(vram_query_fn fn, void * ud);
 
     // decode-time VRAM-tier hit/miss counters of one layer: a routed expert is a
@@ -460,7 +462,6 @@ class llama_hot_expert_cache {
     // where observe_decode_finish() reads the staged ids from: obs_stage (pinned
     // host memory, preferred) or obs_scratch (pageable fallback)
     const int32_t *                                      obs_ids = nullptr;
-    std::vector<uint8_t>                                 vram_flags;       // per-layer VRAM residency snapshot
     std::vector<std::pair<const void *, size_t>>         prefetch_ranges;  // rows to read ahead
 
     // pinned host staging buffer for the decode readback. Async D2H copies into
@@ -477,8 +478,16 @@ class llama_hot_expert_cache {
     // (caller falls back to the pageable obs_scratch)
     bool ensure_obs_stage(ggml_backend_t backend, size_t bytes);
 
-    mutable std::mutex                   mu;
-    std::unordered_map<int, layer_state> layers;
+    mutable std::mutex        mu;
+    // one entry per transformer layer, indexed by layer id: the observation
+    // path looks a layer up several times per token, so the flat vector beats
+    // a hash map there (unresolved entries are inert)
+    std::vector<layer_state>  layers;
+
+    // bounds-checked layer lookup for the cold paths that may be handed an
+    // arbitrary layer id; null when out of range
+    layer_state *       layer_of(int il)       { return (il >= 0 && il < (int) layers.size()) ? &layers[il] : nullptr; }
+    const layer_state * layer_of(int il) const { return (il >= 0 && il < (int) layers.size()) ? &layers[il] : nullptr; }
 
     // Global tracking across all layers. The per-expert usage counts and the
     // resident/in-flight pin mirrors live flattened per layer inside layer_state
