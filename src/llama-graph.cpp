@@ -1973,7 +1973,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         llm_graph_build_shexp_fn build_shexp) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -1994,7 +1995,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up_exps_s,
         gate_exps_s,
         down_exps_s,
-        selected_experts_in
+        selected_experts_in,
+        build_shexp
     );
 }
 
@@ -2022,10 +2024,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         llm_graph_build_shexp_fn build_shexp) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+
+    // the layer input before it is reshaped for the expert mul_mat_ids, for the
+    // shared expert branch
+    ggml_tensor * cur_in = cur;
 
     // direct-read staging: on multi-token ubatches use the layer's host staging
     // tensors (filled from the model file right before this layer computes) in
@@ -2418,7 +2425,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (mc) {
         experts->src[3]       = dc != nullptr ? dc->slot_skip : mc->host_table;
         experts->op_params[0] = dc != nullptr ? 0 : mc->n_slots;
+    }
 
+    // emit the host expert chain, then the shared expert, so the shared expert
+    // sits before the VRAM cache chain and can be launched with it while the
+    // host experts run
+    ggml_tensor * shexp = nullptr;
+    if (build_shexp) {
+        ggml_build_forward_expand(gf, experts);
+
+        shexp = build_shexp(cur_in);
+        ggml_build_forward_expand(gf, shexp);
+    }
+
+    if (mc) {
         // device-side chain over the cached experts, mirroring the host
         // activation (plain swiglu_split - clamp layers never reach here)
         ggml_tensor * mc_slot_ids = ggml_get_rows(ctx0, mc->dev_table, selected_experts); // [1, n_expert_used, n_tokens]
@@ -2498,6 +2518,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     cb(moe_out, "ffn_moe_out", il);
+
+    if (shexp) {
+        moe_out = ggml_add(ctx0, moe_out, shexp);
+    }
 
     return moe_out;
 }

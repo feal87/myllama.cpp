@@ -997,6 +997,10 @@ struct llm_graph_qkv {
     ggml_tensor * v; // [n_embd_head, n_head_kv, n_tokens]
 };
 
+// builds the shared-expert branch on the MoE input; called by build_moe_ffn
+// after the routed-expert host chain, before the VRAM cache chain
+using llm_graph_build_shexp_fn = std::function<ggml_tensor *(ggml_tensor * cur)>;
+
 struct llm_graph_context {
     const llm_arch arch;
 
@@ -1147,7 +1151,8 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             llm_graph_build_shexp_fn build_shexp = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1173,7 +1178,8 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             llm_graph_build_shexp_fn build_shexp = nullptr) const;
 
     //
     // inputs
