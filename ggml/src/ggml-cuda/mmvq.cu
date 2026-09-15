@@ -696,7 +696,12 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
-    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    // MoE expert cache: a routed expert that is not resident maps to the
+    // sentinel slot whose weights are all zero. Skip the dot products and let
+    // the zero tmp be written below instead of computing them.
+    const bool skip_x = ncols_dst == 1 && ids != nullptr && (int32_t) channel_x == fusion.ids_skip;
+
+    for (int kbx = tid / (qi/vdr); !skip_x && kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
         // x block quant index when casting the quants to int
@@ -1429,6 +1434,11 @@ void ggml_cuda_mul_mat_vec_q(
     float         *  dst_d =       (float         *)  dst->data;
 
     ggml_cuda_mm_fusion_args_device fusion_local{};
+
+    // MoE expert cache: src[3] marks a cache-side mul_mat_id and op_params[1]
+    // holds the sentinel slot that a non-resident expert maps to. The kernel
+    // skips that slot's all-zero weights instead of computing them.
+    fusion_local.ids_skip = (ids != nullptr && dst->src[3] != nullptr) ? dst->op_params[1] : -1;
 
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;

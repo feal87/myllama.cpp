@@ -1637,21 +1637,25 @@ static void ggml_compute_forward_mul_mat_id(
 #endif
     }
 
+    // llama MoE GPU expert cache: when src[3] is set it is an I32 table
+    // mapping expert id -> device cache slot, and op_params[0] holds the
+    // "not cached" dummy slot value. Cached experts are served by the
+    // device-side cache chain, so this op skips them instead of reading the
+    // host-RAM weights. op_params[2] selects whether the skipped dst rows are
+    // zeroed: only the down projection needs it, the gate/up rows are dead
+    // because the down mul_mat_id skips the same experts.
+    const int32_t * moe_tbl   = NULL;
+    int32_t         moe_dummy = 0;
+    int32_t         moe_zero  = 0;
+    if (dst->src[3]) {
+        moe_tbl   = (const int32_t *) dst->src[3]->data;
+        moe_dummy = ggml_get_op_params_i32(dst, 0);
+        moe_zero  = ggml_get_op_params_i32(dst, 2);
+    }
+
     if (ith == 0) {
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
-
-        // llama MoE GPU expert cache: when src[3] is set it is an I32 host table
-        // mapping expert id -> device cache slot, and op_params[0] holds the
-        // "not cached" dummy slot value. Cached experts are served by the
-        // device-side cache chain, so this op skips them and zeroes their dst
-        // rows instead (saving the host-RAM weight reads entirely).
-        const int32_t * moe_tbl   = NULL;
-        int32_t         moe_dummy = 0;
-        if (dst->src[3]) {
-            moe_tbl   = (const int32_t *) dst->src[3]->data;
-            moe_dummy = ggml_get_op_params_i32(dst, 0);
-        }
 
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
@@ -1661,12 +1665,25 @@ static void ggml_compute_forward_mul_mat_id(
                 assert(i02 >= 0 && i02 < n_as);
 
                 if (moe_tbl && moe_tbl[i02] != moe_dummy) {
-                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
-                    continue;
+                    continue; // zeroed in parallel below
                 }
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
+            }
+        }
+    }
+
+    // zero the cached experts' dst rows across all threads: the rows are few
+    // but a single thread is too slow to clear them for the whole batch
+    if (moe_zero) {
+        const int64_t n_rows = n_ids*ids->ne[1];
+        for (int64_t ir = ith; ir < n_rows; ir += nth) {
+            const int64_t iid1 = ir / n_ids;
+            const int64_t id   = ir % n_ids;
+            const int32_t i02  = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+            if (moe_tbl[i02] != moe_dummy) {
+                memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
             }
         }
     }

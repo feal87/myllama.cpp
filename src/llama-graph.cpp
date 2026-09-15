@@ -2425,6 +2425,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (mc) {
         experts->src[3]       = dc != nullptr ? dc->slot_skip : mc->host_table;
         experts->op_params[0] = dc != nullptr ? 0 : mc->n_slots;
+        // this is the final host projection: its cached rows feed the add with
+        // the device result, so they must be zeroed. Gate/up rows are dead
+        // (the down mul_mat_id skips the same experts) and stay untouched.
+        experts->op_params[2] = 1;
     }
 
     // emit the host expert chain, then the shared expert, so the shared expert
@@ -2444,11 +2448,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * mc_slot_ids = ggml_get_rows(ctx0, mc->dev_table, selected_experts); // [1, n_expert_used, n_tokens]
         mc_slot_ids = ggml_reshape_2d(ctx0, mc_slot_ids, selected_experts->ne[0], selected_experts->ne[1]);
 
+        // a routed expert that is not resident maps to the sentinel slot, whose
+        // weights are all zero. src[3] marks the op as a cache-side mul_mat_id
+        // and op_params[1] carries the sentinel, so the device mul_mat_id skips
+        // that slot instead of computing zeros for it.
+        const auto mc_set_skip = [&](ggml_tensor * t) {
+            t->src[3]       = mc->dev_table;
+            t->op_params[1] = mc->n_slots;
+        };
+
         ggml_tensor * mc_act = nullptr;
         if (mc->fused) {
             // one fused gate+up mul_mat_id, then split into gate and up views
             ggml_tensor * mc_gu = ggml_mul_mat_id(ctx0, mc->c_gate, mc_inp, mc_slot_ids); // [n_ff*2, n_expert_used, n_tokens]
             cb(mc_gu, "ffn_moe_cache_gate_up", il);
+            mc_set_skip(mc_gu);
 
             const int64_t mc_n_ff = mc_gu->ne[0] / 2;
             ggml_tensor * mc_gate = ggml_view_3d(ctx0, mc_gu, mc_n_ff, mc_gu->ne[1], mc_gu->ne[2], mc_gu->nb[1], mc_gu->nb[2], 0);
@@ -2459,12 +2473,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_tensor * mc_up   = ggml_mul_mat_id(ctx0, mc->c_up,   mc_inp, mc_slot_ids);
             cb(mc_gate, "ffn_moe_cache_gate", il);
             cb(mc_up,   "ffn_moe_cache_up",   il);
+            mc_set_skip(mc_gate);
+            mc_set_skip(mc_up);
             mc_act = ggml_swiglu_split(ctx0, mc_gate, mc_up);
         }
         cb(mc_act, "ffn_moe_cache_swiglu", il);
 
         ggml_tensor * mc_down = ggml_mul_mat_id(ctx0, mc->c_down, mc_act, mc_slot_ids); // [n_embd, n_expert_used, n_tokens]
         cb(mc_down, "ffn_moe_cache_down", il);
+        mc_set_skip(mc_down);
 
         // merge: each routed expert is computed on exactly one side, so the sum
         // is the exact host-only result (up to fp rounding on the cached side)
