@@ -1852,9 +1852,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 if (n_prefix > 0) {
-                    GGML_LOG_DEBUG("%s: early launch of %d nodes at split %d (%s)\n",
-                            __func__, n_prefix, split_id + 1, next->graph.nodes[0]->name);
-
                     struct ggml_cgraph gv = ggml_graph_view(&next->graph, 0, n_prefix);
                     const enum ggml_status ec = ggml_backend_graph_compute_async(sched->backends[next_backend_id], &gv);
                     if (ec != GGML_STATUS_SUCCESS) {
