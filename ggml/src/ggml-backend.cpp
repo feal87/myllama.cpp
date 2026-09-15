@@ -21,6 +21,7 @@
 #include <string.h>
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef __APPLE__
@@ -1653,6 +1654,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // a split on the blocking CPU backend leaves the GPU idle for its whole duration.
+    // launch the leading nodes of the next split that do not depend on this split's
+    // outputs before blocking, so the two overlap. for MoE this prefix is the
+    // VRAM-resident expert chain, which is independent of the host expert chain.
+    std::vector<int> launched(sched->n_splits, 0);
+    std::unordered_set<const ggml_tensor *> computed;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -1795,6 +1803,68 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // early launch: start the next split's independent prefix while this split blocks
+        if (!sched->callback_eval && split_backend_id == sched->n_backends - 1 &&
+                split_id + 1 < sched->n_splits) {
+            struct ggml_backend_sched_split * next = &splits[split_id + 1];
+            const int next_backend_id = next->backend_id;
+
+            if (next_backend_id != split_backend_id) {
+                // tensors this split produces, and the next split's pending inputs, are not ready
+                std::unordered_set<const ggml_tensor *> blocked;
+                for (int j = 0; j < split->graph.n_nodes; j++) {
+                    blocked.insert(split->graph.nodes[j]);
+                }
+                for (int i = 0; i < next->n_inputs; i++) {
+                    blocked.insert(tensor_copy(next->inputs[i], next_backend_id, sched->cur_copy));
+                }
+
+                std::unordered_set<const ggml_tensor *> prefix;
+                int n_prefix = 0;
+                for (; n_prefix < next->graph.n_nodes; n_prefix++) {
+                    const ggml_tensor * node = next->graph.nodes[n_prefix];
+
+                    bool ready = true;
+                    for (int s = 0; s < GGML_MAX_SRC && ready; s++) {
+                        const ggml_tensor * src = node->src[s];
+                        if (src == nullptr) {
+                            continue;
+                        }
+                        const ggml_tensor * base = src->view_src ? src->view_src : src;
+
+                        // depends on a tensor this split does not have yet
+                        if (blocked.count(src) || blocked.count(base)) {
+                            ready = false;
+                        } else if (src->op == GGML_OP_NONE) {
+                            // weights and already copied inputs are leaves
+                        } else if (computed.count(src) || computed.count(base) ||
+                                   prefix.count(src) || prefix.count(base)) {
+                            // produced earlier, or by this prefix
+                        } else {
+                            ready = false;
+                        }
+                    }
+
+                    if (!ready) {
+                        break;
+                    }
+                    prefix.insert(node);
+                }
+
+                if (n_prefix > 0) {
+                    GGML_LOG_DEBUG("%s: early launch of %d nodes at split %d (%s)\n",
+                            __func__, n_prefix, split_id + 1, next->graph.nodes[0]->name);
+
+                    struct ggml_cgraph gv = ggml_graph_view(&next->graph, 0, n_prefix);
+                    const enum ggml_status ec = ggml_backend_graph_compute_async(sched->backends[next_backend_id], &gv);
+                    if (ec != GGML_STATUS_SUCCESS) {
+                        return ec;
+                    }
+                    launched[split_id + 1] = n_prefix;
+                }
+            }
+        }
+
         // host-side preparation of the nodes, after their inputs were copied to the
         // split backend: used to stage MoE experts for host-resident weights
         if (sched->callback_node_prepare) {
@@ -1804,9 +1874,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (!sched->callback_eval) {
-            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
-            if (ec != GGML_STATUS_SUCCESS) {
-                return ec;
+            // the leading nodes may already have been launched while a previous split was blocking
+            struct ggml_cgraph gv = ggml_graph_view(&split->graph, launched[split_id], split->graph.n_nodes);
+            if (gv.n_nodes > 0) {
+                enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
+                if (ec != GGML_STATUS_SUCCESS) {
+                    return ec;
+                }
             }
         } else {
             // similar to ggml_backend_compare_graph_backend
@@ -1845,6 +1919,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+        }
+
+        for (int j = 0; j < split->graph.n_nodes; j++) {
+            computed.insert(split->graph.nodes[j]);
         }
 
         prev_backend_id = split_backend_id;
