@@ -195,8 +195,8 @@ class llama_moe_cache {
     // per-expert 0/1 residency table (n_expert bytes), or null when the layer
     // has no device cache. The RAM tier uses it to skip double-covering
     // residents and to feed this cache's decode-time hit/miss stats (see
-    // vram_stats). The pointer is read in place, so the observation does not
-    // copy the table once per layer per token.
+    // vram_stats_snapshot). The pointer is read in place, so the observation does
+    // not copy the table once per layer per token.
     static const uint8_t * vram_resident_cb(void * ud, int il);
 
   private:

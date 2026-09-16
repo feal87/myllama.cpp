@@ -373,22 +373,34 @@ struct llama_model_qwen4exp::ple_direct_reader {
         if (cache_bytes == 0) {
             return;
         }
-        std::lock_guard<std::mutex> lock(cache.mu);
-        const uint64_t look   = cache.n_hits + cache.n_miss;
-        const uint64_t d_hit  = cache.n_hits - cache.prev_hits;
-        const uint64_t d_look = d_hit + (cache.n_miss - cache.prev_miss);
-        const uint64_t d_evict = cache.n_evict - cache.prev_evict;
+        // gather under the lock, log after unlocking: the console write is
+        // synchronous on Windows and must not block the gather worker
+        uint64_t look = 0, d_hit = 0, d_look = 0, d_evict = 0;
+        uint64_t n_hits = 0, n_evict = 0;
+        uint32_t n_live = 0, n_slots = 0;
+        size_t   n_payload = 0;
+        {
+            std::lock_guard<std::mutex> lock(cache.mu);
+            n_hits  = cache.n_hits;
+            n_evict = cache.n_evict;
+            look    = n_hits + cache.n_miss;
+            d_hit   = n_hits - cache.prev_hits;
+            d_look  = d_hit + (cache.n_miss - cache.prev_miss);
+            d_evict = n_evict - cache.prev_evict;
+            n_live    = cache.live();
+            n_slots   = cache.n_slots;
+            n_payload = cache.payload_bytes();
+            cache.prev_hits  = n_hits;
+            cache.prev_miss  = cache.n_miss;
+            cache.prev_evict = n_evict;
+        }
 
         LLAMA_LOG_INFO("[ple-cache] hit=%.1f%% (%" PRIu64 "/%" PRIu64 " rows)"
                        " | slots=%u/%u live (%.1f MiB payload) | evictions=%" PRIu64 "\n",
-                       look ? 100.0 * cache.n_hits / look : 0.0, cache.n_hits, look,
-                       cache.live(), cache.n_slots, cache.payload_bytes() / (1024.0 * 1024.0), cache.n_evict);
+                       look ? 100.0 * n_hits / look : 0.0, n_hits, look,
+                       n_live, n_slots, n_payload / (1024.0 * 1024.0), n_evict);
         LLAMA_LOG_INFO("[ple-cache] delta hit=%.1f%% (%" PRIu64 "/%" PRIu64 " rows) | evictions=%" PRIu64 "\n",
                        d_look ? 100.0 * (double) d_hit / (double) d_look : 0.0, d_hit, d_look, d_evict);
-
-        cache.prev_hits  = cache.n_hits;
-        cache.prev_miss  = cache.n_miss;
-        cache.prev_evict = cache.n_evict;
     }
 
     // fill dst with the n gathered rows, dequantized to F32:

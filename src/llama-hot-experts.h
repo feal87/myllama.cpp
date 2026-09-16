@@ -193,16 +193,14 @@ class llama_hot_expert_cache {
     using vram_query_fn = const uint8_t * (*)(void * ud, int il);
     void set_vram_query(vram_query_fn fn, void * ud);
 
-    // decode-time VRAM-tier hit/miss counters of one layer: a routed expert is a
-    // hit when its device copy served it (the host read was skipped), a miss when
-    // it was routed to the host experts. Kept by the shared observation while the
-    // VRAM tier is active; read by its stats report (both are 0 while inactive).
-    void vram_stats(int il, uint64_t & n_hit, uint64_t & n_miss) const;
-
-    // decode-time host-path routed counters: every observed route the VRAM tier
-    // did not serve. The VRAM tier's true denominator is its own hits plus these,
-    // so routes seen before the tier activated still count as misses
-    void route_stats(uint64_t & n_hit, uint64_t & n_miss) const;
+    // decode-time VRAM-tier hit/miss per layer plus the host-path routed counters:
+    // a routed expert is a VRAM hit when its device copy served it (the host read
+    // was skipped), and every non-served route counts as a host-path hit/miss.
+    // vram_hit/vram_miss are resized to the layer count and indexed by layer id,
+    // so the stats report takes one lock instead of one per layer
+    void vram_stats_snapshot(std::vector<uint64_t> & vram_hit,
+                             std::vector<uint64_t> & vram_miss,
+                             uint64_t & route_hit, uint64_t & route_miss) const;
 
     // an expert just became VRAM-resident: drop its RAM mlock (the VRAM copy
     // serves it; the mlock would only waste a RAM slot for a deeper expert)
@@ -275,6 +273,9 @@ class llama_hot_expert_cache {
         std::unique_ptr<llama_mlock, mlock_deleter> down_lock;
         std::unique_ptr<llama_mlock, mlock_deleter> gate_up_lock;
         size_t                                      nbytes_locked = 0;
+        // stats report stamp: differs from stats_stamp when the expert arrived
+        // after the previous report (see print_stats)
+        uint32_t                                    seen_stamp = 0;
     };
 
     struct layer_state {
@@ -300,7 +301,7 @@ class llama_hot_expert_cache {
         // path never touches the hash containers
         std::vector<uint8_t> pin_state;
 
-        // decode-time VRAM-tier hit/miss of this layer (see vram_stats()); updated
+        // decode-time VRAM-tier hit/miss of this layer (see vram_stats_snapshot()); updated
         // by observe() only while the VRAM tier serves this layer
         uint64_t n_vram_hit  = 0;
         uint64_t n_vram_miss = 0;
@@ -399,7 +400,7 @@ class llama_hot_expert_cache {
     uint64_t count_of(int il, int32_t expert_id) const;
 
     // rebuild pinned_rank from the current counts (caller holds mu). Called at
-    // decay boundaries and in the stats report: updating one ordered-set key per
+    // decay boundaries and on a new prompt: updating one ordered-set key per
     // routed selection was pure churn on the decode thread, so the keys are
     // refreshed lazily instead; eviction decisions only heal the cold end of
     // the set (see try_promote) rather than rebuilding it
@@ -533,9 +534,10 @@ class llama_hot_expert_cache {
     std::vector<int>                                               layer_pool; // layer -> pool, -1 when not cached
     int                                                            n_pools = 1;
     std::unordered_map<expert_key, pinned_expert, expert_key_hash> pinned;
-    // pinned set at the previous stats report; diffed against the current one to
-    // measure the list churn (expert replaced since the last report)
-    std::unordered_set<expert_key, expert_key_hash> pinned_prev;
+    // stats report stamp: bumped once per print_stats(). A pinned expert whose
+    // seen_stamp differs from stats_stamp arrived after the previous report, which
+    // is what the churn percentage measures
+    uint32_t stats_stamp = 1;
     // decode-token time of the last takeover eviction of each expert (see the
     // evict_grace_tokens constant): a freshly evicted expert is refused a slot
     // until its grace expires, so it cannot immediately re-take the slot it

@@ -147,54 +147,84 @@ llama_hot_expert_cache::~llama_hot_expert_cache() {
 }
 
 void llama_hot_expert_cache::print_stats() {
-    std::lock_guard<std::mutex> lock(mu);
+    // gather everything under mu, then log after unlocking: console writes are
+    // synchronous on Windows and must not stall the pin worker or a VRAM takeover
+    size_t   total_distinct_seen = 0;
+    size_t   total_pinned        = 0;
+    size_t   n_new               = 0;
+    size_t   n_base_ram          = 0;
+    uint64_t routed_hit          = 0;
+    uint64_t routed_total        = 0;
+    uint64_t min_count           = 0;
+    uint64_t max_count           = 0;
+    bool     any_rank            = false;
+    uint64_t bytes_locked        = 0;
+    uint64_t lock_calls          = 0;
+    uint64_t lock_slow           = 0;
+    uint64_t pin_failures        = 0;
+    uint64_t eval_calls          = 0;
+    uint64_t ubatches            = 0;
+    uint64_t prefetch_calls      = 0;
+    uint64_t prefetch_bytes      = 0;
+    uint64_t prefetch_failures   = 0;
+    uint64_t decays              = 0;
+    uint64_t hysteresis_holds    = 0;
+    uint64_t min_count_holds     = 0;
 
-    // rank keys are refreshed lazily; make the reported count range exact
-    rebuild_pinned_rank();
+    // one slot per layer, filled under mu and read after
+    std::vector<size_t> per_layer(layers.size(), 0);
 
-    const size_t   total_distinct_seen = (size_t) n_distinct;
-    const size_t   total_pinned        = pinned.size();
-    const uint64_t total_routed        = n_route_hit + n_route_miss;
+    {
+        std::lock_guard<std::mutex> lock(mu);
 
-    // RAM occupancy: pinned holds every resident, base included. Base entries are
-    // permanent (never churn), so churn is measured over the dynamic ones only
-    size_t n_base_ram = 0;
-    size_t n_new      = 0;
-    for (const auto & [key, pe] : pinned) {
-        const layer_state * ls   = layer_of(key.layer);
-        const bool          base = ls != nullptr && key.expert_id >= 0 && (uint32_t) key.expert_id < ls->n_experts &&
-                                   (ls->pin_state[(size_t) key.expert_id] & PIN_BASE) != 0;
-        if (base) {
-            n_base_ram++;
-            continue;
+        total_distinct_seen = (size_t) n_distinct;
+        total_pinned        = pinned.size();
+        routed_hit          = n_route_hit;
+        routed_total        = n_route_hit + n_route_miss;
+        bytes_locked        = n_bytes_locked;
+        lock_calls          = n_lock_calls;
+        lock_slow           = n_lock_slow;
+        pin_failures        = n_pin_failures;
+        eval_calls          = n_eval_calls;
+        ubatches            = n_ubatches;
+        prefetch_calls      = n_prefetch_calls;
+        prefetch_bytes      = n_prefetch_bytes;
+        prefetch_failures   = n_prefetch_failures;
+        decays              = n_decays;
+        hysteresis_holds    = n_hysteresis_holds;
+        min_count_holds     = n_min_count_holds;
+
+        // RAM occupancy: pinned holds every resident, base included. Base entries
+        // are permanent (never churn), so churn and the count range cover the
+        // dynamic ones only. The range is read from the counts directly, so the
+        // report no longer rebuilds the eviction rank just to make it exact
+        const uint32_t last_stamp = stats_stamp;
+        const uint32_t next_stamp = last_stamp + 1;
+        min_count = UINT64_MAX;
+        for (auto & [key, pe] : pinned) {
+            const layer_state * ls   = layer_of(key.layer);
+            const bool          base = ls != nullptr && key.expert_id >= 0 && (uint32_t) key.expert_id < ls->n_experts &&
+                                       (ls->pin_state[(size_t) key.expert_id] & PIN_BASE) != 0;
+            if (key.layer >= 0 && key.layer < (int) per_layer.size()) {
+                per_layer[(size_t) key.layer]++;
+            }
+            if (base) {
+                n_base_ram++;
+                continue;
+            }
+            if (pe.seen_stamp != last_stamp) {
+                n_new++;  // arrived since the previous report
+            }
+            pe.seen_stamp = next_stamp;
+            const uint64_t c = count_of(key.layer, key.expert_id);
+            any_rank  = true;
+            min_count = std::min(min_count, c);
+            max_count = std::max(max_count, c);
         }
-        if (pinned_prev.find(key) == pinned_prev.end()) {
-            n_new++;
-        }
+        stats_stamp = next_stamp;
     }
+
     const size_t n_dynamic = total_pinned - n_base_ram;
-    pinned_prev.clear();
-    for (const auto & [key, pe] : pinned) {
-        pinned_prev.insert(key);
-    }
-
-    // Per-layer breakdown of pinned experts
-    std::unordered_map<int, size_t> pinned_per_layer;
-    for (const auto & [key, pe] : pinned) {
-        pinned_per_layer[key.layer]++;
-    }
-
-    uint64_t global_coldest_count = UINT64_MAX;
-    uint64_t global_hottest_count = 0;
-    bool     any_rank = false;
-    for (const auto & rank : pinned_rank_pool) {
-        if (rank.empty()) {
-            continue;
-        }
-        any_rank = true;
-        global_coldest_count = std::min(global_coldest_count, std::get<0>(*rank.begin()));
-        global_hottest_count = std::max(global_hottest_count, std::get<0>(*rank.rbegin()));
-    }
 
     LLAMA_LOG_INFO("[pin-hot-experts] RAM tier: residents=%zu/%d slots (dynamic=%zu, base=%zu ram + %d vram, free=%d, %d pool(s))"
                    " | hit=%.1f%% (%" PRIu64 "/%" PRIu64 " routed)"
@@ -203,29 +233,35 @@ void llama_hot_expert_cache::print_stats() {
                    total_pinned, n_pin_total, n_dynamic, n_base_ram,
                    (int) ((int32_t) n_base - (int32_t) n_base_ram),
                    (int) ((int32_t) n_pin_total - (int32_t) total_pinned), n_pools,
-                   total_routed ? 100.0 * n_route_hit / total_routed : 0.0, n_route_hit, total_routed,
+                   routed_total ? 100.0 * routed_hit / routed_total : 0.0, routed_hit, routed_total,
                    n_dynamic ? 100.0 * n_new / n_dynamic : 0.0, n_new, n_dynamic,
-                   n_bytes_locked / (1024.0 * 1024.0), n_lock_calls, n_lock_slow, n_pin_failures);
+                   bytes_locked / (1024.0 * 1024.0), lock_calls, lock_slow, pin_failures);
 
     LLAMA_LOG_CONT(" | obs=%" PRIu64 " ub=%" PRIu64 " | distinct (layer,expert) seen=%zu"
                    " | prefetch calls=%" PRIu64 " bytes=%.2f MiB failures=%" PRIu64
                    " | decays=%" PRIu64 " takeover holds=%" PRIu64 " min-count holds=%" PRIu64,
-                   n_eval_calls, n_ubatches, total_distinct_seen, n_prefetch_calls,
-                   n_prefetch_bytes / (1024.0 * 1024.0), n_prefetch_failures, n_decays, n_hysteresis_holds,
-                   n_min_count_holds);
+                   eval_calls, ubatches, total_distinct_seen, prefetch_calls,
+                   prefetch_bytes / (1024.0 * 1024.0), prefetch_failures, decays, hysteresis_holds,
+                   min_count_holds);
 
     if (any_rank) {
-        LLAMA_LOG_CONT(" | pinned count range=[%" PRIu64 ", %" PRIu64 "]", global_coldest_count, global_hottest_count);
+        LLAMA_LOG_CONT(" | pinned count range=[%" PRIu64 ", %" PRIu64 "]", min_count, max_count);
     }
 
-    if (!pinned_per_layer.empty()) {
+    // per-layer breakdown, already in layer order
+    size_t n_layers_used = 0;
+    for (const size_t c : per_layer) {
+        n_layers_used += c != 0 ? 1 : 0;
+    }
+    if (n_layers_used > 0) {
         LLAMA_LOG_CONT(" | per-layer: {");
-        // Sort by layer index for readable output
-        std::vector<std::pair<int, size_t>> sorted_layers(pinned_per_layer.begin(), pinned_per_layer.end());
-        std::sort(sorted_layers.begin(), sorted_layers.end());
-        for (size_t i = 0; i < sorted_layers.size(); i++) {
-            const auto & [il, cnt] = sorted_layers[i];
-            LLAMA_LOG_CONT("L%d=%zu%s", il, cnt, (i + 1 < sorted_layers.size()) ? ", " : "");
+        size_t shown = 0;
+        for (size_t il = 0; il < per_layer.size(); ++il) {
+            if (per_layer[il] == 0) {
+                continue;
+            }
+            shown++;
+            LLAMA_LOG_CONT("L%zu=%zu%s", il, per_layer[il], shown < n_layers_used ? ", " : "");
         }
         LLAMA_LOG_CONT("}");
     }
@@ -731,11 +767,10 @@ void llama_hot_expert_cache::set_disk_stage(llama_disk_stage * ds) {
         }
     }
 
-    // the base+warm startup fill is not churn: seed the previous set so the
+    // the base+warm startup fill is not churn: stamp the current residents so the
     // first report starts clean
-    pinned_prev.clear();
-    for (const auto & [key, pe] : pinned) {
-        pinned_prev.insert(key);
+    for (auto & [key, pe] : pinned) {
+        pe.seen_stamp = stats_stamp;
     }
 }
 
@@ -1512,24 +1547,19 @@ void llama_hot_expert_cache::set_vram_query(vram_query_fn fn, void * ud) {
     vram_ud    = ud;
 }
 
-void llama_hot_expert_cache::vram_stats(int il, uint64_t & n_hit, uint64_t & n_miss) const {
+void llama_hot_expert_cache::vram_stats_snapshot(std::vector<uint64_t> & vram_hit,
+                                                 std::vector<uint64_t> & vram_miss,
+                                                 uint64_t & route_hit, uint64_t & route_miss) const {
     std::lock_guard<std::mutex> lock(mu);
 
-    const layer_state * ls = layer_of(il);
-    if (ls == nullptr) {
-        n_hit  = 0;
-        n_miss = 0;
-        return;
+    vram_hit.assign(layers.size(), 0);
+    vram_miss.assign(layers.size(), 0);
+    for (size_t il = 0; il < layers.size(); ++il) {
+        vram_hit[il]  = layers[il].n_vram_hit;
+        vram_miss[il] = layers[il].n_vram_miss;
     }
-    n_hit  = ls->n_vram_hit;
-    n_miss = ls->n_vram_miss;
-}
-
-void llama_hot_expert_cache::route_stats(uint64_t & n_hit, uint64_t & n_miss) const {
-    std::lock_guard<std::mutex> lock(mu);
-
-    n_hit  = n_route_hit;
-    n_miss = n_route_miss;
+    route_hit  = n_route_hit;
+    route_miss = n_route_miss;
 }
 
 uint64_t llama_hot_expert_cache::content_tokens() const {
