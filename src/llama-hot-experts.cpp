@@ -170,6 +170,11 @@ void llama_hot_expert_cache::print_stats() {
     uint64_t decays              = 0;
     uint64_t hysteresis_holds    = 0;
     uint64_t min_count_holds     = 0;
+    uint64_t route_base          = 0;
+    uint64_t route_total         = 0;
+    uint64_t prev_base           = 0;
+    uint64_t prev_total          = 0;
+    size_t   n_base_used         = 0;
 
     // one slot per layer, filled under mu and read after
     std::vector<size_t> per_layer(layers.size(), 0);
@@ -193,6 +198,10 @@ void llama_hot_expert_cache::print_stats() {
         decays              = n_decays;
         hysteresis_holds    = n_hysteresis_holds;
         min_count_holds     = n_min_count_holds;
+        route_base          = n_route_base;
+        route_total         = n_route_total;
+        prev_base           = prev_route_base;
+        prev_total          = prev_route_total;
 
         // RAM occupancy: pinned holds every resident, base included. Base entries
         // are permanent (never churn), so churn and the count range cover the
@@ -221,6 +230,23 @@ void llama_hot_expert_cache::print_stats() {
             min_count = std::min(min_count, c);
             max_count = std::max(max_count, c);
         }
+
+        // base utilization: base experts routed at least once since startup (the
+        // count floors at 1 once set, so counts[id] == 0 means never routed)
+        for (size_t il = 0; il < layers.size(); ++il) {
+            const layer_state & ls = layers[il];
+            if (!ls.resolved_tensors) {
+                continue;
+            }
+            for (uint32_t id = 0; id < ls.n_experts; ++id) {
+                if ((ls.pin_state[(size_t) id] & PIN_BASE) != 0 && ls.counts[(size_t) id] > 0) {
+                    n_base_used++;
+                }
+            }
+        }
+
+        prev_route_base  = n_route_base;
+        prev_route_total = n_route_total;
         stats_stamp = next_stamp;
     }
 
@@ -246,6 +272,19 @@ void llama_hot_expert_cache::print_stats() {
 
     if (any_rank) {
         LLAMA_LOG_CONT(" | pinned count range=[%" PRIu64 ", %" PRIu64 "]", min_count, max_count);
+    }
+
+    // base set feedback: how much of the decode routing the base experts serve and
+    // how many of them were ever routed (a large gap to n_base means dead weight)
+    if (n_base > 0) {
+        const uint64_t d_base  = route_base  - prev_base;
+        const uint64_t d_total = route_total - prev_total;
+        LLAMA_LOG_CONT(" | base: routed=%.1f%% (cum %" PRIu64 "/%" PRIu64 ")"
+                       " | interval=%.1f%% (%" PRIu64 "/%" PRIu64 ")"
+                       " | used=%zu/%d",
+                       route_total ? 100.0 * route_base / route_total : 0.0, route_base, route_total,
+                       d_total ? 100.0 * d_base / d_total : 0.0, d_base, d_total,
+                       n_base_used, (int) n_base);
     }
 
     // per-layer breakdown, already in layer order
@@ -609,6 +648,12 @@ void llama_hot_expert_cache::observe_decode_finish() {
             const int32_t id = ids[k];
             if (id < 0 || id >= n_experts) {
                 continue;
+            }
+            // base set telemetry: the base flag survives a VRAM takeover, so a
+            // route to a base expert is counted wherever it is served from
+            n_route_total++;
+            if ((pin_state[id] & PIN_BASE) != 0) {
+                n_route_base++;
             }
             const bool served = vram_flags != nullptr && vram_flags[(size_t) id] != 0;
             if (served) {

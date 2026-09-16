@@ -560,6 +560,11 @@ class llama_hot_expert_cache {
     uint64_t n_content_tokens    = 0;  // decode tokens observed (see content_tokens())
     uint64_t n_route_hit         = 0;  // routed expert selections served by the pinned (RAM) tier
     uint64_t n_route_miss        = 0;  // routed selections not pinned (VRAM-served experts are skipped)
+    uint64_t n_route_base        = 0;  // routed selections whose expert is in the base set
+    uint64_t n_route_total       = 0;  // all routed selections observed on decode
+    // previous report's route counters, for the interval base share
+    uint64_t prev_route_base     = 0;
+    uint64_t prev_route_total    = 0;
 
     // VRAM-tier residency query (see the public API docs); guarded by mu
     vram_query_fn vram_query = nullptr;
