@@ -150,6 +150,7 @@ llama_context::llama_context(
     cparams.n_experts_stats_interval = params.n_experts_stats_interval;
     cparams.n_pin_hot_experts_decay_tokens   = params.n_pin_hot_experts_decay_tokens;
     cparams.n_pin_hot_experts_min_count      = params.n_pin_hot_experts_min_count;
+    cparams.expert_profile_path              = params.expert_profile_path;
 
     cparams.n_moe_cache_budget_bytes = params.n_moe_cache_budget_bytes;
     cparams.n_moe_cache_inserts      = params.n_moe_cache_inserts;
@@ -194,13 +195,14 @@ llama_context::llama_context(
     // decode ubatches feed the hot-expert ranking whenever pinning, the VRAM MoE
     // tier or the disk decode cache can consume it (matches the track_rank the
     // engine was built with)
-    hot_observe_decode = cparams.n_pin_hot_experts > 0 || moe_requested || disk_active;
+    hot_observe_decode = cparams.n_pin_hot_experts > 0 || moe_requested || disk_active || cparams.expert_profile_path != nullptr;
 
     const bool hot_experts_requested =
         cparams.n_pin_hot_experts > 0 ||
         moe_requested ||
         cparams.hot_experts_prefetch ||
-        disk_active;
+        disk_active ||
+        cparams.expert_profile_path != nullptr;
 
     if (hot_experts_requested) {
         if (cparams.cb_eval != nullptr) {
@@ -218,8 +220,8 @@ llama_context::llama_context(
                 model, n_pin_effective, cparams.n_pin_hot_experts_budget_bytes,
                 cparams.n_pin_hot_experts_decay_tokens, cparams.n_pin_hot_experts_min_count,
                 cparams.hot_experts_prefetch,
-                cparams.n_pin_hot_experts > 0 || moe_requested || disk_active,
-                disk_active);
+                cparams.n_pin_hot_experts > 0 || moe_requested || disk_active || cparams.expert_profile_path != nullptr,
+                disk_active, cparams.expert_profile_path);
             cparams.cb_eval           = llama_hot_expert_cache::eval_callback;
             cparams.cb_eval_user_data = hot_experts.get();
         }
@@ -4109,6 +4111,7 @@ llama_context_params llama_context_default_params() {
         /*.n_experts_stats_interval     =*/ 5,
         /*.n_pin_hot_experts_decay_tokens=*/ 0,
         /*.n_pin_hot_experts_min_count   =*/ 8,
+        /*.expert_profile_path           =*/ nullptr,
         /*.n_moe_cache_budget_bytes    =*/ 0,
         /*.n_moe_cache_inserts         =*/ 2,
         /*.type_k                      =*/ GGML_TYPE_F16,

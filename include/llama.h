@@ -438,6 +438,9 @@ extern "C" {
         // window (shorter window, lower counts -> lower floor).
         uint64_t n_pin_hot_experts_min_count;
 
+        // decode-only MoE routing profile output in JSONL format (nullptr = disabled)
+        const char * expert_profile_path;
+
         // GPU-resident cache for host-offloaded MoE expert weights, VRAM tier on
         // top of the hot-expert cache (--pin-hot-experts). Decode on a
         // host-offloaded MoE layer is host-RAM-bandwidth bound; this serves the

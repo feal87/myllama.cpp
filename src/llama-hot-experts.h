@@ -72,6 +72,7 @@
 #include "llama-mmap.h"
 
 #include <condition_variable>
+#include <cstdio>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -117,7 +118,8 @@ class llama_hot_expert_cache {
                            uint64_t            min_pin_count,
                            bool                prefetch_enabled,
                            bool                track_rank,
-                           bool                disk_mode);
+                           bool                disk_mode,
+                           const char *        profile_path);
     ~llama_hot_expert_cache();
 
     llama_hot_expert_cache(const llama_hot_expert_cache &)             = delete;
@@ -284,6 +286,8 @@ class llama_hot_expert_cache {
         uint32_t n_experts = 0;
         // per-expert usage count, indexed by expert id (hot path of the ranking)
         std::vector<uint64_t> counts;
+        // non-decaying decode-only counts for the optional profile export
+        std::vector<uint64_t> profile_counts;
         // per-expert pin bookkeeping mirror, indexed by expert id: bit 0 =
         // mlock'd resident (pinned map), bit 1 = pin job queued/in flight
         // (pin_inflight set). Mirrors are updated at the same funnel points as
@@ -436,6 +440,9 @@ class llama_hot_expert_cache {
     // halve all usage counts (and the rank keys of the pinned entries)
     void decay_counts();
 
+    // write and reset the current decode profile
+    void write_profile();
+
     const llama_model & model;
 
     const int32_t  n_pin;            // N experts per layer
@@ -447,6 +454,10 @@ class llama_hot_expert_cache {
     const bool     prefetch_enabled; // read-ahead routed-but-unpinned expert rows (--hot-experts-prefetch)
     llama_disk_stage * disk_stage = nullptr; // direct-read staging of the routed experts (null when disabled)
     const bool     track_rank;       // rank feeds pinning/VRAM tier; false = prefetch-only mode
+    std::FILE *    profile_file = nullptr;
+    uint64_t       profile_id = 0;
+    uint64_t       profile_tokens = 0;
+    uint64_t       profile_routes = 0;
     uint64_t       n_tokens_seen = 0;  // tokens since the last decay
     int64_t        n_tokens_cur  = 0;  // tokens of the ubatch being computed (ask-phase gate)
     // per-observation scratch, reused instead of per-call allocation: observation

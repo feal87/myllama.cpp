@@ -502,6 +502,8 @@ struct common_params {
     // short decay, up when decay is disabled (lifetime counts). See
     // --pin-hot-experts-min-count.
     uint64_t n_pin_hot_experts_min_count = 8;
+    // decode-only MoE routing profile output in JSONL format (empty = disabled)
+    std::string expert_profile;
     // batch/prefill read-ahead (madvise WILLNEED / PrefetchVirtualMemory) of the
     // MoE experts that were just routed but are neither pinned nor served from
     // VRAM. Multi-token ubatches only: single-token decode is skipped (it reads

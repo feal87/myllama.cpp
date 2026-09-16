@@ -9,6 +9,7 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -20,7 +21,8 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
                                                uint64_t            min_pin_count,
                                                bool                prefetch_enabled,
                                                bool                track_rank,
-                                               bool                disk_mode) :
+                                               bool                disk_mode,
+                                               const char *        profile_path) :
     model(model),
     n_pin(n_pin_experts),
     budget_bytes(budget_bytes),
@@ -40,6 +42,15 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
     n_pinned_layer.assign((size_t) model.hparams.n_layer(), 0);
     layers.resize((size_t) model.hparams.n_layer());
     pinned_rank_pool.resize((size_t) n_pools);
+
+    if (profile_path != nullptr && profile_path[0] != '\0') {
+        profile_file = std::fopen(profile_path, "ab");
+        if (profile_file == nullptr) {
+            LLAMA_LOG_WARN("%s: failed to open expert profile '%s', profiling disabled\n", __func__, profile_path);
+        } else {
+            LLAMA_LOG_INFO("%s: writing decode-only expert profiles to %s\n", __func__, profile_path);
+        }
+    }
 
     if (n_moe_layers == 0) {
         if (n_pin > 0) {
@@ -109,6 +120,12 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
 llama_hot_expert_cache::~llama_hot_expert_cache() {
     if (n_pin > 0 || prefetch_enabled) {
         print_stats();
+    }
+    if (profile_file != nullptr) {
+        std::lock_guard<std::mutex> lock(mu);
+        write_profile();
+        std::fclose(profile_file);
+        profile_file = nullptr;
     }
 
     // stop the pin worker and drain whatever is queued (pending jobs are simply
@@ -416,7 +433,7 @@ void llama_hot_expert_cache::observe_decode_begin(const std::vector<ggml_tensor 
                 resolve_tensors(il, ls);
             }
         }
-        if (!ls.tensors_are_host) {
+        if (!ls.tensors_are_host && profile_file == nullptr) {
             continue;  // experts offloaded to a device: nothing to count or pin
         }
 
@@ -539,6 +556,7 @@ void llama_hot_expert_cache::observe_decode_finish() {
         // flat per-expert tables, indexed by routed expert id
         const int   n_experts = (int) ls.n_experts;
         uint64_t *  counts    = ls.counts.data();
+        uint64_t *  profile_counts = profile_file != nullptr ? ls.profile_counts.data() : nullptr;
         uint8_t *   pin_state = ls.pin_state.data();
 
         for (int k = 0; k < n_ids; ++k) {
@@ -568,6 +586,10 @@ void llama_hot_expert_cache::observe_decode_finish() {
                 n_distinct++;  // first route of this (layer, expert)
             }
             c++;
+            if (profile_counts != nullptr) {
+                profile_counts[id]++;
+                profile_routes++;
+            }
             if (!served) {
                 // try_promote() returns immediately for VRAM-resident experts, so
                 // skipping the call here is behaviour-identical and keeps the
@@ -606,6 +628,9 @@ void llama_hot_expert_cache::resolve_tensors(int il, layer_state & ls) {
     // expert ids are validated against this range on the hot path
     ls.n_experts = (uint32_t) repr->ne[2];
     ls.counts.assign(ls.n_experts, 0);
+    if (profile_file != nullptr) {
+        ls.profile_counts.assign(ls.n_experts, 0);
+    }
     ls.pin_state.assign(ls.n_experts, 0);
 
     if (!ls.tensors_are_host) {
@@ -1172,6 +1197,10 @@ void llama_hot_expert_cache::on_ubatch_begin(int64_t n_tokens) {
         return;
     }
 
+    if (profile_file != nullptr) {
+        profile_tokens++;
+    }
+
     n_content_tokens++;
 
     // periodic decay of the usage counts: keeps the pin set tracking the recent
@@ -1209,15 +1238,70 @@ void llama_hot_expert_cache::decay_counts() {
     n_decays++;
 }
 
+void llama_hot_expert_cache::write_profile() {
+    if (profile_file == nullptr || profile_routes == 0) {
+        return;
+    }
+
+    std::fprintf(profile_file,
+                 "{\"schema\":\"llama.expert_profile.v1\",\"profile_id\":%" PRIu64
+                 ",\"scope\":\"decode\",\"model_arch\":\"%s\",\"n_layers\":%" PRId64
+                 ",\"n_experts\":%" PRId64 ",\"n_experts_used\":%" PRId64
+                 ",\"decode_tokens\":%" PRIu64 ",\"route_selections\":%" PRIu64 ",\"layers\":[",
+                 profile_id++, model.arch_name().c_str(), (int64_t) model.hparams.n_layer(),
+                 (int64_t) model.hparams.n_expert, (int64_t) model.hparams.n_expert_used(),
+                 profile_tokens, profile_routes);
+
+    bool first_layer = true;
+    for (size_t il = 0; il < layers.size(); ++il) {
+        const auto & counts = layers[il].profile_counts;
+        bool has_counts = false;
+        for (uint64_t count : counts) {
+            if (count != 0) {
+                has_counts = true;
+                break;
+            }
+        }
+        if (!has_counts) {
+            continue;
+        }
+
+        std::fprintf(profile_file, "%s{\"layer\":%zu,\"experts\":[", first_layer ? "" : ",", il);
+        first_layer = false;
+        bool first_expert = true;
+        for (size_t expert = 0; expert < counts.size(); ++expert) {
+            if (counts[expert] == 0) {
+                continue;
+            }
+            std::fprintf(profile_file, "%s{\"expert\":%zu,\"count\":%" PRIu64 "}",
+                         first_expert ? "" : ",", expert, counts[expert]);
+            first_expert = false;
+        }
+        std::fputs("]}", profile_file);
+    }
+    std::fputs("]}\n", profile_file);
+    std::fflush(profile_file);
+
+    for (auto & layer : layers) {
+        std::fill(layer.profile_counts.begin(), layer.profile_counts.end(), 0);
+    }
+    profile_tokens = 0;
+    profile_routes = 0;
+}
+
 void llama_hot_expert_cache::on_prompt_begin() {
     std::lock_guard<std::mutex> lock(mu);
+
+    if (profile_file != nullptr) {
+        write_profile();
+    }
 
     if (!track_rank) {
         return;  // prefetch-only mode: no usage counts are maintained
     }
 
     // A new prompt defines new routing priorities (its decode ubatches start
-    // feeding the ranking right after this): divide every usage count by four
+    // feeding the ranking right after this): divide every usage count by two
     // immediately (same floor-at-1 rounding as the periodic halving), so the
     // pin/VRAM sets can re-converge on the new prompt's expert mix instead of
     // letting the previous prompt's lifetime leaders hold their slots.

@@ -2959,6 +2959,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PIN_HOTEXPERTS_MIN_COUNT"));
     add_opt(common_arg(
+        {"--expert-profile"}, "FILE",
+        "write decode-only MoE expert usage profiles as JSONL (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.expert_profile = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--hot-experts-prefetch"},
         {"--no-hot-experts-prefetch"},
         string_format(
