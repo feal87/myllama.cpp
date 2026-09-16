@@ -151,6 +151,8 @@ llama_context::llama_context(
     cparams.n_pin_hot_experts_decay_tokens   = params.n_pin_hot_experts_decay_tokens;
     cparams.n_pin_hot_experts_min_count      = params.n_pin_hot_experts_min_count;
     cparams.expert_profile_path              = params.expert_profile_path;
+    cparams.pin_experts_from_profile_path    = params.pin_experts_from_profile_path;
+    cparams.warm_experts_from_profile_path   = params.warm_experts_from_profile_path;
 
     cparams.n_moe_cache_budget_bytes = params.n_moe_cache_budget_bytes;
     cparams.n_moe_cache_inserts      = params.n_moe_cache_inserts;
@@ -184,11 +186,23 @@ llama_context::llama_context(
         }
         auto stage = std::make_unique<llama_disk_stage>(model, stage_dev,
                 cparams.n_pin_hot_experts, cparams.n_pin_hot_experts_budget_bytes,
-                cparams.n_pin_hot_experts_pool_layers);
+                cparams.n_pin_hot_experts_pool_layers,
+                cparams.pin_experts_from_profile_path, cparams.warm_experts_from_profile_path);
         if (stage->is_active()) {
             disk_stage = std::move(stage);
         }
     }
+
+    // the base/warm expert sets only make sense with the disk decode cache; a
+    // silent no-op would defeat the purpose, so refuse to start
+    const auto require_disk = [&](const char * path, const char * flag) {
+        if (path != nullptr && path[0] != '\0' && disk_stage == nullptr) {
+            throw std::runtime_error(std::string(flag) +
+                    " requires the disk decode cache (--load-mode dio on Windows)");
+        }
+    };
+    require_disk(cparams.pin_experts_from_profile_path,  "--pin-experts-from-profile");
+    require_disk(cparams.warm_experts_from_profile_path, "--warm-experts-from-profile");
 
     const bool disk_active = disk_stage != nullptr;
 
@@ -1617,9 +1631,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     // feed the hot-expert cache at the ubatch boundary: advance its ubatch
-    // counter and decay the usage counts (no-op when pinning is disabled)
+    // counter and decay the usage counts (no-op when pinning is disabled). A
+    // single-token ubatch carries the token sampled on the previous step: hand
+    // it to the expert profile so each record carries its generated output
     if (hot_experts) {
         hot_experts->on_ubatch_begin(ubatch.n_tokens);
+        if (ubatch.n_tokens == 1 && ubatch.token != nullptr) {
+            hot_experts->note_output_token(ubatch.token[0]);
+        }
     }
 
     // The mid-graph eval callback serves two readers: the multi-token
@@ -4112,6 +4131,8 @@ llama_context_params llama_context_default_params() {
         /*.n_pin_hot_experts_decay_tokens=*/ 0,
         /*.n_pin_hot_experts_min_count   =*/ 8,
         /*.expert_profile_path           =*/ nullptr,
+        /*.pin_experts_from_profile_path =*/ nullptr,
+        /*.warm_experts_from_profile_path=*/ nullptr,
         /*.n_moe_cache_budget_bytes    =*/ 0,
         /*.n_moe_cache_inserts         =*/ 2,
         /*.type_k                      =*/ GGML_TYPE_F16,

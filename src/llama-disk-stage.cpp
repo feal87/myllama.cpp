@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <list>
 #include <map>
 #include <mutex>
@@ -43,6 +44,82 @@ static const int64_t disk_stage_sparse_tokens = 32;
 
 static size_t align_up(size_t v, size_t a) {
     return (v + a - 1) & ~(a - 1);
+}
+
+// Parse a base-expert set: a required header, then one "<layer> <expert>" pair
+// per line. Blank lines and '#' comments are skipped. Only the layer range is
+// checked here; the constructor validates stageability and the expert range
+static std::vector<std::vector<int32_t>> disk_stage_parse_expert_set(
+        const std::string & path, int n_layer, const char * what) {
+    std::ifstream in(path);
+    if (!in) {
+        throw std::runtime_error(std::string("disk stage: cannot open ") + what + " '" + path + "'");
+    }
+
+    std::vector<std::vector<int32_t>> base((size_t) n_layer);
+    std::string line;
+    int  lineno      = 0;
+    bool have_header = false;
+
+    const auto fail = [&](const std::string & msg) {
+        throw std::runtime_error("disk stage: " + path + ":" + std::to_string(lineno) + ": " + msg);
+    };
+
+    while (std::getline(in, line)) {
+        lineno++;
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        const char * s = line.c_str();
+        while (*s == ' ' || *s == '\t') {
+            s++;
+        }
+        if (*s == '\0' || *s == '#') {
+            continue;
+        }
+
+        if (!have_header) {
+            if (std::strcmp(s, "llama-expert-base v1") != 0) {
+                fail("expected header 'llama-expert-base v1'");
+            }
+            have_header = true;
+            continue;
+        }
+
+        char *       end  = nullptr;
+        const long   il   = std::strtol(s, &end, 10);
+        if (end == s) {
+            fail("expected '<layer> <expert>'");
+        }
+        char *     end2 = nullptr;
+        const long id   = std::strtol(end, &end2, 10);
+        if (end2 == end) {
+            fail("expected an expert id after the layer");
+        }
+        while (*end2 == ' ' || *end2 == '\t') {
+            end2++;
+        }
+        if (*end2 != '\0') {
+            fail("trailing characters after the expert id");
+        }
+        if (il < 0 || il >= n_layer) {
+            fail("layer " + std::to_string(il) + " out of range [0, " + std::to_string(n_layer) + ")");
+        }
+        if (id < 0 || id > INT32_MAX) {
+            fail("expert " + std::to_string(id) + " out of range");
+        }
+        base[(size_t) il].push_back((int32_t) id);
+    }
+
+    if (!have_header) {
+        throw std::runtime_error(std::string("disk stage: ") + what + " '" + path + "' has no header");
+    }
+
+    for (auto & v : base) {
+        std::sort(v.begin(), v.end());
+        v.erase(std::unique(v.begin(), v.end()), v.end());
+    }
+    return base;
 }
 
 #if defined(_WIN32)
@@ -214,6 +291,7 @@ struct llama_disk_stage::impl {
         std::vector<int32_t> resident_slot;   // expert id -> slot, -1 when not resident
         std::vector<uint8_t> resident_filled; // expert id -> its slot holds this expert's data
         std::vector<uint8_t> vram;            // expert id -> served by the VRAM cache (host chain skips it)
+        std::vector<uint8_t> base;            // expert id -> permanent base resident (never evicted)
         llama_disk_stage_cache_layer pub;     // public view returned by cache_layer()
     };
     ggml_backend_buffer_t cache_buf  = nullptr;
@@ -221,6 +299,13 @@ struct llama_disk_stage::impl {
     std::unique_ptr<llama_mlock> cache_lock; // decode cache held in RAM for the process lifetime
     std::vector<cache_pool>  pools;
     std::vector<cache_layer> cache;
+    // base-expert set from --pin-experts-from-profile: [layer] -> expert ids,
+    // parsed and validated by the constructor, immutable afterwards
+    std::vector<std::vector<int32_t>> base_set;
+    // warm-expert set from --warm-experts-from-profile: candidates (base removed)
+    // and the subset actually read into the cache
+    std::vector<std::vector<int32_t>> warm_set;
+    std::vector<std::vector<int32_t>> warm_loaded;
     std::unordered_map<const ggml_tensor *, int32_t> table_layer; // cache id table -> layer id
     std::mutex   cache_mu;       // guards resident_slot / free_slots and table writes
     std::mutex   io_mu;          // one reaper at a time: the IOCP is shared by all reads
@@ -230,8 +315,9 @@ struct llama_disk_stage::impl {
     // slabs are idle, so they hold the experts the resident cache missed. A miss
     // is read into a pool slot and copied to the transient slot the graph
     // executes from; a later hit copies from the pool instead of reading the
-    // disk. One pool per expert-bundle type (one slab each): a slot stride is
-    // fixed per tensor, and this model mixes Q8_0 and Q5_1 down projections.
+    // disk. One pool per expert-bundle type on one staging slab (a slot stride
+    // is fixed per tensor); spare slabs split a type's layers, so every idle
+    // slab holds slots even for a model with a single layout.
     //
     // SLRU: a miss enters the probation segment, a hit promotes it to the
     // protected segment, and evictions come from the probation LRU, so a
@@ -640,7 +726,8 @@ int llama_disk_stage::pool_id(int il) const {
 
 llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t dev,
                                    int32_t n_pin_experts, uint64_t cache_budget_bytes,
-                                   int32_t pool_layers_max) :
+                                   int32_t pool_layers_max, const char * base_experts_path,
+                                   const char * warm_experts_path) :
     pimpl(std::make_unique<impl>(model)) {
     impl & p = *pimpl;
 
@@ -649,6 +736,8 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     GGML_UNUSED(n_pin_experts);
     GGML_UNUSED(cache_budget_bytes);
     GGML_UNUSED(pool_layers_max);
+    GGML_UNUSED(base_experts_path);
+    GGML_UNUSED(warm_experts_path);
     return;
 #else
     if (!model.has_disk_weights()) {
@@ -713,6 +802,68 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
             src[il].r[role.slot].file     = p.file_for(path);
         }
         src[il].ok = ok;
+    }
+
+    // base-expert set: parse and validate now, so a bad file fails before any
+    // pool is allocated
+    if (base_experts_path != nullptr && base_experts_path[0] != '\0') {
+        p.base_set = disk_stage_parse_expert_set(base_experts_path, n_layer, "base-expert set");
+        int32_t n_base = 0;
+        for (int il = 0; il < n_layer; ++il) {
+            if (p.base_set[(size_t) il].empty()) {
+                continue;
+            }
+            if (!src[il].ok) {
+                throw std::runtime_error("disk stage: base-expert set references layer " + std::to_string(il) +
+                                         ", which is not stageable");
+            }
+            const int32_t n_expert = (int32_t) src[il].t[0]->ne[2];
+            for (const int32_t id : p.base_set[(size_t) il]) {
+                if (id >= n_expert) {
+                    throw std::runtime_error("disk stage: base-expert set references layer " + std::to_string(il) +
+                                             " expert " + std::to_string(id) + ", out of range [0, " +
+                                             std::to_string(n_expert) + ")");
+                }
+            }
+            n_base += (int32_t) p.base_set[(size_t) il].size();
+        }
+        LLAMA_LOG_INFO("%s: base-expert set '%s': %d expert(s) over %d layer(s)\n",
+                       __func__, base_experts_path, n_base, n_layer);
+    }
+
+    // warm-expert set: same format, candidates for the slots the base set leaves
+    // free. Base experts, experts of non-stageable layers and out-of-range ids
+    // are dropped, since the warm fill is best effort
+    if (warm_experts_path != nullptr && warm_experts_path[0] != '\0') {
+        p.warm_set = disk_stage_parse_expert_set(warm_experts_path, n_layer, "warm-expert set");
+        int32_t n_kept    = 0;
+        int32_t n_skipped = 0;
+        for (int il = 0; il < n_layer; ++il) {
+            std::vector<int32_t> & v = p.warm_set[(size_t) il];
+            if (v.empty()) {
+                continue;
+            }
+            if (!src[il].ok) {
+                n_skipped += (int32_t) v.size();
+                v.clear();
+                continue;
+            }
+            const int32_t n_expert = (int32_t) src[il].t[0]->ne[2];
+            const auto &  base     = p.base_set[(size_t) il];
+            std::vector<int32_t> kept;
+            kept.reserve(v.size());
+            for (const int32_t id : v) {
+                if (id < n_expert && !std::binary_search(base.begin(), base.end(), id)) {
+                    kept.push_back(id);
+                } else {
+                    n_skipped++;
+                }
+            }
+            v = std::move(kept);
+            n_kept += (int32_t) v.size();
+        }
+        LLAMA_LOG_INFO("%s: warm-expert set '%s': %d candidate(s), %d skipped\n",
+                       __func__, warm_experts_path, n_kept, n_skipped);
     }
 
     // every layer's staging tensors alias one region per role, so the pool holds
@@ -983,6 +1134,24 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
             }
             res_per_layer = std::min<int32_t>(res_per_layer, n_expert);
 
+            // the base set is a requirement, not a hint: a pool must have room
+            // for every one of its base experts, or the run refuses to start
+            if (!p.base_set.empty()) {
+                for (size_t g = 0; g < groups.size(); ++g) {
+                    int32_t n_base = 0;
+                    for (int il : groups[g]) {
+                        n_base += (int32_t) p.base_set[(size_t) il].size();
+                    }
+                    const int32_t res_cap = (int32_t) groups[g].size() * res_per_layer;
+                    if (n_base > res_cap) {
+                        throw std::runtime_error("disk stage: base-expert set needs " + std::to_string(n_base) +
+                                                 " resident slot(s) in pool " + std::to_string(g) +
+                                                 " but the decode cache has " + std::to_string(res_cap) +
+                                                 "; raise --pin-hot-experts-budget-mib");
+                    }
+                }
+            }
+
             if (res_per_layer > 0) {
                 size_t cache_bytes = 64 * 1024;
                 for (const auto & grp : groups) {
@@ -1082,6 +1251,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                 c.resident_slot.assign((size_t) n_expert, -1);
                                 c.resident_filled.assign((size_t) n_expert, 0);
                                 c.vram.assign((size_t) n_expert, 0);
+                                c.base.assign((size_t) n_expert, 0);
 
                                 // 2d [1, n_expert] so ggml_get_rows can index the
                                 // expert id along ne[1] during the decode remap
@@ -1125,9 +1295,9 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                         }
 
                         // the prefill staging slabs are idle during decode: reuse
-                        // their memory as the L2 pool, one slab per expert-bundle
-                        // type. Requires aligned data: the pool reads an expert at
-                        // its slot start, so head must be zero.
+                        // their memory as the L2 pool. Requires aligned data: the
+                        // pool reads an expert at its slot start, so head must be
+                        // zero.
                         //
                         // The pool and the staging tensors are never live at once:
                         // every prefill clears the pool before it fills the slab,
@@ -1141,12 +1311,70 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                         if (!l2_on) {
                             LLAMA_LOG_INFO("%s: L2 eviction pool disabled by LLAMA_DISK_STAGE_L2\n", __func__);
                         } else if (all_aligned && p.n_buf >= 2) {
-                            p.evict_pool_id.assign(n_layer, -1);
-
-                            for (int il = 0; il < n_layer && (int) p.evict_pools.size() < p.n_buf; ++il) {
-                                if (!src[il].ok || p.evict_pool_id[il] >= 0) {
+                            // group the stageable layers by expert-bundle type: a
+                            // slot stride is fixed per tensor, so only identical
+                            // tensors can share one pool. Start with one pool per
+                            // type, then let any spare slab halve the largest type,
+                            // so both staging slabs hold L2 slots even when the
+                            // model has a single layout
+                            std::vector<std::vector<int>> l2_groups;
+                            for (int il = 0; il < n_layer; ++il) {
+                                if (!src[il].ok) {
                                     continue;
                                 }
+                                int g = -1;
+                                for (size_t k = 0; k < l2_groups.size(); ++k) {
+                                    const layer_src & a = src[l2_groups[k][0]];
+                                    bool same = true;
+                                    for (const auto & role : roles) {
+                                        const ggml_tensor * ta = a.t[role.slot];
+                                        const ggml_tensor * tb = src[il].t[role.slot];
+                                        if (ta->type != tb->type || ta->ne[0] != tb->ne[0] || ta->ne[1] != tb->ne[1]) {
+                                            same = false;
+                                            break;
+                                        }
+                                    }
+                                    if (same) {
+                                        g = (int) k;
+                                        break;
+                                    }
+                                }
+                                if (g < 0) {
+                                    l2_groups.push_back({});
+                                    g = (int) l2_groups.size() - 1;
+                                }
+                                l2_groups[g].push_back(il);
+                            }
+
+                            // more bundle types than staging slabs: leave the L2
+                            // off (the all_pooled check below reports it)
+                            if ((int) l2_groups.size() > p.n_buf) {
+                                l2_groups.clear();
+                            }
+
+                            while ((int) l2_groups.size() < p.n_buf) {
+                                size_t best = l2_groups.size();
+                                for (size_t k = 0; k < l2_groups.size(); ++k) {
+                                    if (l2_groups[k].size() < 2) {
+                                        continue;
+                                    }
+                                    if (best == l2_groups.size() || l2_groups[k].size() > l2_groups[best].size()) {
+                                        best = k;
+                                    }
+                                }
+                                if (best == l2_groups.size()) {
+                                    break;  // no type has a layer to spare
+                                }
+                                const size_t mid = l2_groups[best].size() / 2;
+                                std::vector<int> half(l2_groups[best].begin() + mid, l2_groups[best].end());
+                                l2_groups[best].resize(mid);
+                                l2_groups.push_back(std::move(half));
+                            }
+
+                            p.evict_pool_id.assign(n_layer, -1);
+
+                            for (size_t g = 0; g < l2_groups.size(); ++g) {
+                                const int il  = l2_groups[g][0];
                                 const int pid = (int) p.evict_pools.size();
 
                                 size_t per_slot = 0;
@@ -1190,22 +1418,8 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                 }
                                 p.evict_pools.push_back(std::move(ep));
 
-                                for (int jl = il; jl < n_layer; ++jl) {
-                                    if (!src[jl].ok) {
-                                        continue;
-                                    }
-                                    bool same = true;
-                                    for (const auto & role : roles) {
-                                        const ggml_tensor * a = src[il].t[role.slot];
-                                        const ggml_tensor * b = src[jl].t[role.slot];
-                                        if (a->type != b->type || a->ne[0] != b->ne[0] || a->ne[1] != b->ne[1]) {
-                                            same = false;
-                                            break;
-                                        }
-                                    }
-                                    if (same) {
-                                        p.evict_pool_id[jl] = pid;
-                                    }
+                                for (int jl : l2_groups[g]) {
+                                    p.evict_pool_id[jl] = pid;
                                 }
                             }
 
@@ -1236,6 +1450,38 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                 }
             } else {
                 LLAMA_LOG_WARN("%s: decode cache budget too small for a decode cache\n", __func__);
+            }
+
+            if (!p.base_set.empty()) {
+                if (p.cache_buf == nullptr || p.cache.empty()) {
+                    throw std::runtime_error("disk stage: base-expert set requested but the decode cache is unavailable");
+                }
+                this->preload_base();
+            }
+            if (!p.warm_set.empty()) {
+                if (p.cache_buf == nullptr || p.cache.empty()) {
+                    throw std::runtime_error("disk stage: warm-expert set requested but the decode cache is unavailable");
+                }
+                this->preload_warm();
+            }
+
+            if (!p.base_set.empty() || !p.warm_set.empty()) {
+                size_t n_cap  = 0;
+                size_t n_free = 0;
+                for (const auto & pool : p.pools) {
+                    n_cap  += (size_t) pool.res_cap;
+                    n_free += pool.free_slots.size();
+                }
+                size_t n_base = 0;
+                for (const auto & v : p.base_set) {
+                    n_base += v.size();
+                }
+                size_t n_warm = 0;
+                for (const auto & v : p.warm_loaded) {
+                    n_warm += v.size();
+                }
+                LLAMA_LOG_INFO("%s: decode cache prefilled: %zu/%zu resident slots at startup (%zu free, %zu base, %zu warm)\n",
+                               __func__, n_cap - n_free, n_cap, n_free, n_base, n_warm);
             }
         }
     }
@@ -1279,6 +1525,150 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     LLAMA_LOG_INFO("%s: disk staging active for %d layer(s), %.1f MiB pool, %d buffer(s), %zu-byte aligned unbuffered reads\n",
                    __func__, n_staged, total / (1024.0 * 1024.0), p.n_buf, disk_stage_align);
 
+#endif
+}
+
+void llama_disk_stage::preload_base() {
+#if defined(_WIN32)
+    impl & p = *pimpl;
+    if (p.base_set.empty()) {
+        return;
+    }
+
+    std::vector<disk_stage_job>          jobs;
+    std::vector<std::pair<int, int32_t>> filled;
+    size_t                               bytes = 0;
+
+    for (int il = 0; il < (int) p.cache.size(); ++il) {
+        impl::cache_layer & c = p.cache[(size_t) il];
+        if (c.table == nullptr || il >= (int) p.base_set.size()) {
+            continue;
+        }
+        impl::cache_pool &                pool    = p.pools[(size_t) c.pool];
+        const std::vector<impl::region> & regions = p.layer_regions[(size_t) il];
+
+        for (const int32_t id : p.base_set[(size_t) il]) {
+            if (id < 0 || id >= (int32_t) c.resident_slot.size() || c.resident_slot[(size_t) id] >= 0) {
+                continue;
+            }
+            if (pool.free_slots.empty()) {
+                break;  // the fit check in the constructor makes this unreachable
+            }
+            const int32_t slot = pool.free_slots.back();
+            pool.free_slots.pop_back();
+            c.resident_slot[(size_t) id]   = slot;
+            c.resident_filled[(size_t) id] = 0;
+            c.base[(size_t) id]            = 1;
+
+            for (int r = 0; r < 3; ++r) {
+                const impl::region & sr = regions[(size_t) r];
+                if (sr.file == nullptr || sr.stride == 0) {
+                    continue;
+                }
+                const size_t read_len = align_up(sr.head + sr.stride, disk_stage_align);
+                char *       dst      = pool.data[r] + (size_t) slot * pool.slot_stride[r] - sr.head;
+                jobs.push_back({ sr.file->h, dst, sr.file_off + (size_t) id * sr.stride, read_len });
+                bytes += read_len;
+            }
+            filled.emplace_back(il, id);
+        }
+    }
+
+    if (!jobs.empty()) {
+        std::lock_guard<std::mutex> io(p.io_mu);
+        disk_stage_run_jobs(jobs, 32, p.iocp);
+        for (const auto & [il, id] : filled) {
+            p.cache[(size_t) il].resident_filled[(size_t) id] = 1;
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: base-expert set: %zu expert(s), %.1f MiB preloaded into the decode cache\n",
+                   __func__, filled.size(), bytes / (1024.0 * 1024.0));
+#else
+#endif
+}
+
+void llama_disk_stage::preload_warm() {
+#if defined(_WIN32)
+    impl & p = *pimpl;
+    if (p.warm_set.empty() || p.cache.empty()) {
+        return;
+    }
+
+    p.warm_loaded.assign(p.warm_set.size(), {});
+
+    std::vector<disk_stage_job>          jobs;
+    std::vector<std::pair<int, int32_t>> filled;
+    size_t                               bytes = 0;
+
+    // one pool at a time: its free slots are handed out round-robin across the
+    // layers that share it, so a layer with few candidates cannot starve the
+    // others and every layer ends up as full as the candidate list allows
+    for (size_t pid = 0; pid < p.pools.size(); ++pid) {
+        impl::cache_pool & pool = p.pools[pid];
+
+        std::vector<int>                  pl_layers;
+        std::vector<std::vector<int32_t>> cand;
+        for (int il = 0; il < (int) p.cache.size(); ++il) {
+            if (p.cache[(size_t) il].table == nullptr || p.cache[(size_t) il].pool != (int) pid) {
+                continue;
+            }
+            pl_layers.push_back(il);
+            cand.emplace_back(p.warm_set[(size_t) il].begin(), p.warm_set[(size_t) il].end());
+        }
+        if (pl_layers.empty()) {
+            continue;
+        }
+
+        std::vector<size_t> cursor(pl_layers.size(), 0);
+        bool                progress = true;
+        while (!pool.free_slots.empty() && progress) {
+            progress = false;
+            for (size_t i = 0; i < pl_layers.size() && !pool.free_slots.empty(); ++i) {
+                if (cursor[i] >= cand[i].size()) {
+                    continue;
+                }
+                const int     il = pl_layers[i];
+                const int32_t id = cand[i][cursor[i]++];
+
+                impl::cache_layer & c = p.cache[(size_t) il];
+                if (c.resident_slot[(size_t) id] >= 0) {
+                    continue;  // already resident (base); the parse dropped those
+                }
+                const int32_t slot = pool.free_slots.back();
+                pool.free_slots.pop_back();
+                c.resident_slot[(size_t) id]   = slot;
+                c.resident_filled[(size_t) id] = 0;
+
+                const std::vector<impl::region> & regions = p.layer_regions[(size_t) il];
+                for (int r = 0; r < 3; ++r) {
+                    const impl::region & sr = regions[(size_t) r];
+                    if (sr.file == nullptr || sr.stride == 0) {
+                        continue;
+                    }
+                    const size_t read_len = align_up(sr.head + sr.stride, disk_stage_align);
+                    char *       dst      = pool.data[r] + (size_t) slot * pool.slot_stride[r] - sr.head;
+                    jobs.push_back({ sr.file->h, dst, sr.file_off + (size_t) id * sr.stride, read_len });
+                    bytes += read_len;
+                }
+                filled.emplace_back(il, id);
+                p.warm_loaded[(size_t) il].push_back(id);
+                progress = true;
+            }
+        }
+    }
+
+    if (!jobs.empty()) {
+        std::lock_guard<std::mutex> io(p.io_mu);
+        disk_stage_run_jobs(jobs, 32, p.iocp);
+        for (const auto & [il, id] : filled) {
+            p.cache[(size_t) il].resident_filled[(size_t) id] = 1;
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: warm-expert set: %zu expert(s), %.1f MiB preloaded (count 0, evictable)\n",
+                   __func__, filled.size(), bytes / (1024.0 * 1024.0));
+#else
 #endif
 }
 
@@ -1817,6 +2207,33 @@ int32_t llama_disk_stage::resident_capacity() const {
     return cap;
 }
 
+const std::vector<std::vector<int32_t>> & llama_disk_stage::base_experts() const {
+    return pimpl->base_set;
+}
+
+const std::vector<std::vector<int32_t>> & llama_disk_stage::warm_experts() const {
+    return pimpl->warm_loaded;
+}
+
+int32_t llama_disk_stage::base_count() const {
+    int32_t n = 0;
+    for (const auto & v : pimpl->base_set) {
+        n += (int32_t) v.size();
+    }
+    return n;
+}
+
+bool llama_disk_stage::is_base(int il, int32_t id) const {
+    if (il < 0 || il >= (int) pimpl->cache.size()) {
+        return false;
+    }
+    const impl::cache_layer & c = pimpl->cache[(size_t) il];
+    if (c.table == nullptr || id < 0 || id >= (int32_t) c.base.size()) {
+        return false;
+    }
+    return c.base[(size_t) id] != 0;
+}
+
 bool llama_disk_stage::resident_add(int il, int32_t id) {
 #if defined(_WIN32)
     impl & p = *pimpl;
@@ -1879,6 +2296,9 @@ void llama_disk_stage::resident_remove(int il, int32_t id) {
     }
 
     std::lock_guard<std::mutex> lock(p.cache_mu);
+    if (c.base[id] != 0) {
+        return;  // base expert: a permanent resident, never evicted
+    }
     if (c.vram[id]) {
         return;  // already belongs to the VRAM cache
     }

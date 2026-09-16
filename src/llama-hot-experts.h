@@ -218,6 +218,11 @@ class llama_hot_expert_cache {
     // only: prefill ubatches neither count nor age the ranking).
     void on_ubatch_begin(int64_t n_tokens);
 
+    // Record the token of a single-token decode ubatch (the token sampled on the
+    // previous step) for the expert profile's generated-output text. No-op when
+    // profiling is disabled.
+    void note_output_token(int32_t token);
+
     // direct-read expert staging: when set, ubatches fill the stage at each
     // layer's topk instead of prefetching the mmap (--load-mode dio). The disk
     // cache's pools become the RAM tier's pools: shared slots within a pool,
@@ -301,7 +306,7 @@ class llama_hot_expert_cache {
         uint64_t n_vram_miss = 0;
     };
 
-    enum : uint8_t { PIN_RESIDENT = 1, PIN_INFLIGHT = 2 };
+    enum : uint8_t { PIN_RESIDENT = 1, PIN_INFLIGHT = 2, PIN_BASE = 4 };
 
     // -- tuning constants ----------------------------------------------------
     // an mlock syscall slower than this (us) is counted as a stall in the stats;
@@ -351,6 +356,17 @@ class llama_hot_expert_cache {
     // takeover lead and eviction grace; the eviction victim is the pool's
     // coldest resident
     void try_promote_pool(int il, layer_state & ls, int32_t expert_id, uint64_t count, bool apply_hysteresis);
+
+    // re-admit a base expert whose VRAM takeover freed its RAM slot: reserve a
+    // slot unconditionally, evicting the coldest dynamic resident when the pool
+    // is full. Base experts are never in pinned_rank_pool, so the victim is
+    // always dynamic. The bytes are read by fill_cache() on the next route
+    void readmit_base(int il, int32_t expert_id);
+
+    // record a base expert as a RAM resident: inserts into pinned so the RAM
+    // accounting is exact, but never into pinned_rank_pool, so the eviction
+    // policy cannot select it
+    void add_base_pin(int il, layer_state & ls, int32_t expert_id);
 
     // disk-cache pool of a layer (0 in the non-disk mlock mode, where the whole
     // model is one pool)
@@ -447,6 +463,7 @@ class llama_hot_expert_cache {
 
     const int32_t  n_pin;            // N experts per layer
     int32_t        n_pin_total = 0;  // N * num_moe_layers (global cap)
+    int32_t        n_base      = 0;  // base experts (--pin-experts-from-profile), for stats
     std::vector<int32_t> n_pinned_layer; // residents per layer (disk cache path)
     const uint64_t budget_bytes;     // 0 = unlimited
     const uint64_t decay_interval;   // 0 = lifetime counts (no aging)
@@ -455,6 +472,7 @@ class llama_hot_expert_cache {
     llama_disk_stage * disk_stage = nullptr; // direct-read staging of the routed experts (null when disabled)
     const bool     track_rank;       // rank feeds pinning/VRAM tier; false = prefetch-only mode
     std::FILE *    profile_file = nullptr;
+    std::vector<int32_t> profile_output; // decode tokens of the current profile
     uint64_t       profile_id = 0;
     uint64_t       profile_tokens = 0;
     uint64_t       profile_routes = 0;

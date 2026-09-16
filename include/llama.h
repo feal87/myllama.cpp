@@ -441,6 +441,15 @@ extern "C" {
         // decode-only MoE routing profile output in JSONL format (nullptr = disabled)
         const char * expert_profile_path;
 
+        // base set of experts read into the disk decode cache at load and never
+        // evicted (nullptr = disabled). Requires the disk stage (--load-mode dio)
+        const char * pin_experts_from_profile_path;
+
+        // warm set of experts read into the remaining disk decode-cache slots at
+        // load, evictable like any other resident (nullptr = disabled). Requires
+        // the disk stage; base experts already listed there are skipped
+        const char * warm_experts_from_profile_path;
+
         // GPU-resident cache for host-offloaded MoE expert weights, VRAM tier on
         // top of the hot-expert cache (--pin-hot-experts). Decode on a
         // host-offloaded MoE layer is host-RAM-bandwidth bound; this serves the

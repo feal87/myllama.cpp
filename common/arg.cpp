@@ -2966,6 +2966,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--pin-experts-from-profile"}, "FILE",
+        "keep a base set of MoE experts permanently resident in the disk\n"
+        "decode cache (default: disabled). FILE is a base-expert set derived\n"
+        "from one or more --expert-profile exports: a required\n"
+        "'llama-expert-base v1' header line, then one '<layer> <expert>' pair\n"
+        "per line. With --load-mode dio the listed experts are read into the\n"
+        "decode cache at load and are never evicted by the hot-expert\n"
+        "promotion policy, so the RAM tier keeps a stable common set across\n"
+        "prompt switches. Requires --load-mode dio; the run refuses to start\n"
+        "when the set does not fit the configured cache budget",
+        [](common_params & params, const std::string & value) {
+            params.pin_experts_from_profile = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--warm-experts-from-profile"}, "FILE",
+        "prefill the remaining disk decode-cache slots at load from FILE\n"
+        "(default: disabled), so the RAM tier is full from the first token\n"
+        "instead of warming up over the first prompt. Same format as\n"
+        "--pin-experts-from-profile; experts already in the base set are\n"
+        "skipped. The warm experts are read with usage count 0 and are\n"
+        "evicted by the normal hot-expert policy as soon as the current\n"
+        "topic's experts heat up, so they never block a real resident.\n"
+        "Experts are spread as evenly as possible across the layers of each\n"
+        "decode-cache pool, up to capacity. Requires --load-mode dio",
+        [](common_params & params, const std::string & value) {
+            params.warm_experts_from_profile = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--hot-experts-prefetch"},
         {"--no-hot-experts-prefetch"},
         string_format(

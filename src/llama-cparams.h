@@ -79,6 +79,10 @@ struct llama_cparams {
     // expert); with aging the counts shrink, so scale this with the decay window
     uint64_t n_pin_hot_experts_min_count;
     const char * expert_profile_path;
+    // base set of experts to keep resident in the disk decode cache (nullptr = off)
+    const char * pin_experts_from_profile_path;
+    // warm set of experts to prefill the remaining decode-cache slots (nullptr = off)
+    const char * warm_experts_from_profile_path;
 
     // GPU-resident MoE expert cache, VRAM tier on top of the hot-expert cache
     // (see llama-moecache.h). The shared routing ranking is observed by the

@@ -504,6 +504,12 @@ struct common_params {
     uint64_t n_pin_hot_experts_min_count = 8;
     // decode-only MoE routing profile output in JSONL format (empty = disabled)
     std::string expert_profile;
+    // base set of experts to keep permanently resident in the disk decode cache
+    // (--pin-experts-from-profile), derived from one or more --expert-profile exports
+    std::string pin_experts_from_profile;
+    // warm set of experts to prefill the remaining decode-cache slots with at
+    // load (--warm-experts-from-profile), same format as the base set
+    std::string warm_experts_from_profile;
     // batch/prefill read-ahead (madvise WILLNEED / PrefetchVirtualMemory) of the
     // MoE experts that were just routed but are neither pinned nor served from
     // VRAM. Multi-token ubatches only: single-token decode is skipped (it reads

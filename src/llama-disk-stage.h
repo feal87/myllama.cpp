@@ -65,9 +65,16 @@ public:
     // (--pin-hot-experts-budget-mib); 0 means no explicit budget
     // pool_layers_max caps how many layers share one decode-cache pool (0 = no
     // limit, 1 = one pool per layer). Layers in a pool share resident slots
+    // base_experts_path: optional "llama-expert-base v1" set of experts to read
+    // into the decode cache at load and keep permanently resident (nullptr =
+    // none). The cache must have room for the whole set or the constructor throws
+    // warm_experts_path: optional set in the same format, read into the slots
+    // left free by the base set. These are evictable count-0 residents; base
+    // experts are skipped. Best effort: it fills up to capacity
     llama_disk_stage(const llama_model & model, ggml_backend_dev_t dev,
                      int32_t n_pin_experts, uint64_t cache_budget_bytes,
-                     int32_t pool_layers_max);
+                     int32_t pool_layers_max, const char * base_experts_path,
+                     const char * warm_experts_path);
     ~llama_disk_stage();
 
     // staging tensors of MoE layer il, or null when the layer is not stageable
@@ -108,6 +115,21 @@ public:
 
     // largest pool resident capacity, for logs and the hot-expert engine gate
     int32_t resident_capacity() const;
+
+    // base-expert set parsed from the profile: [layer] -> expert ids. Empty when
+    // no set was given. The vectors are immutable once the constructor returns
+    const std::vector<std::vector<int32_t>> & base_experts() const;
+
+    // warm experts actually read into the cache (base entries excluded), for the
+    // hot-expert engine to register as evictable count-0 residents
+    const std::vector<std::vector<int32_t>> & warm_experts() const;
+
+    // total base experts loaded, for stats/logs
+    int32_t base_count() const;
+
+    // true when (il, id) is a base expert: a permanent decode-cache resident that
+    // the promotion policy must never evict. Lock-free (immutable after load)
+    bool is_base(int il, int32_t id) const;
 
     // make expert id of layer il resident: reserve a slot for it and mark it
     // unfilled. No I/O here - fill_cache() reads the expert into the slot the next
@@ -165,4 +187,12 @@ private:
     // `used` selects sparse fill: only those experts are read, the rest of the
     // slab keeps stale data and is never touched by the reader
     void fill_run(int il, const uint8_t * used = nullptr);
+
+    // read every base expert into its reserved resident slot. Called once from
+    // the constructor, before any graph is served
+    void preload_base();
+
+    // read warm experts into the slots left free by the base set, spread as
+    // evenly as possible across the layers of each pool
+    void preload_warm();
 };
