@@ -202,14 +202,13 @@ struct llama_disk_stage::impl {
         char *        data[3] = { nullptr, nullptr, nullptr };
         size_t        slot_stride[3] = { 0, 0, 0 }; // padded bytes per slot
         int32_t       n_layers = 0;
-        int32_t       res_base = 0; // first resident slot
+        int32_t       res_base = 0; // first resident slot == n_trans
         int32_t       res_cap  = 0; // resident slots
         int32_t       sentinel = 0; // == res_base + res_cap: first spare slot
         std::vector<int32_t> free_slots;   // resident slots with no expert (LIFO)
     };
     struct cache_layer {
         int           pool           = -1;
-        int           pool_layer_idx = 0;  // index within its pool, selects the transient region
         ggml_tensor * table    = nullptr;  // I32 [n_expert], expert id -> slot
         ggml_tensor * slot_skip = nullptr; // I32 [n_slots + 1], 1 at the sentinel
         std::vector<int32_t> resident_slot;   // expert id -> slot, -1 when not resident
@@ -875,8 +874,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
             // one reference layer: the bundle varies across layers (this quantization
             // mixes Q8_0 and Q5_1 down projections), and a reference layer's bundle
             // would leave the cheaper layers under-filled. The padded stride is what
-            // the cache allocates per slot, and one sentinel slot per layer shares
-            // the same tensor, so the usable slot count is one below the quotient
+            // the cache allocates per slot
             size_t cost_per_slot = 0;
             for (int il = 0; il < n_layer; ++il) {
                 if (!src[il].ok) {
@@ -887,96 +885,108 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                 }
             }
 
-            int32_t slots_per_layer = 0;
-            if (cache_budget > 0 && cost_per_slot > 0) {
-                const int64_t slots = (int64_t) (cache_budget / cost_per_slot) - 1;
-                slots_per_layer = slots > 0 ? (int32_t) std::min<int64_t>(slots, n_expert) : 0;
+            // a pool needs every layer's tensor data at the same sector
+            // remainder, since one data pointer serves the whole pool and the
+            // unbuffered read destination must be aligned; the realign script
+            // makes that remainder zero
+            bool all_aligned = true;
+            for (int il = 0; il < n_layer && all_aligned; ++il) {
+                if (!src[il].ok) {
+                    continue;
+                }
+                for (const auto & role : roles) {
+                    if (src[il].r[role.slot].head != 0) {
+                        all_aligned = false;
+                        break;
+                    }
+                }
             }
-            if (n_pin_experts > 0) {
-                // --pin-hot-experts N: N resident experts per layer on average,
-                // plus the transient slots the routed-but-not-resident experts
-                // need. With pools a hot layer may exceed N and a cold one fall
-                // short; the budget bounds the total across the pool
-                const int32_t want = std::min<int32_t>(n_pin_experts + n_trans, n_expert);
-                slots_per_layer = slots_per_layer > 0 ? std::min(slots_per_layer, want) : want;
-            }
-            if (slots_per_layer == 0) {
-                slots_per_layer = std::min<int32_t>(n_trans + 1, n_expert);
-                LLAMA_LOG_WARN("%s: neither --pin-hot-experts nor --pin-hot-experts-budget-mib given, "
-                               "using a minimal %d-slot decode cache per layer\n",
-                               __func__, (int) slots_per_layer);
-            }
-            slots_per_layer = std::min<int32_t>(slots_per_layer, n_expert);
 
-            if (slots_per_layer > n_trans) {
-                const int32_t res_per_layer = slots_per_layer - n_trans;
-
-                // a pool needs every layer's tensor data at the same sector
-                // remainder, since one data pointer serves the whole pool and the
-                // unbuffered read destination must be aligned; the realign script
-                // makes that remainder zero
-                bool all_aligned = true;
-                for (int il = 0; il < n_layer && all_aligned; ++il) {
+            // group the stageable layers: all-aligned layers with identical
+            // expert tensors share one array per role, everything else gets a
+            // private one. The cap trades cross-layer sharing for speed: the
+            // CPU mul_mat_id scans every slot of its src tensor (n_as = ne02),
+            // so a pool of N layers makes each layer pay for N layers' slots
+            const int max_pool_layers = pool_layers_max > 0 ? pool_layers_max : (1 << 30);
+            std::vector<std::vector<int>> groups;
+            if (all_aligned) {
+                for (int il = 0; il < n_layer; ++il) {
                     if (!src[il].ok) {
                         continue;
                     }
-                    for (const auto & role : roles) {
-                        if (src[il].r[role.slot].head != 0) {
-                            all_aligned = false;
-                            break;
+                    int g = -1;
+                    for (size_t k = 0; k < groups.size(); ++k) {
+                        if ((int) groups[k].size() >= max_pool_layers) {
+                            continue;  // cap reached: start another sub-pool
                         }
-                    }
-                }
-
-                // group the stageable layers: all-aligned layers with identical
-                // expert tensors share one array per role, everything else gets a
-                // private one. The cap trades cross-layer sharing for speed: the
-                // CPU mul_mat_id scans every slot of its src tensor (n_as = ne02),
-                // so a pool of N layers makes each layer pay for N layers' slots
-                const int max_pool_layers = pool_layers_max > 0 ? pool_layers_max : (1 << 30);
-                std::vector<std::vector<int>> groups;
-                if (all_aligned) {
-                    for (int il = 0; il < n_layer; ++il) {
-                        if (!src[il].ok) {
-                            continue;
-                        }
-                        int g = -1;
-                        for (size_t k = 0; k < groups.size(); ++k) {
-                            if ((int) groups[k].size() >= max_pool_layers) {
-                                continue;  // cap reached: start another sub-pool
-                            }
-                            const layer_src & a = src[groups[k][0]];
-                            bool same = true;
-                            for (const auto & role : roles) {
-                                const ggml_tensor * ta = a.t[role.slot];
-                                const ggml_tensor * tb = src[il].t[role.slot];
-                                if (ta->type != tb->type || ta->ne[0] != tb->ne[0] || ta->ne[1] != tb->ne[1]) {
-                                    same = false;
-                                    break;
-                                }
-                            }
-                            if (same) {
-                                g = (int) k;
+                        const layer_src & a = src[groups[k][0]];
+                        bool same = true;
+                        for (const auto & role : roles) {
+                            const ggml_tensor * ta = a.t[role.slot];
+                            const ggml_tensor * tb = src[il].t[role.slot];
+                            if (ta->type != tb->type || ta->ne[0] != tb->ne[0] || ta->ne[1] != tb->ne[1]) {
+                                same = false;
                                 break;
                             }
                         }
-                        if (g < 0) {
-                            groups.push_back({});
-                            g = (int) groups.size() - 1;
+                        if (same) {
+                            g = (int) k;
+                            break;
                         }
-                        groups[g].push_back(il);
                     }
-                } else {
-                    for (int il = 0; il < n_layer; ++il) {
-                        if (src[il].ok) {
-                            groups.push_back({ il });
-                        }
+                    if (g < 0) {
+                        groups.push_back({});
+                        g = (int) groups.size() - 1;
+                    }
+                    groups[g].push_back(il);
+                }
+            } else {
+                for (int il = 0; il < n_layer; ++il) {
+                    if (src[il].ok) {
+                        groups.push_back({ il });
                     }
                 }
+            }
 
+            // one shared transient window per pool, so the budget must hold one
+            // expert of each pool's bundle on top of the resident slots
+            size_t pool_cost = 0;
+            for (const auto & grp : groups) {
+                for (const auto & role : roles) {
+                    pool_cost += (size_t) src[grp[0]].t[role.slot]->nb[2] + disk_stage_align;
+                }
+            }
+
+            int32_t res_per_layer = 0;
+            if (cache_budget > 0 && cost_per_slot > 0) {
+                // every pool holds n_trans transient slots and one sentinel slot;
+                // charge those in bytes instead of a per-layer share, which would
+                // round a whole layer's bundle per term and leave slots unused
+                const int64_t fixed = ((int64_t) n_trans + 1) * (int64_t) pool_cost
+                                    + (int64_t) n_layer * 4 * (int64_t) disk_stage_align;
+                if ((int64_t) cache_budget > fixed) {
+                    const int64_t slots = ((int64_t) cache_budget - fixed) / (int64_t) cost_per_slot;
+                    res_per_layer = (int32_t) std::min<int64_t>(slots, n_expert);
+                }
+            }
+            if (n_pin_experts > 0) {
+                // --pin-hot-experts N: N resident experts per layer on average.
+                // With pools a hot layer may exceed N and a cold one fall short;
+                // the budget bounds the total across the pool
+                const int32_t want = std::min<int32_t>(n_pin_experts, n_expert);
+                res_per_layer = res_per_layer > 0 ? std::min(res_per_layer, want) : want;
+            }
+            if (res_per_layer == 0) {
+                res_per_layer = 1;
+                LLAMA_LOG_WARN("%s: neither --pin-hot-experts nor --pin-hot-experts-budget-mib given, "
+                               "using a minimal decode cache\n", __func__);
+            }
+            res_per_layer = std::min<int32_t>(res_per_layer, n_expert);
+
+            if (res_per_layer > 0) {
                 size_t cache_bytes = 64 * 1024;
                 for (const auto & grp : groups) {
-                    const int32_t n_pool_slots = (int32_t) grp.size() * (n_trans + res_per_layer);
+                    const int32_t n_pool_slots = (int32_t) grp.size() * res_per_layer + n_trans;
                     for (const auto & role : roles) {
                         const size_t stride = (size_t) src[grp[0]].t[role.slot]->nb[2];
                         const size_t head   = all_aligned ? 0 : src[grp[0]].r[role.slot].head;
@@ -1026,7 +1036,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                             const std::vector<int> & grp = groups[g];
                             impl::cache_pool & pool = p.pools[g];
                             pool.n_layers = (int32_t) grp.size();
-                            pool.res_base = pool.n_layers * n_trans;
+                            pool.res_base = n_trans;
                             pool.res_cap  = (int32_t) grp.size() * res_per_layer;
                             pool.sentinel = pool.res_base + pool.res_cap;
 
@@ -1069,7 +1079,6 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                 const int il = grp[j];
                                 impl::cache_layer & c = p.cache[il];
                                 c.pool           = (int) g;
-                                c.pool_layer_idx = (int) j;
                                 c.resident_slot.assign((size_t) n_expert, -1);
                                 c.resident_filled.assign((size_t) n_expert, 0);
                                 c.vram.assign((size_t) n_expert, 0);
@@ -1226,7 +1235,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                     }
                 }
             } else {
-                LLAMA_LOG_WARN("%s: decode cache budget too small for %d transient slots/layer\n", __func__, n_trans);
+                LLAMA_LOG_WARN("%s: decode cache budget too small for a decode cache\n", __func__);
             }
         }
     }
@@ -1626,10 +1635,10 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
         }
     }
 
-    // this layer's own transient window inside the pool: [0, res_base) is split
-    // into one n_trans-wide window per layer
-    const int32_t trans_begin = c.pool_layer_idx * p.n_trans;
-    const int32_t trans_end   = trans_begin + p.n_trans;
+    // the pool keeps one transient window: only the layer being computed holds
+    // routed-but-not-resident experts
+    const int32_t trans_begin = 0;
+    const int32_t trans_end   = p.n_trans;
     int32_t transient = trans_begin;
 
     // slot assignment under the lock; the unbuffered reads below run without it
