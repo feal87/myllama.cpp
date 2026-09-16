@@ -1552,12 +1552,13 @@ private:
         }
 
         if (cache_disk_enabled) {
+            const int ckpt_step = (int) std::max<int64_t>(params_base.n_batch, params_base.checkpoint_min_step);
             if (params_base.n_batch != params_base.n_ubatch) {
                 SRV_WRN("--cache-disk: n_batch (%d) != n_ubatch (%d), checkpoints land on batch boundaries, not ubatch boundaries\n",
                         params_base.n_batch, params_base.n_ubatch);
-            } else {
-                SRV_TRC("--cache-disk: one checkpoint per prefilled batch (n_batch == n_ubatch == %d)\n", params_base.n_batch);
             }
+            SRV_TRC("--cache-disk: one checkpoint per %d prefilled tokens (n_batch = %d, min spacing = %d)\n",
+                    ckpt_step, params_base.n_batch, params_base.checkpoint_min_step);
 
             const bool use_dio = params_base.load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
             const size_t max_bytes = params_base.cache_disk_max_mib > 0
@@ -4193,12 +4194,18 @@ private:
                     // a checkpoint of a request with media cannot be hashed or verified
                     do_checkpoint = do_checkpoint && !slot.task->tokens.has_media() && !slot.prompt.tokens.has_media();
 
-                    // no need to create checkpoints that are too close together, unless it's the last user message
+                    // no need to create checkpoints that are too close together
+                    // on disk, space by at least one batch; in RAM, also keep the user-break and near-prompt-end rules
+                    const int64_t ckpt_step = ckpt_store
+                        ? std::max<int64_t>(n_batch, params_base.checkpoint_min_step)
+                        : params_base.checkpoint_min_step;
+
                     do_checkpoint = do_checkpoint && (
-                            ckpt_store != nullptr ||
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
-                            n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                            (ckpt_store == nullptr
+                                ? (is_last_user_message || near_prompt_end ||
+                                   n_tokens_start > slot.prompt.checkpoints.back().n_tokens + ckpt_step)
+                                : (n_tokens_start >= slot.prompt.checkpoints.back().n_tokens + ckpt_step)));
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
