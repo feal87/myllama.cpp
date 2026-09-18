@@ -2894,6 +2894,12 @@ ggml_status llama_context::graph_compute(
         auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
         if (set_threadpool_fn) {
             set_threadpool_fn(backend_cpu, tp);
+            // the split backend computes the cold pass in its own split. CPU
+            // splits never run concurrently, so it can share the pool; without
+            // this it has no pool and ggml creates a disposable one per call
+            if (backend_cpu_split != nullptr) {
+                set_threadpool_fn(backend_cpu_split, tp);
+            }
         }
     }
 
