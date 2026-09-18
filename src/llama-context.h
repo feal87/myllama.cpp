@@ -486,6 +486,8 @@ private:
     bool sched_need_reserve = true;
 
     ggml_backend_t backend_cpu = nullptr;
+    // split-hot: second CPU backend hosting the cold MoE pass (owned by backends)
+    ggml_backend_t backend_cpu_split = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
     // training

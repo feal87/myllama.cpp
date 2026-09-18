@@ -1491,6 +1491,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     rope_type        (hparams.rope_type),
     sched            (params.sched),
     backend_cpu      (params.backend_cpu),
+    backend_cpu_split(params.backend_cpu_split),
     cvec             (params.cvec),
     loras            (params.loras),
     mctx             (params.mctx),
@@ -2266,6 +2267,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // captured here because `cur` is clobbered by the gate/up results below
     ggml_tensor * mc_inp = cur;
 
+    // split-hot: the disk decode cache exposes two static slot tables; compute
+    // the resident (hot) experts and the disk-backed (cold) experts in two host
+    // passes on two CPU backends, so the scheduler runs the cold pass in its own
+    // split after the hot one and the cold read overlaps the hot compute. Only
+    // the plain separate gate/up SILU layout without clamp is handled
+    const bool split_host =
+        dc != nullptr && dc->slot_skip_hot != nullptr && dc->slot_skip_cold != nullptr &&
+        backend_cpu_split != nullptr && !weight_before_ffn &&
+        type_op == LLM_FFN_SILU && (il < 0 || hparams.swiglu_clamp_exp[il] <= 1e-6f);
+
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts_c, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
@@ -2298,8 +2309,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up = build_lora_mm_id(up_exps, cur, selected_experts_c, up_exps_s); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
-        if (mc) {
-            up->src[3]       = dc != nullptr ? dc->slot_skip : mc->host_table;
+        if (mc || split_host) {
+            up->src[3]       = dc != nullptr ? (split_host ? dc->slot_skip_hot : dc->slot_skip) : mc->host_table;
             up->op_params[0] = dc != nullptr ? 0 : mc->n_slots;
         }
 
@@ -2316,8 +2327,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cur = build_lora_mm_id(gate_exps, cur, selected_experts_c, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
 
-            if (mc) {
-                cur->src[3]       = dc != nullptr ? dc->slot_skip : mc->host_table;
+            if (mc || split_host) {
+                cur->src[3]       = dc != nullptr ? (split_host ? dc->slot_skip_hot : dc->slot_skip) : mc->host_table;
                 cur->op_params[0] = dc != nullptr ? 0 : mc->n_slots;
             }
         } else {
@@ -2426,13 +2437,50 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
     cb(experts, "ffn_moe_down", il);
 
-    if (mc) {
-        experts->src[3]       = dc != nullptr ? dc->slot_skip : mc->host_table;
+    if (mc || split_host) {
+        experts->src[3]       = dc != nullptr ? (split_host ? dc->slot_skip_hot : dc->slot_skip) : mc->host_table;
         experts->op_params[0] = dc != nullptr ? 0 : mc->n_slots;
         // this is the final host projection: its cached rows feed the add with
         // the device result, so they must be zeroed. Gate/up rows are dead
         // (the down mul_mat_id skips the same experts) and stay untouched.
         experts->op_params[2] = 1;
+    }
+
+    if (split_host) {
+        // keep the hot chain (and the get_rows that produces the remapped ids)
+        // on the hot backend, before the cold split
+        ggml_backend_sched_set_tensor_backend(sched, selected_experts_c, backend_cpu);
+        if (selected_experts_c->src[0] != nullptr) {
+            ggml_backend_sched_set_tensor_backend(sched, selected_experts_c->src[0], backend_cpu);
+        }
+        ggml_backend_sched_set_tensor_backend(sched, experts, backend_cpu);
+
+        // cold pass on the second CPU backend: the scheduler gives it its own
+        // split, and the node-prepare hook waits there for the disk batch that
+        // the get_rows handed to the worker, i.e. after the hot compute
+        ggml_tensor * c_up   = build_lora_mm_id(up_exps,   mc_inp, selected_experts_c, nullptr);
+        ggml_tensor * c_gate = build_lora_mm_id(gate_exps, mc_inp, selected_experts_c, nullptr);
+        cb(c_up,   "ffn_moe_cold_up",   il);
+        cb(c_gate, "ffn_moe_cold_gate", il);
+        c_up->src[3]         = dc->slot_skip_cold;
+        c_gate->src[3]       = dc->slot_skip_cold;
+        c_up->op_params[0]   = 0;
+        c_gate->op_params[0] = 0;
+
+        ggml_tensor * c_act  = ggml_swiglu_split(ctx0, c_gate, c_up);
+        ggml_tensor * c_down = build_lora_mm_id(down_exps, c_act, selected_experts_c, nullptr);
+        cb(c_down, "ffn_moe_cold_down", il);
+        c_down->src[3]       = dc->slot_skip_cold;
+        c_down->op_params[0] = 0;
+        c_down->op_params[2] = 1;
+
+        ggml_backend_sched_set_tensor_backend(sched, c_up,   backend_cpu_split);
+        ggml_backend_sched_set_tensor_backend(sched, c_gate, backend_cpu_split);
+        ggml_backend_sched_set_tensor_backend(sched, c_act,  backend_cpu_split);
+        ggml_backend_sched_set_tensor_backend(sched, c_down, backend_cpu_split);
+
+        experts = ggml_add(ctx0, experts, c_down);
+        cb(experts, "ffn_moe_host_merged", il);
     }
 
     // emit the host expert chain, then the shared expert, so the shared expert
