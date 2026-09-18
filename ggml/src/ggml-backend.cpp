@@ -889,6 +889,15 @@ static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backen
     return -1;
 }
 
+// A second backend with the same device type as the canonical CPU backend (the
+// last one) supports the same ops and buffer types, so it would shadow the CPU
+// during the automatic assignment. Such a backend is only reachable through an
+// explicit assignment.
+static bool ggml_backend_sched_is_extra_cpu(ggml_backend_sched_t sched, int backend_id) {
+    return backend_id >= 0 && backend_id != sched->n_backends - 1 &&
+           ggml_backend_dev_type(ggml_backend_get_device(sched->backends[backend_id])) == GGML_BACKEND_DEVICE_TYPE_CPU;
+}
+
 static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, const struct ggml_tensor * tensor, const struct ggml_tensor * op) {
     ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     if (buffer == NULL) {
@@ -897,6 +906,9 @@ static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, co
 
     // find highest prio backend that supports the buffer type and the op
     for (int i = 0; i < sched->n_backends; i++) {
+        if (ggml_backend_sched_is_extra_cpu(sched, i)) {
+            continue;
+        }
         if (ggml_backend_supports_buft(sched->backends[i], buffer->buft) &&
             ggml_backend_supports_op(sched->backends[i], op)) {
             return i;
@@ -1140,7 +1152,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
             int * node_backend_id = &tensor_backend_id(node);
             if (*node_backend_id != -1) {
-                if (*node_backend_id == sched->n_backends - 1) {
+                if (*node_backend_id == sched->n_backends - 1 || ggml_backend_sched_is_extra_cpu(sched, *node_backend_id)) {
                     // skip cpu (lowest prio backend)
                     cur_backend_id = -1;
                 } else {
@@ -1161,7 +1173,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
             int * node_backend_id = &tensor_backend_id(node);
             if (*node_backend_id != -1) {
-                if (*node_backend_id == sched->n_backends - 1) {
+                if (*node_backend_id == sched->n_backends - 1 || ggml_backend_sched_is_extra_cpu(sched, *node_backend_id)) {
                     // skip cpu (lowest prio backend)
                     cur_backend_id = -1;
                 } else {
@@ -1182,7 +1194,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
             int * node_backend_id = &tensor_backend_id(node);
             if (*node_backend_id != -1) {
-                cur_backend_id = *node_backend_id;
+                cur_backend_id = ggml_backend_sched_is_extra_cpu(sched, *node_backend_id) ? -1 : *node_backend_id;
             } else if (cur_backend_id != -1) {
                 ggml_backend_sched_set_if_supported(sched, node, cur_backend_id, node_backend_id);
             }
@@ -1198,7 +1210,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
             int * node_backend_id = &tensor_backend_id(node);
             if (*node_backend_id != -1) {
-                cur_backend_id = *node_backend_id;
+                cur_backend_id = ggml_backend_sched_is_extra_cpu(sched, *node_backend_id) ? -1 : *node_backend_id;
             } else if (cur_backend_id != -1) {
                 ggml_backend_sched_set_if_supported(sched, node, cur_backend_id, node_backend_id);
             }
@@ -1223,6 +1235,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             // unassigned node: find the backend with the most supported inputs
             int n_supported_best = -1;
             for (int b = 0; b < sched->n_backends; b++) {
+                if (ggml_backend_sched_is_extra_cpu(sched, b)) {
+                    continue;
+                }
                 if (ggml_backend_supports_op(sched->backends[b], node)) {
                     int n_supported = 0;
                     for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -1293,6 +1308,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         // if the node is still unassigned, assign it to the first backend that supports it
         for (int b = 0; b < sched->n_backends && *cur_backend_id == -1; b++) {
+            if (ggml_backend_sched_is_extra_cpu(sched, b)) {
+                continue;
+            }
             ggml_backend_sched_set_if_supported(sched, node, b, cur_backend_id);
         }
         GGML_ASSERT(*cur_backend_id != -1);
