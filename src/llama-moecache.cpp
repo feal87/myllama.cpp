@@ -13,6 +13,7 @@
 #include <cinttypes>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <mutex>
 #include <stdexcept>
@@ -1345,11 +1346,17 @@ void llama_moe_cache::print_stats() {
                    t_total ? 100.0 * n_hit_total / t_total : 0.0, n_hit_total, t_total,
                    n_res_total ? 100.0 * n_new / n_res_total : 0.0, n_new, n_res_total,
                    n_ticks);
+    // one write for the whole per-layer breakdown: a console write per layer was
+    // the only measurable cost of the report (Windows console writes are synchronous)
+    std::string per_layer;
     for (size_t li = 0; li < report.size(); ++li) {
         const auto & r   = report[li];
         const uint64_t t = r.n_hit + r.n_miss;
-        LLAMA_LOG_CONT("L%d:slots=%d res=%d hit=%.1f%%%s", r.il, r.n_slots, r.n_res,
+        char buf[128];
+        snprintf(buf, sizeof(buf), "L%d:slots=%d res=%d hit=%.1f%%%s", r.il, r.n_slots, r.n_res,
                 t ? 100.0 * r.n_hit / t : 0.0, (li + 1 < report.size()) ? ", " : "");
+        per_layer += buf;
     }
+    LLAMA_LOG_CONT("%s", per_layer.c_str());
     LLAMA_LOG_CONT("}\n");
 }

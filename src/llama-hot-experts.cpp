@@ -293,16 +293,20 @@ void llama_hot_expert_cache::print_stats() {
         n_layers_used += c != 0 ? 1 : 0;
     }
     if (n_layers_used > 0) {
-        LLAMA_LOG_CONT(" | per-layer: {");
+        // one write for the whole breakdown: a console write per layer was the
+        // only measurable cost of the report (Windows console writes are synchronous)
+        std::string str = " | per-layer: {";
         size_t shown = 0;
         for (size_t il = 0; il < per_layer.size(); ++il) {
             if (per_layer[il] == 0) {
                 continue;
             }
             shown++;
-            LLAMA_LOG_CONT("L%zu=%zu%s", il, per_layer[il], shown < n_layers_used ? ", " : "");
+            str += "L" + std::to_string(il) + "=" + std::to_string(per_layer[il]);
+            str += shown < n_layers_used ? ", " : "";
         }
-        LLAMA_LOG_CONT("}");
+        str += "}";
+        LLAMA_LOG_CONT("%s", str.c_str());
     }
     LLAMA_LOG_CONT("\n");
 }
