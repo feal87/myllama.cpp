@@ -884,11 +884,13 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                 continue;
             }
             const int32_t n_expert = (int32_t) src[il].t[0]->ne[2];
-            const auto &  base     = p.base_set[(size_t) il];
+            const bool    have_base = !p.base_set.empty();
             std::vector<int32_t> kept;
             kept.reserve(v.size());
             for (const int32_t id : v) {
-                if (id < n_expert && !std::binary_search(base.begin(), base.end(), id)) {
+                const bool in_base = have_base && std::binary_search(p.base_set[(size_t) il].begin(),
+                                                                     p.base_set[(size_t) il].end(), id);
+                if (id < n_expert && !in_base) {
                     kept.push_back(id);
                 } else {
                     n_skipped++;
