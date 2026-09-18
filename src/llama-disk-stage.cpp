@@ -37,6 +37,8 @@
 static const size_t disk_stage_align = 4096;
 // one request per chunk; a few dozen in flight saturate the drive
 static const size_t disk_stage_chunk = 1u << 20;
+// below this many bytes a concurrent copy does not pay for a worker thread
+static const size_t disk_stage_copy_thread_min = 256 * 1024;
 // below this ubatch size the routed experts are few enough that reading only
 // them beats streaming the whole slab; the same cut makes the CUDA mul_mat_id
 // fall back to the CPU, which reads only the routed rows anyway
@@ -361,7 +363,8 @@ struct llama_disk_stage::impl {
     };
     std::vector<disk_stage_job>          fs_jobs;
     std::vector<int32_t>                 fs_newly_filled;
-    std::vector<pool_copy>               fs_copies;
+    std::vector<pool_copy>               fs_copies;       // copies independent of the disk batch
+    std::vector<pool_copy>               fs_copies_after; // miss copies, run after the disk batch
     std::vector<std::pair<int, int64_t>> fs_l2_consume;
 
     // previous stats report, for the per-interval delta line
@@ -371,6 +374,23 @@ struct llama_disk_stage::impl {
     uint64_t prev_l2_demotions   = 0;
     uint64_t prev_l2_hit_bytes   = 0;
     uint64_t prev_l2_promo_bytes = 0;
+
+    // decode fill timing: the blocking read share of a decode step, so it can be
+    // compared with the compute. Summed over every fill_cache() call
+    uint64_t n_dec_fill_us    = 0;
+    uint64_t n_dec_fill_calls = 0;
+    uint64_t n_dec_fill_bytes = 0;
+    uint64_t prev_dec_fill_us    = 0;
+    uint64_t prev_dec_fill_calls = 0;
+    uint64_t prev_dec_fill_bytes = 0;
+    // trace state (compute thread only): previous fill end and layer, plus the
+    // running totals of the decode token being traced
+    int64_t  trace_prev_us      = 0;
+    int32_t  trace_prev_il      = -1;
+    int64_t  trace_tok_start_us = 0;
+    uint64_t trace_tok_fill_us  = 0;
+    uint64_t trace_tok_gap_us   = 0;
+    uint64_t trace_tok_calls    = 0;
 
     int evict_pool_for(int il) const {
         return (il >= 0 && il < (int) evict_pool_id.size()) ? evict_pool_id[(size_t) il] : -1;
@@ -654,6 +674,21 @@ void llama_disk_stage::node_prepare_callback(struct ggml_tensor * node, void * u
 
 void llama_disk_stage::print_stats() {
     impl & p = *pimpl;
+
+    // decode fill: the read share of a decode step. Reported before the L2 early
+    // return so a cache without a pool still gets the number
+    const uint64_t d_dec_us   = p.n_dec_fill_us - p.prev_dec_fill_us;
+    const uint64_t d_dec_call = p.n_dec_fill_calls - p.prev_dec_fill_calls;
+    const uint64_t d_dec_byt  = p.n_dec_fill_bytes - p.prev_dec_fill_bytes;
+    if (d_dec_call > 0) {
+        LLAMA_LOG_INFO("[disk-stage] decode fill: %.2f ms/call over %" PRIu64 " call(s), %.2f MiB read, %.2f ms/MiB\n",
+                       (double) d_dec_us / 1000.0 / (double) d_dec_call, d_dec_call,
+                       d_dec_byt / (1024.0 * 1024.0),
+                       d_dec_byt ? (double) d_dec_us / 1000.0 / (d_dec_byt / (1024.0 * 1024.0)) : 0.0);
+    }
+    p.prev_dec_fill_us    = p.n_dec_fill_us;
+    p.prev_dec_fill_calls = p.n_dec_fill_calls;
+    p.prev_dec_fill_bytes = p.n_dec_fill_bytes;
 
     if (p.evict_pools.empty()) {
         return;
@@ -2004,13 +2039,17 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
 
     int32_t * table = (int32_t *) c.table->data;
 
+    const int64_t t0 = ggml_time_us();
+
     std::vector<disk_stage_job> & jobs            = p.fs_jobs;
     std::vector<int32_t>        & newly_filled    = p.fs_newly_filled;
     std::vector<impl::pool_copy>& copies          = p.fs_copies;
+    std::vector<impl::pool_copy>& copies_after    = p.fs_copies_after;
     std::vector<std::pair<int, int64_t>> & l2_consume = p.fs_l2_consume;
     jobs.clear();
     newly_filled.clear();
     copies.clear();
+    copies_after.clear();
     l2_consume.clear();
 
     const std::vector<impl::region> & regions = p.layer_regions[il];
@@ -2031,6 +2070,12 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
     const int32_t trans_end   = p.n_trans;
     int32_t transient = trans_begin;
 
+    // routed ids served from RAM / read from disk / skipped (VRAM), for the trace:
+    // a layer with cold ids and no residents has no compute to hide the read behind
+    int64_t n_res_ev  = 0;
+    int64_t n_cold_ev = 0;
+    int64_t n_vram_ev = 0;
+
     // slot assignment under the lock; the unbuffered reads below run without it
     {
         std::lock_guard<std::mutex> lock(p.cache_mu);
@@ -2045,6 +2090,7 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
             // host mul_mat_id skips it, and read nothing
             if (c.vram[id]) {
                 table[id] = pool.sentinel;
+                n_vram_ev++;
                 continue;
             }
 
@@ -2054,6 +2100,7 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
             const int32_t slot = c.resident_slot[id];
             if (slot >= 0) {
                 table[id] = slot;
+                n_res_ev++;
                 if (c.resident_filled[id] == 0) {
                     // a promoted expert may still sit in the L2 pool from its
                     // first route: copy it in instead of reading the disk again
@@ -2095,6 +2142,7 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
                 transient = trans_begin;
             }
             const int32_t use = transient++;
+            n_cold_ev++;
 
             if (epid >= 0) {
                 impl::evict_pool & ep = p.evict_pools[(size_t) epid];
@@ -2134,14 +2182,17 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
                     }
                 }
 
-                // the graph reads the transient slot: copy the pool rows there
+                // the graph reads the transient slot: copy the pool rows there. A
+                // miss must copy after the read above lands in its pool slot; a
+                // hit can copy while the drive is busy with other experts
+                std::vector<impl::pool_copy> & tc = hit < 0 ? copies_after : copies;
                 for (int r = 0; r < 3; ++r) {
                     const size_t len = regions[r].stride;
                     if (len == 0) {
                         continue;
                     }
-                    copies.push_back({ ep.data[r] + (size_t) eslot * ep.stride[r],
-                                       pool.data[r] + (size_t) use * pool.slot_stride[r], len });
+                    tc.push_back({ ep.data[r] + (size_t) eslot * ep.stride[r],
+                                   pool.data[r] + (size_t) use * pool.slot_stride[r], len });
                 }
                 table[id] = use;
                 continue;
@@ -2164,14 +2215,41 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
         }
     }
 
+    // the copies that do not depend on the reads run on a second thread while
+    // the drive is busy (same as fill_run); the miss copies below run after the
+    // join, so they read the bytes the disk batch just landed
+    size_t copy_bytes = 0;
+    for (const impl::pool_copy & cp : copies) {
+        copy_bytes += cp.len;
+    }
+
+    std::thread copier;
+    if (copy_bytes >= disk_stage_copy_thread_min) {
+        try {
+            copier = std::thread([&copies]() {
+                for (const impl::pool_copy & cp : copies) {
+                    std::memcpy(cp.dst, cp.src, cp.len);
+                }
+            });
+        } catch (...) {
+            // no thread: the copies run inline below
+        }
+    }
+
     if (!jobs.empty()) {
         std::lock_guard<std::mutex> io(p.io_mu);
         disk_stage_run_jobs(jobs, 32, p.iocp);
     }
 
-    // pool rows are copied after the reads above, so a miss always copies the
-    // bytes the read just landed in its pool slot
-    for (const impl::pool_copy & cp : copies) {
+    if (copier.joinable()) {
+        copier.join();
+    } else {
+        for (const impl::pool_copy & cp : copies) {
+            std::memcpy(cp.dst, cp.src, cp.len);
+        }
+    }
+
+    for (const impl::pool_copy & cp : copies_after) {
         std::memcpy(cp.dst, cp.src, cp.len);
     }
 
@@ -2186,6 +2264,50 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
         for (const int32_t id : newly_filled) {
             c.resident_filled[id] = 1;
         }
+    }
+
+    // decode fill timing: how much of a decode step is the blocking read, and
+    // (trace) the gap to the previous layer's fill, i.e. the compute in between
+    const int64_t t1 = ggml_time_us();
+    size_t disk_bytes = 0;
+    for (const disk_stage_job & j : jobs) {
+        disk_bytes += j.len;
+    }
+    p.n_dec_fill_calls++;
+    p.n_dec_fill_us    += (uint64_t) (t1 - t0);
+    p.n_dec_fill_bytes += disk_bytes;
+
+    if (disk_stage_trace()) {
+        const double fill_ms = (t1 - t0) / 1000.0;
+        if (p.trace_prev_il >= 0 && il <= p.trace_prev_il) {
+            // the layer index wrapped back: a new decode token, report the last
+            const double tok_us = (double) (t0 - p.trace_tok_start_us);
+            LLAMA_LOG_INFO("[disk-stage] decode token: %" PRIu64 " fills, fill=%.2f ms gap=%.2f ms wall=%.2f ms (read %.0f%%)\n",
+                           p.trace_tok_calls, p.trace_tok_fill_us / 1000.0, p.trace_tok_gap_us / 1000.0,
+                           tok_us / 1000.0, tok_us > 0.0 ? 100.0 * p.trace_tok_fill_us / tok_us : 0.0);
+            p.trace_tok_start_us = t0;
+            p.trace_tok_fill_us  = 0;
+            p.trace_tok_gap_us   = 0;
+            p.trace_tok_calls    = 0;
+        } else if (p.trace_prev_il < 0) {
+            p.trace_tok_start_us = t0;
+        }
+        p.trace_tok_calls++;
+        p.trace_tok_fill_us += (uint64_t) (t1 - t0);
+
+        // gap since the previous fill: the compute that ran between the two
+        // fills when the scheduler splits the graph per layer, ~0 when it
+        // prepares several layers in one split
+        const int64_t gap_us = p.trace_prev_us > 0 ? t0 - p.trace_prev_us : 0;
+        if (gap_us > 0) {
+            p.trace_tok_gap_us += (uint64_t) gap_us;
+        }
+        LLAMA_LOG_INFO("[disk-stage] decode L%d: fill=%.2f ms jobs=%zu (%.2f MiB) res=%" PRId64 " cold=%" PRId64
+                       " vram=%" PRId64 " gap=%.2f ms\n",
+                       il, fill_ms, jobs.size(), disk_bytes / (1024.0 * 1024.0),
+                       n_res_ev, n_cold_ev, n_vram_ev, gap_us / 1000.0);
+        p.trace_prev_il = il;
+        p.trace_prev_us = t1;
     }
 #else
     GGML_UNUSED(il);
