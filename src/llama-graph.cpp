@@ -2444,39 +2444,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (split_host) {
         // keep the hot chain (and the get_rows that produces the remapped ids)
-        // on the hot backend, before the cold split
+        // on the hot backend, so the split after it is the VRAM cache chain
         ggml_backend_sched_set_tensor_backend(sched, selected_experts_c, backend_cpu);
         if (selected_experts_c->src[0] != nullptr) {
             ggml_backend_sched_set_tensor_backend(sched, selected_experts_c->src[0], backend_cpu);
         }
         ggml_backend_sched_set_tensor_backend(sched, experts, backend_cpu);
-
-        // cold pass on the second CPU backend: the scheduler gives it its own
-        // split, and the node-prepare hook waits there for the disk batch that
-        // the get_rows handed to the worker, i.e. after the hot compute
-        ggml_tensor * c_up   = build_lora_mm_id(up_exps,   mc_inp, selected_experts_c, nullptr);
-        ggml_tensor * c_gate = build_lora_mm_id(gate_exps, mc_inp, selected_experts_c, nullptr);
-        cb(c_up,   "ffn_moe_cold_up",   il);
-        cb(c_gate, "ffn_moe_cold_gate", il);
-        c_up->src[3]         = dc->slot_skip_cold;
-        c_gate->src[3]       = dc->slot_skip_cold;
-        c_up->op_params[0]   = 0;
-        c_gate->op_params[0] = 0;
-
-        ggml_tensor * c_act  = ggml_swiglu_split(ctx0, c_gate, c_up);
-        ggml_tensor * c_down = build_lora_mm_id(down_exps, c_act, selected_experts_c, nullptr);
-        cb(c_down, "ffn_moe_cold_down", il);
-        c_down->src[3]       = dc->slot_skip_cold;
-        c_down->op_params[0] = 0;
-        c_down->op_params[2] = 1;
-
-        ggml_backend_sched_set_tensor_backend(sched, c_up,   backend_cpu_split);
-        ggml_backend_sched_set_tensor_backend(sched, c_gate, backend_cpu_split);
-        ggml_backend_sched_set_tensor_backend(sched, c_act,  backend_cpu_split);
-        ggml_backend_sched_set_tensor_backend(sched, c_down, backend_cpu_split);
-
-        experts = ggml_add(ctx0, experts, c_down);
-        cb(experts, "ffn_moe_host_merged", il);
     }
 
     // emit the host expert chain, then the shared expert, so the shared expert
@@ -2535,6 +2508,37 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // is the exact host-only result (up to fp rounding on the cached side)
         experts = ggml_add(ctx0, experts, mc_down);
         cb(experts, "ffn_moe_cache_merged", il);
+    }
+
+    if (split_host) {
+        // cold pass on the second CPU backend, emitted after the VRAM cache
+        // chain so the hot CPU split stays next to the GPU split (the early
+        // launch overlap). The scheduler gives the cold pass its own split and
+        // the node-prepare hook waits there for the disk batch that the get_rows
+        // handed to the worker, i.e. after the hot compute
+        ggml_tensor * c_up   = build_lora_mm_id(up_exps,   mc_inp, selected_experts_c, nullptr);
+        ggml_tensor * c_gate = build_lora_mm_id(gate_exps, mc_inp, selected_experts_c, nullptr);
+        cb(c_up,   "ffn_moe_cold_up",   il);
+        cb(c_gate, "ffn_moe_cold_gate", il);
+        c_up->src[3]         = dc->slot_skip_cold;
+        c_gate->src[3]       = dc->slot_skip_cold;
+        c_up->op_params[0]   = 0;
+        c_gate->op_params[0] = 0;
+
+        ggml_tensor * c_act  = ggml_swiglu_split(ctx0, c_gate, c_up);
+        ggml_tensor * c_down = build_lora_mm_id(down_exps, c_act, selected_experts_c, nullptr);
+        cb(c_down, "ffn_moe_cold_down", il);
+        c_down->src[3]       = dc->slot_skip_cold;
+        c_down->op_params[0] = 0;
+        c_down->op_params[2] = 1;
+
+        ggml_backend_sched_set_tensor_backend(sched, c_up,   backend_cpu_split);
+        ggml_backend_sched_set_tensor_backend(sched, c_gate, backend_cpu_split);
+        ggml_backend_sched_set_tensor_backend(sched, c_act,  backend_cpu_split);
+        ggml_backend_sched_set_tensor_backend(sched, c_down, backend_cpu_split);
+
+        experts = ggml_add(ctx0, experts, c_down);
+        cb(experts, "ffn_moe_host_merged", il);
     }
 
     if (down_exps_s) {
