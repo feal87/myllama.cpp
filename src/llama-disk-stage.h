@@ -51,6 +51,13 @@ struct llama_disk_stage_cache_layer {
     ggml_tensor * down  = nullptr;
     ggml_tensor * table = nullptr; // I32 [n_expert], expert id -> slot
     ggml_tensor * slot_skip = nullptr; // I32 [n_slots + 1], 1 at the sentinel
+    // split-hot: two static slot-indexed tables that partition the slots, so the
+    // host MoE can run a hot pass (residents) and a cold pass (transients) that
+    // overlap the read of the cold experts with the compute of the hot ones.
+    // skip_hot is 1 on transient + sentinel slots, skip_cold is 1 on resident +
+    // sentinel slots. Null when the split is off
+    ggml_tensor * slot_skip_hot  = nullptr;
+    ggml_tensor * slot_skip_cold = nullptr;
 };
 
 class llama_disk_stage {
@@ -100,6 +107,15 @@ public:
     // ensure the routed experts of layer il are in the cache and update the
     // layer's id table; reads the non-resident ones into transient slots
     void fill_cache(int il, const int32_t * ids, int64_t n_ids);
+
+    // split-hot variant: fill_cache_begin() sets the tables and hands the disk
+    // batch to a worker, then returns so the hot pass computes; fill_cache_wait()
+    // joins the worker and runs the miss copies. Only used when split_hot() is on
+    void fill_cache_begin(int il, const int32_t * ids, int64_t n_ids);
+    void fill_cache_wait(int il);
+
+    // true when the split-hot decode path is active (Windows + env opt-in)
+    bool split_hot() const;
 
     // number of independent decode-cache pools (0 when the cache is off)
     int n_pools() const;
@@ -195,4 +211,9 @@ private:
     // read warm experts into the slots left free by the base set, spread as
     // evenly as possible across the layers of each pool
     void preload_warm();
+
+    // slot assignment shared by fill_cache() and the split-hot pair: writes the
+    // layer's id table and collects the disk jobs, the independent copies and
+    // the miss copies. false when the layer has no cache or no routed ids
+    bool fill_cache_plan(int il, const int32_t * ids, int64_t n_ids);
 };

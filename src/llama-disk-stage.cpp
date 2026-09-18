@@ -290,6 +290,8 @@ struct llama_disk_stage::impl {
         int           pool           = -1;
         ggml_tensor * table    = nullptr;  // I32 [n_expert], expert id -> slot
         ggml_tensor * slot_skip = nullptr; // I32 [n_slots + 1], 1 at the sentinel
+        ggml_tensor * slot_skip_hot  = nullptr; // split-hot pass 1: 1 on transient + sentinel
+        ggml_tensor * slot_skip_cold = nullptr; // split-hot pass 2: 1 on resident + sentinel
         std::vector<int32_t> resident_slot;   // expert id -> slot, -1 when not resident
         std::vector<uint8_t> resident_filled; // expert id -> its slot holds this expert's data
         std::vector<uint8_t> vram;            // expert id -> served by the VRAM cache (host chain skips it)
@@ -366,6 +368,29 @@ struct llama_disk_stage::impl {
     std::vector<pool_copy>               fs_copies;       // copies independent of the disk batch
     std::vector<pool_copy>               fs_copies_after; // miss copies, run after the disk batch
     std::vector<std::pair<int, int64_t>> fs_l2_consume;
+
+    // split-hot decode: fill_cache_begin() hands the layer's disk batch to this
+    // worker and returns so the hot pass computes; fill_cache_wait() joins it.
+    // One batch in flight, since layers are sequential
+    bool split_hot_active = false;
+    std::thread             dec_io;
+    std::mutex              dec_io_mu;
+    std::condition_variable dec_io_cv;
+    std::condition_variable dec_io_done_cv;
+    bool                    dec_io_ready   = false; // begin() handed a batch over
+    bool                    dec_io_running = false; // worker is running it
+    bool                    dec_io_stop    = false;
+    bool                    dec_io_error   = false;
+    std::vector<disk_stage_job> dec_io_jobs;
+    // begin()/wait() handoff state, compute thread only
+    int32_t dec_wait_il   = -1;
+    int64_t dec_t0        = 0; // begin() entry, for the trace
+    int64_t dec_begin_us  = 0; // begin() duration, for the trace
+    size_t  dec_bytes     = 0; // disk bytes handed to the worker, for the stats
+    // routed ids served from RAM / cold / skipped (VRAM), set by fill_cache_plan
+    int64_t trace_n_res  = 0;
+    int64_t trace_n_cold = 0;
+    int64_t trace_n_vram = 0;
 
     // previous stats report, for the per-interval delta line
     uint64_t prev_l2_hits        = 0;
@@ -638,7 +663,25 @@ void llama_disk_stage::node_prepare_callback(struct ggml_tensor * node, void * u
 #if defined(_WIN32)
     auto * self = static_cast<llama_disk_stage *>(user_data);
     impl & p = *self->pimpl;
-    if (!p.active || node == nullptr || node->op != GGML_OP_GET_ROWS || node->src[0] == nullptr || node->src[1] == nullptr) {
+    if (!p.active || node == nullptr) {
+        return;
+    }
+
+    // split-hot: the cold pass runs in its own split, after the hot one. Its first
+    // node waits for the disk batch that the get_rows below handed to the worker,
+    // so the hot compute overlapped the read
+    if (p.split_hot_active && node->op == GGML_OP_MUL_MAT_ID) {
+        static const char cold[] = "ffn_moe_cold_";
+        if (std::strncmp(node->name, cold, sizeof(cold) - 1) == 0) {
+            const char * dash = std::strrchr(node->name, '-');
+            if (dash != nullptr) {
+                self->fill_cache_wait(atoi(dash + 1));
+            }
+        }
+        return;
+    }
+
+    if (node->op != GGML_OP_GET_ROWS || node->src[0] == nullptr || node->src[1] == nullptr) {
         return;
     }
 
@@ -665,7 +708,11 @@ void llama_disk_stage::node_prepare_callback(struct ggml_tensor * node, void * u
         return;
     }
 
-    self->fill_cache(it->second, (const int32_t *) t->data, n_used);
+    if (p.split_hot_active) {
+        self->fill_cache_begin(it->second, (const int32_t *) t->data, n_used);
+    } else {
+        self->fill_cache(it->second, (const int32_t *) t->data, n_used);
+    }
 #else
     GGML_UNUSED(node);
     GGML_UNUSED(user_data);
@@ -778,6 +825,13 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     if (!model.has_disk_weights()) {
         return;
     }
+
+    // experimental: split the host decode MoE into a hot and a cold pass so the
+    // cold disk read overlaps the hot compute. Opt-in via env
+    p.split_hot_active = [] {
+        const char * v = std::getenv("LLAMA_DISK_STAGE_SPLIT_HOT");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
 
     p.iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
     if (p.iocp == nullptr) {
@@ -1306,14 +1360,41 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                 ((int32_t *) skip->data)[pool.sentinel] = 1;
                                 off += align_up((size_t) (pool.sentinel + 1) * sizeof(int32_t), disk_stage_align);
 
-                                c.table     = tab;
-                                c.slot_skip = skip;
+                                // split-hot: static partition of the slots. skip_hot is 1
+                                // on the transients and the sentinel, skip_cold is 1 on the
+                                // residents and the sentinel, so the two host passes never
+                                // compute the same expert
+                                ggml_tensor * skip_hot  = nullptr;
+                                ggml_tensor * skip_cold = nullptr;
+                                if (p.split_hot_active) {
+                                    skip_hot  = ggml_new_tensor_2d(p.cache_ctx, GGML_TYPE_I32, 1, pool.sentinel + 1);
+                                    skip_cold = ggml_new_tensor_2d(p.cache_ctx, GGML_TYPE_I32, 1, pool.sentinel + 1);
+                                    ggml_format_name(skip_hot,  "disk_cache_skip_hot.%d",  il);
+                                    ggml_format_name(skip_cold, "disk_cache_skip_cold.%d", il);
+                                    ggml_backend_tensor_alloc(p.cache_buf, skip_hot, cbase + off);
+                                    off += align_up((size_t) (pool.sentinel + 1) * sizeof(int32_t), disk_stage_align);
+                                    ggml_backend_tensor_alloc(p.cache_buf, skip_cold, cbase + off);
+                                    off += align_up((size_t) (pool.sentinel + 1) * sizeof(int32_t), disk_stage_align);
+                                    int32_t * hot = (int32_t *) skip_hot->data;
+                                    int32_t * cld = (int32_t *) skip_cold->data;
+                                    for (int32_t s = 0; s <= pool.sentinel; ++s) {
+                                        hot[s] = (s < n_trans || s >= pool.sentinel) ? 1 : 0;
+                                        cld[s] = (s >= n_trans) ? 1 : 0;
+                                    }
+                                }
+
+                                c.table          = tab;
+                                c.slot_skip      = skip;
+                                c.slot_skip_hot  = skip_hot;
+                                c.slot_skip_cold = skip_cold;
                                 p.table_layer.emplace(tab, il);
-                                c.pub.gate      = pool.gate;
-                                c.pub.up        = pool.up;
-                                c.pub.down      = pool.down;
-                                c.pub.table     = tab;
-                                c.pub.slot_skip = skip;
+                                c.pub.gate           = pool.gate;
+                                c.pub.up             = pool.up;
+                                c.pub.down           = pool.down;
+                                c.pub.table          = tab;
+                                c.pub.slot_skip      = skip;
+                                c.pub.slot_skip_hot  = skip_hot;
+                                c.pub.slot_skip_cold = skip_cold;
                                 n_cache++;
                             }
                         }
@@ -1556,6 +1637,40 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
         });
     }
 
+    if (p.split_hot_active) {
+        p.dec_io = std::thread([&p]() {
+            for (;;) {
+                std::vector<disk_stage_job> jobs;
+                {
+                    std::unique_lock<std::mutex> lk(p.dec_io_mu);
+                    p.dec_io_cv.wait(lk, [&p] { return p.dec_io_stop || p.dec_io_ready; });
+                    if (p.dec_io_stop) {
+                        return;
+                    }
+                    jobs = std::move(p.dec_io_jobs);
+                    p.dec_io_ready   = false;
+                    p.dec_io_running = true;
+                }
+
+                bool err = false;
+                try {
+                    std::lock_guard<std::mutex> io(p.io_mu);
+                    disk_stage_run_jobs(jobs, 32, p.iocp);
+                } catch (...) {
+                    err = true;
+                }
+
+                {
+                    std::lock_guard<std::mutex> lk(p.dec_io_mu);
+                    p.dec_io_error   = err;
+                    p.dec_io_running = false;
+                }
+                p.dec_io_done_cv.notify_all();
+            }
+        });
+        LLAMA_LOG_INFO("%s: split-hot decode enabled\n", __func__);
+    }
+
     p.active = true;
     LLAMA_LOG_INFO("%s: disk staging active for %d layer(s), %.1f MiB pool, %d buffer(s), %zu-byte aligned unbuffered reads\n",
                    __func__, n_staged, total / (1024.0 * 1024.0), p.n_buf, disk_stage_align);
@@ -1718,8 +1833,20 @@ llama_disk_stage::~llama_disk_stage() {
         if (pimpl->reader.joinable()) {
             pimpl->reader.join();
         }
+        {
+            std::lock_guard<std::mutex> lk(pimpl->dec_io_mu);
+            pimpl->dec_io_stop = true;
+        }
+        pimpl->dec_io_cv.notify_all();
+        if (pimpl->dec_io.joinable()) {
+            pimpl->dec_io.join();
+        }
     }
 #endif
+}
+
+bool llama_disk_stage::split_hot() const {
+    return pimpl->split_hot_active;
 }
 
 void llama_disk_stage::fill(int il) {
@@ -2025,21 +2152,19 @@ void llama_disk_stage::fill_selected(int il, const int32_t * ids, int64_t n_ids)
 #endif
 }
 
-void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
+bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_ids) {
 #if defined(_WIN32)
     impl & p = *pimpl;
     if (il < 0 || il >= (int) p.cache.size()) {
-        return;
+        return false;
     }
     impl::cache_layer & c = p.cache[il];
     if (c.table == nullptr || n_ids <= 0) {
-        return;
+        return false;
     }
     impl::cache_pool & pool = p.pools[c.pool];
 
     int32_t * table = (int32_t *) c.table->data;
-
-    const int64_t t0 = ggml_time_us();
 
     std::vector<disk_stage_job> & jobs            = p.fs_jobs;
     std::vector<int32_t>        & newly_filled    = p.fs_newly_filled;
@@ -2072,9 +2197,9 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
 
     // routed ids served from RAM / read from disk / skipped (VRAM), for the trace:
     // a layer with cold ids and no residents has no compute to hide the read behind
-    int64_t n_res_ev  = 0;
-    int64_t n_cold_ev = 0;
-    int64_t n_vram_ev = 0;
+    p.trace_n_res  = 0;
+    p.trace_n_cold = 0;
+    p.trace_n_vram = 0;
 
     // slot assignment under the lock; the unbuffered reads below run without it
     {
@@ -2090,7 +2215,7 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
             // host mul_mat_id skips it, and read nothing
             if (c.vram[id]) {
                 table[id] = pool.sentinel;
-                n_vram_ev++;
+                p.trace_n_vram++;
                 continue;
             }
 
@@ -2100,7 +2225,7 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
             const int32_t slot = c.resident_slot[id];
             if (slot >= 0) {
                 table[id] = slot;
-                n_res_ev++;
+                p.trace_n_res++;
                 if (c.resident_filled[id] == 0) {
                     // a promoted expert may still sit in the L2 pool from its
                     // first route: copy it in instead of reading the disk again
@@ -2142,7 +2267,7 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
                 transient = trans_begin;
             }
             const int32_t use = transient++;
-            n_cold_ev++;
+            p.trace_n_cold++;
 
             if (epid >= 0) {
                 impl::evict_pool & ep = p.evict_pools[(size_t) epid];
@@ -2214,6 +2339,32 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
             table[id] = use;
         }
     }
+
+    // the copies that do not depend on the reads run on a second thread while
+    // the drive is busy (same as fill_run); the miss copies below run after the
+    // join, so they read the bytes the disk batch just landed
+    return true;
+#else
+    GGML_UNUSED(il);
+    GGML_UNUSED(ids);
+    GGML_UNUSED(n_ids);
+    return false;
+#endif
+}
+
+void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
+#if defined(_WIN32)
+    impl & p = *pimpl;
+    const int64_t t0 = ggml_time_us();
+    if (!fill_cache_plan(il, ids, n_ids)) {
+        return;
+    }
+    impl::cache_layer & c = p.cache[il];
+    std::vector<disk_stage_job> & jobs = p.fs_jobs;
+    std::vector<impl::pool_copy>& copies = p.fs_copies;
+    std::vector<impl::pool_copy>& copies_after = p.fs_copies_after;
+    std::vector<int32_t> & newly_filled = p.fs_newly_filled;
+    std::vector<std::pair<int, int64_t>> & l2_consume = p.fs_l2_consume;
 
     // the copies that do not depend on the reads run on a second thread while
     // the drive is busy (same as fill_run); the miss copies below run after the
@@ -2305,7 +2456,7 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
         LLAMA_LOG_INFO("[disk-stage] decode L%d: fill=%.2f ms jobs=%zu (%.2f MiB) res=%" PRId64 " cold=%" PRId64
                        " vram=%" PRId64 " gap=%.2f ms\n",
                        il, fill_ms, jobs.size(), disk_bytes / (1024.0 * 1024.0),
-                       n_res_ev, n_cold_ev, n_vram_ev, gap_us / 1000.0);
+                       p.trace_n_res, p.trace_n_cold, p.trace_n_vram, gap_us / 1000.0);
         p.trace_prev_il = il;
         p.trace_prev_us = t1;
     }
@@ -2313,6 +2464,154 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
     GGML_UNUSED(il);
     GGML_UNUSED(ids);
     GGML_UNUSED(n_ids);
+#endif
+}
+
+void llama_disk_stage::fill_cache_begin(int il, const int32_t * ids, int64_t n_ids) {
+#if defined(_WIN32)
+    impl & p = *pimpl;
+    p.dec_wait_il = -1;
+    if (!p.split_hot_active) {
+        fill_cache(il, ids, n_ids);
+        return;
+    }
+    if (il < 0 || il >= (int) p.cache.size() || p.cache[il].table == nullptr || n_ids <= 0) {
+        return;
+    }
+
+    // a promoted-but-unread resident is served by a read in this same batch, so
+    // the hot pass would race it; fall back to the synchronous fill for this layer
+    {
+        impl::cache_layer & c = p.cache[il];
+        for (int64_t i = 0; i < n_ids; ++i) {
+            const int32_t id = ids[i];
+            if (id < 0 || id >= (int32_t) c.resident_slot.size() || c.vram[id]) {
+                continue;
+            }
+            if (c.resident_slot[id] >= 0 && c.resident_filled[id] == 0) {
+                fill_cache(il, ids, n_ids);
+                return;
+            }
+        }
+    }
+
+    const int64_t t0 = ggml_time_us();
+    if (!fill_cache_plan(il, ids, n_ids)) {
+        return;
+    }
+
+    std::vector<disk_stage_job> & jobs = p.fs_jobs;
+    std::vector<impl::pool_copy>& copies = p.fs_copies;
+
+    p.dec_bytes = 0;
+    for (const disk_stage_job & j : jobs) {
+        p.dec_bytes += j.len;
+    }
+
+    size_t copy_bytes = 0;
+    for (const impl::pool_copy & cp : copies) {
+        copy_bytes += cp.len;
+    }
+
+    std::thread copier;
+    if (copy_bytes >= disk_stage_copy_thread_min) {
+        try {
+            copier = std::thread([&copies]() {
+                for (const impl::pool_copy & cp : copies) {
+                    std::memcpy(cp.dst, cp.src, cp.len);
+                }
+            });
+        } catch (...) {
+            // no thread: the copies run inline below
+        }
+    }
+
+    // hand the disk batch to the worker so it runs while the hot pass computes
+    {
+        std::lock_guard<std::mutex> lk(p.dec_io_mu);
+        p.dec_io_jobs  = std::move(jobs);
+        p.dec_io_error = false;
+        p.dec_io_ready = !p.dec_io_jobs.empty();
+    }
+    if (p.dec_io_ready) {
+        p.dec_io_cv.notify_one();
+    }
+
+    if (copier.joinable()) {
+        copier.join();
+    } else {
+        for (const impl::pool_copy & cp : copies) {
+            std::memcpy(cp.dst, cp.src, cp.len);
+        }
+    }
+
+    p.dec_wait_il  = il;
+    p.dec_t0       = t0;
+    p.dec_begin_us = ggml_time_us() - t0;
+#else
+    GGML_UNUSED(il);
+    GGML_UNUSED(ids);
+    GGML_UNUSED(n_ids);
+#endif
+}
+
+void llama_disk_stage::fill_cache_wait(int il) {
+#if defined(_WIN32)
+    impl & p = *pimpl;
+    if (p.dec_wait_il != il) {
+        return; // the synchronous fallback already completed this layer
+    }
+    p.dec_wait_il = -1;
+
+    const int64_t tw = ggml_time_us();
+    {
+        std::unique_lock<std::mutex> lk(p.dec_io_mu);
+        p.dec_io_done_cv.wait(lk, [&p] { return !p.dec_io_running && !p.dec_io_ready; });
+    }
+    const int64_t twait = ggml_time_us() - tw;
+
+    bool failed = false;
+    {
+        std::lock_guard<std::mutex> lk(p.dec_io_mu);
+        failed = p.dec_io_error;
+    }
+
+    impl::cache_layer & c = p.cache[il];
+    std::vector<impl::pool_copy>& copies_after = p.fs_copies_after;
+    std::vector<int32_t> & newly_filled = p.fs_newly_filled;
+    std::vector<std::pair<int, int64_t>> & l2_consume = p.fs_l2_consume;
+
+    // a miss copies the bytes the reads above just landed in the pool slot
+    for (const impl::pool_copy & cp : copies_after) {
+        std::memcpy(cp.dst, cp.src, cp.len);
+    }
+
+    if (!l2_consume.empty() || !newly_filled.empty()) {
+        std::lock_guard<std::mutex> lock(p.cache_mu);
+        for (const auto & [e, key] : l2_consume) {
+            p.evict_remove(e, key);
+        }
+        for (const int32_t id : newly_filled) {
+            c.resident_filled[id] = 1;
+        }
+    }
+
+    p.n_dec_fill_calls++;
+    p.n_dec_fill_us    += (uint64_t) (p.dec_begin_us + twait);
+    p.n_dec_fill_bytes += p.dec_bytes;
+
+    if (disk_stage_trace()) {
+        LLAMA_LOG_INFO("[disk-stage] split L%d: begin=%.2f ms wait=%.2f ms jobs_bytes=%.2f MiB res=%" PRId64 " cold=%" PRId64
+                       " vram=%" PRId64 "\n",
+                       il, p.dec_begin_us / 1000.0, twait / 1000.0, p.dec_bytes / (1024.0 * 1024.0),
+                       p.trace_n_res, p.trace_n_cold, p.trace_n_vram);
+    }
+
+    if (failed) {
+        throw std::runtime_error("disk stage: unbuffered read failed");
+    }
+#else
+    GGML_UNUSED(il);
 #endif
 }
 

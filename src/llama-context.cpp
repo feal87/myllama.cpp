@@ -500,6 +500,21 @@ llama_context::llama_context(
         if (backend_cpu == nullptr) {
             throw std::runtime_error("failed to initialize CPU backend");
         }
+
+        // split-hot: a second CPU backend hosts the cold MoE pass. The scheduler
+        // starts a new split when the backend changes, so the hot pass runs and
+        // completes before the cold split prepares, i.e. the cold read overlaps
+        // the hot compute. Registered BEFORE the main CPU backend so the latter
+        // stays the scheduler's last backend: the prefill VRAM/host overlap is an
+        // early launch gated on the last backend
+        if (disk_stage != nullptr && disk_stage->split_hot()) {
+            backend_cpu_split = ggml_backend_cpu_init();
+            if (backend_cpu_split == nullptr) {
+                throw std::runtime_error("failed to initialize the split CPU backend");
+            }
+            backends.emplace_back(backend_cpu_split);
+        }
+
         backends.emplace_back(backend_cpu);
 
         // create a list of the set_n_threads functions in the backends
@@ -2853,6 +2868,7 @@ llm_graph_params llama_context::graph_params(
         /*.gtype       =*/ gtype,
         /*.sched       =*/ sched.get(),
         /*.backend_cpu =*/ backend_cpu,
+        /*.backend_cpu_split =*/ backend_cpu_split,
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
