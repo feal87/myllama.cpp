@@ -1259,6 +1259,10 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                     for (size_t j = 0; j < grp.size(); ++j) {
                         cache_bytes += align_up((size_t) n_expert * sizeof(int32_t), disk_stage_align);
                         cache_bytes += align_up((size_t) (n_pool_slots + 1) * sizeof(int32_t), disk_stage_align);
+                        if (p.split_hot_active) {
+                            // split-hot: the hot and cold slot tables
+                            cache_bytes += 2 * align_up((size_t) (n_pool_slots + 1) * sizeof(int32_t), disk_stage_align);
+                        }
                     }
                 }
 
