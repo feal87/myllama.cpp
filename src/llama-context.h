@@ -193,6 +193,12 @@ struct llama_context {
 
     llama_memory_breakdown memory_breakdown() const;
 
+    // diagnostic: log one line per device (and host) with the free/total device
+    // memory and the attributed consumers (model, KV context, compute buffers,
+    // MoE expert cache pool, CUDA scratch pools, cuBLAS workspaces). `tag`
+    // identifies the call site in the log
+    void memory_report(const char * tag) const;
+
     // --moe-expert-cache*: release / re-reserve the device pool of the MoE
     // expert cache so its VRAM can serve another consumer (e.g. the mmproj) and
     // be restored afterwards. suspend() must be called with no graph in flight.
@@ -208,6 +214,35 @@ struct llama_context {
     // device bytes the MoE cache reclaims when the prefill compute buffer is
     // released (pp size - tg size on the cache's device, 0 when unavailable)
     uint64_t vram_reclaim_bytes() const;
+
+    // the CUDA backend of the MoE device, or null when the cache is off or the
+    // backend does not expose the scratch procs (non-CUDA)
+    ggml_backend_t moe_backend() const;
+
+    // device bytes held by the CUDA scratch pools and cuBLAS workspaces on the
+    // MoE device (0 when unavailable)
+    uint64_t moe_device_scratch_bytes() const;
+
+    // device bytes the MoE budget must leave aside for the CUDA scratch. Until
+    // the first decode has grown the scratch, its peak is unknown, so a
+    // one-time guard (kMoeScratchReserve) is used and later trimmed away
+    uint64_t moe_scratch_target_bytes() const;
+
+    // what the scratch actually costs the budget right now: the target or the
+    // already reserved pool, whichever is larger (the reserve rounds up to the
+    // VMM granularity)
+    uint64_t moe_scratch_charge_bytes() const;
+
+    // make sure the scratch pools can cover `bytes` before a graph runs; false
+    // means the device is full and the MoE pool has to give room back
+    bool moe_reserve_scratch(uint64_t bytes);
+
+    // release the scratch reserved above its high-water mark (see trim())
+    uint64_t moe_trim_scratch();
+
+    // forget the scratch high-water mark so the next trim releases it (used at
+    // the prefill/decode boundaries so each phase pays only for its own peak)
+    void moe_reset_scratch_peak();
 
     //
     // training
@@ -339,6 +374,18 @@ private:
     // layout generation of the MoE cache that backend_buf_tg_size was last
     // measured against (see moe_cache_update_budget)
     uint32_t moe_cache_measured_gen = 0;
+
+    // false until the first decode has grown the CUDA scratch to its real peak;
+    // while false the budget keeps kMoeScratchReserve aside and the scratch is
+    // trimmed back once the peak is known (see moe_scratch_target_bytes)
+    bool moe_scratch_measured = false;
+    // the decode-phase scratch peak, measured after the first decode graph. The
+    // scratch high-water is reset at every prefill/decode boundary so the
+    // prefill peak (tens of MiB) is not charged to decode (KiB)
+    uint64_t moe_decode_scratch = 0;
+    // set when the pool has been resumed for the first decode: the scratch is
+    // measured and trimmed after that graph completes
+    bool moe_scratch_measure_pending = false;
 
     // --load-mode dio: direct-read streaming of the MoE expert weights into a
     // pinned host slab and a per-layer decode cache (null when not requested)

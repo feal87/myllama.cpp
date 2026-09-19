@@ -1209,6 +1209,23 @@ struct ggml_cuda_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
+
+    // device bytes currently held by the pool (diagnostics)
+    virtual size_t size() const = 0;
+
+    // grow the pool so a later alloc(size) is served without asking the driver
+    // for more memory. Returns false when the device has none left (no abort),
+    // so the caller can free device memory and retry
+    virtual bool reserve(size_t size) = 0;
+
+    // unmap everything above the highest byte ever used, returning the device
+    // bytes released. Only valid while no allocation is live
+    virtual size_t trim() = 0;
+
+    // forget the high-water mark: the next trim() keeps only the live bytes.
+    // Used when the workload phase changes (prefill <-> decode), so the peak of
+    // one phase is not charged to the other
+    virtual void reset_peak() = 0;
 };
 
 template<typename T>
@@ -1569,6 +1586,39 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_pool & pool() {
         return pool(device);
+    }
+
+    // make sure the per-stream scratch pool can cover `bytes` before a graph
+    // runs. Returns false when the device is full (no abort)
+    bool reserve_scratch(size_t bytes) {
+        return pool().reserve(bytes);
+    }
+
+    // release the scratch reserved above the high-water mark. Call only with no
+    // graph in flight. Returns the device bytes released
+    size_t trim_scratch() {
+        return pool().trim();
+    }
+
+    // forget the scratch high-water mark so the next trim_scratch() reclaims it
+    void reset_scratch_peak() {
+        pool().reset_peak();
+    }
+
+    // device bytes held by the per-stream scratch pools and the cuBLAS workspaces
+    void mem_info(size_t & scratch_bytes, size_t & cublas_bytes) const {
+        scratch_bytes = 0;
+        cublas_bytes  = 0;
+        for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+            for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+                if (pools[d][s]) {
+                    scratch_bytes += pools[d][s]->size();
+                }
+                if (cublas_workspaces[d][s] != nullptr) {
+                    cublas_bytes += cublas_workspace_sizes[d];
+                }
+            }
+        }
     }
 };
 

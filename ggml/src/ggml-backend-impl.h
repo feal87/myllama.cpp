@@ -72,6 +72,7 @@ extern "C" {
         void * context;
         size_t size;
         enum ggml_backend_buffer_usage usage;
+        uint32_t mem_tag_id; // memory accounting tag (UINT32_MAX = not registered)
     };
 
     GGML_API ggml_backend_buffer_t ggml_backend_buffer_init(

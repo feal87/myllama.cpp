@@ -3954,7 +3954,17 @@ struct clip_model_loader {
     }
 };
 
+// attribute the mmproj (and its context) buffers to a distinct memory tag
+namespace {
+struct clip_mem_tag_guard {
+    explicit clip_mem_tag_guard(const char * tag) { ggml_backend_mem_push(tag); }
+    ~clip_mem_tag_guard() { ggml_backend_mem_pop(); }
+};
+} // namespace
+
 struct clip_init_result clip_init(const char * fname, struct clip_context_params ctx_params) {
+    clip_mem_tag_guard mem_tag("mmproj");
+
     clip_ctx * ctx_vision = nullptr;
     clip_ctx * ctx_audio = nullptr;
     clip_ctx * ctx_gen_audio = nullptr;

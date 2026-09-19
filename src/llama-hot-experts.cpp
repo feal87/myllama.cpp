@@ -604,7 +604,10 @@ bool llama_hot_expert_cache::ensure_obs_stage(ggml_backend_t backend, size_t byt
         obs_stage_buf = nullptr;
         obs_stage     = nullptr;
     }
-    obs_stage_buf = ggml_backend_buft_alloc_buffer(host_buft, bytes);
+    {
+        llama_mem_tag_scope mem_scope("hot");
+        obs_stage_buf = ggml_backend_buft_alloc_buffer(host_buft, bytes);
+    }
     if (obs_stage_buf == nullptr) {
         obs_stage_cap = 0;
         return false;

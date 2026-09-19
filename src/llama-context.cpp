@@ -540,7 +540,10 @@ llama_context::llama_context(
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
 
-        memory.reset(model.create_memory(params_mem, cparams));
+        {
+            llama_mem_tag_scope mem_scope("kv");
+            memory.reset(model.create_memory(params_mem, cparams));
+        }
     }
 
     // init backends
@@ -636,17 +639,21 @@ llama_context::llama_context(
     // and decode hands them over to the cache. The pool reserved above is the
     // user's prefill-safe base; the reclaimed prefill compute bytes are added to
     // the budget used from the first decode on (see vram_swap). Start in prefill
-    // mode, where both are allocated as before this feature
+    // mode with the pool released, matching every later prefill: the compute
+    // buffers and the CUDA scratch need the room until the first decode
     if (moe_cache && cparams.n_ubatch > 1 && moe_cache->budget_bytes() > 0) {
         const uint64_t extra = vram_reclaim_bytes();
         if (extra > 0) {
             moe_cache->set_decode_budget_extra(extra);
             vram_swap_enabled = true;
             vram_prefill_mode = true;
+            moe_cache->suspend();
             LLAMA_LOG_INFO("%s: VRAM swap enabled: %.1f MiB of the prefill compute buffer will be reclaimed for the MoE expert cache on decode\n",
                     __func__, extra/(1024.0*1024.0));
         }
     }
+
+    memory_report("startup");
 }
 
 llama_context::~llama_context() {
@@ -754,6 +761,9 @@ void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
     }
+
+    // every buffer allocated from here on is a compute buffer
+    llama_mem_tag_scope mem_scope("compute");
 
     sched_need_reserve = false;
 
@@ -1560,8 +1570,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // Afterwards gparams.moe_cache is non-null, which invalidates the reused
     // pre-activation graph, so the decode graph is rebuilt with the cache chain.
     if (ubatch.n_tokens == 1 && moe_cache) {
+        const bool was_active = moe_cache->is_active();
         moe_cache->maybe_activate();
+        if (!was_active && moe_cache->is_active()) {
+            memory_report("moe_cache: activated");
+        }
         moe_cache_update_budget();
+        // the first decode grows the CUDA scratch to its decode peak: measure
+        // and trim it after this graph has run (see graph_compute)
+        if (!moe_scratch_measured) {
+            moe_scratch_measure_pending = true;
+        }
     }
 
     // the new graph parameters
@@ -1580,6 +1599,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
+        // a graph (re)build may reallocate the compute buffers; keep them in
+        // the "compute" bucket even when sched_reserve() is not the allocator
+        llama_mem_tag_scope mem_scope("compute");
         for (;;) {
             gf_res_prev_active = nullptr;
             res->reset();
@@ -1625,6 +1647,26 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 }
             }
 
+            // the CUDA scratch (op temporaries) lives outside the scheduler
+            // buffers: make sure its pools can take this graph before it runs,
+            // otherwise cuMemCreate aborts mid-op. When the MoE pool has taken
+            // the room, shrink it and retry
+            const uint64_t scratch_target = moe_scratch_target_bytes();
+            if (!moe_reserve_scratch(scratch_target)) {
+                if (moe_cache && moe_cache->is_active() && moe_cache->shrink_decode_budget()) {
+                    LLAMA_LOG_WARN("%s: CUDA scratch reservation of %.1f MiB failed with the MoE cache active - shrinking the cache and retrying\n",
+                            __func__, scratch_target/(1024.0*1024.0));
+                    memory_report("scratch reserve failed: shrinking");
+                    ggml_backend_sched_synchronize(sched.get());
+                    moe_cache->suspend();
+                    if (moe_cache->resume()) {
+                        gparams = graph_params(res, ubatch, mctx, gtype);
+                        continue;
+                    }
+                }
+                LLAMA_LOG_WARN("%s: could not reserve %.1f MiB of CUDA scratch\n", __func__, scratch_target/(1024.0*1024.0));
+            }
+
             if (ggml_backend_sched_alloc_graph(sched.get(), gf)) {
                 break;
             }
@@ -1635,9 +1677,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             // error once the pool cannot shrink any further
             if (moe_cache && moe_cache->is_active() && moe_cache->shrink_decode_budget()) {
                 LLAMA_LOG_WARN("%s: graph allocation failed with the MoE cache active - shrinking the cache and retrying\n", __func__);
+                memory_report("graph alloc failed: shrinking");
                 ggml_backend_sched_synchronize(sched.get());
                 moe_cache->suspend();
                 if (moe_cache->resume()) {
+                    memory_report("graph alloc failed: shrunk");
                     gparams = graph_params(res, ubatch, mctx, gtype);
                     continue;
                 }
@@ -2505,7 +2549,10 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         if (output_dev_host_buft) {
             buft = output_dev_host_buft;
         }
-        buf_output.reset(ggml_backend_buft_alloc_buffer(buft, new_size));
+        {
+            llama_mem_tag_scope mem_scope("output");
+            buf_output.reset(ggml_backend_buft_alloc_buffer(buft, new_size));
+        }
         if (buf_output == nullptr) {
             LLAMA_LOG_ERROR("%s: failed to allocate output buffer of size %.2f MiB\n", __func__, new_size / (1024.0 * 1024.0));
             return 0;
@@ -2910,6 +2957,20 @@ ggml_status llama_context::graph_compute(
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+    }
+
+    // the first decode grew the CUDA scratch pools to their decode peak: keep
+    // that and drop the one-time reserve, then let the next decode size the MoE
+    // pool with the real value (see moe_scratch_target_bytes)
+    if (moe_scratch_measure_pending && status == GGML_STATUS_SUCCESS) {
+        synchronize();
+        const uint64_t trimmed = moe_trim_scratch();
+        moe_decode_scratch = moe_device_scratch_bytes();
+        moe_scratch_measured = true;
+        moe_scratch_measure_pending = false;
+        moe_cache_measured_gen = 0; // re-measure the budget with the real peak
+        LLAMA_LOG_INFO("%s: decode CUDA scratch peak measured at %.1f MiB (%.1f MiB of the reserve released)\n",
+                __func__, moe_decode_scratch/(1024.0*1024.0), trimmed/(1024.0*1024.0));
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
@@ -3843,6 +3904,133 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
     return ret;
 }
 
+// log the current device/host memory picture with the known consumers named.
+// This is the observation point for the MoE cache VRAM swap and the CUDA
+// runtime scratch (which is not part of memory_breakdown())
+namespace {
+
+struct mem_report_dev {
+    std::map<std::string, size_t> tags;
+    size_t scratch = 0;
+    size_t cublas  = 0;
+};
+
+struct mem_report_ctx {
+    const std::vector<llama_device> * devices = nullptr;
+    std::vector<mem_report_dev> *     devs    = nullptr;
+    std::map<std::string, size_t> *   host    = nullptr;
+};
+
+void mem_report_cb(ggml_backend_buffer_type_t buft, const char * tag, size_t bytes, size_t count, void * ud) {
+    (void) count;
+    auto * ctx = (mem_report_ctx *) ud;
+    if (ggml_backend_buft_is_host(buft)) {
+        (*ctx->host)[tag] += bytes;
+        return;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr) {
+        return;
+    }
+    for (size_t i = 0; i < ctx->devices->size(); ++i) {
+        if ((*ctx->devices)[i].dev == dev) {
+            (*ctx->devs)[i].tags[tag] += bytes;
+            return;
+        }
+    }
+}
+
+// render "tag=MiB tag=MiB ..." hottest first and return the total
+std::string mem_report_detail(const std::map<std::string, size_t> & tags, size_t & total) {
+    std::vector<std::pair<std::string, size_t>> sorted(tags.begin(), tags.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto & a, const auto & b) { return a.second > b.second; });
+
+    std::string out;
+    total = 0;
+    for (const auto & [t, b] : sorted) {
+        total += b;
+        if (!out.empty()) {
+            out += " ";
+        }
+        out += t + "=" + std::to_string((long long) (b / (1024 * 1024)));
+    }
+    return out;
+}
+
+} // namespace
+
+void llama_context::memory_report(const char * tag) const {
+    if (!sched) {
+        return;
+    }
+
+    constexpr double MiB = 1024.0 * 1024.0;
+
+    std::vector<mem_report_dev>   devs(model.devices.size());
+    std::map<std::string, size_t> host_tags;
+
+    mem_report_ctx cb_ctx;
+    cb_ctx.devices = &model.devices;
+    cb_ctx.devs    = &devs;
+    cb_ctx.host    = &host_tags;
+    ggml_backend_mem_foreach(mem_report_cb, &cb_ctx);
+
+    // CUDA runtime scratch pools and cuBLAS workspaces (per backend instance)
+    using mem_info_fn = void (*)(ggml_backend_t, size_t *, size_t *);
+    for (const auto & backend_ptr : backends) {
+        ggml_backend_t backend = backend_ptr.get();
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg == nullptr) {
+            continue;
+        }
+        auto * fn = (mem_info_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_mem_info");
+        if (fn == nullptr) {
+            continue;
+        }
+        size_t scratch = 0;
+        size_t cublas  = 0;
+        fn(backend, &scratch, &cublas);
+        for (size_t i = 0; i < model.devices.size(); ++i) {
+            if (model.devices[i].dev == dev) {
+                devs[i].scratch += scratch;
+                devs[i].cublas  += cublas;
+                break;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < model.devices.size(); ++i) {
+        ggml_backend_dev_t dev = model.devices[i].dev;
+        size_t free  = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+
+        size_t            named = 0;
+        const std::string detail = mem_report_detail(devs[i].tags, named);
+        const size_t self = named + devs[i].scratch + devs[i].cublas;
+        const int64_t other = (int64_t) total - (int64_t) free - (int64_t) self;
+
+        LLAMA_LOG_INFO("[mem] %s: %s total=%.0f free=%.0f self=%.0f scratch=%.0f cublas=%.0f other=%.0f | %s MiB\n",
+                tag, ggml_backend_dev_name(dev),
+                total/MiB, free/MiB, self/MiB,
+                devs[i].scratch/MiB, devs[i].cublas/MiB, (double) other/MiB,
+                detail.c_str());
+    }
+
+    {
+        size_t free  = 0;
+        size_t total = 0;
+        if (backend_cpu != nullptr) {
+            ggml_backend_dev_memory(ggml_backend_get_device(backend_cpu), &free, &total);
+        }
+        size_t            named = 0;
+        const std::string detail = mem_report_detail(host_tags, named);
+        LLAMA_LOG_INFO("[mem] %s: Host total=%.0f free=%.0f self=%.0f | %s MiB\n",
+                tag, total/MiB, free/MiB, named/MiB, detail.c_str());
+    }
+}
+
 bool llama_context::moe_cache_suspend() {
     return moe_cache ? moe_cache->suspend() : false;
 }
@@ -3857,6 +4045,119 @@ bool llama_context::moe_cache_resume() {
         return false;
     }
     return moe_cache->resume();
+}
+
+// one-time scratch guard held in the MoE budget until the first decode has
+// grown the CUDA scratch pools to their real decode peak
+static const uint64_t kMoeScratchReserve = 256ull << 20;
+
+// the decode budget reclaims pp - tg. Keep a small slack for the difference
+// between the measured (full memory context) and the actual (partial) decode
+// graph plus the driver allocation granularity
+static const uint64_t kMoeReclaimSlack = 16ull << 20;
+
+ggml_backend_t llama_context::moe_backend() const {
+    if (!moe_cache) {
+        return nullptr;
+    }
+    const ggml_backend_dev_t dev = moe_cache->device();
+    if (dev == nullptr) {
+        return nullptr;
+    }
+    for (const auto & backend_ptr : backends) {
+        if (ggml_backend_get_device(backend_ptr.get()) == dev) {
+            return backend_ptr.get();
+        }
+    }
+    return nullptr;
+}
+
+uint64_t llama_context::moe_device_scratch_bytes() const {
+    ggml_backend_t backend = moe_backend();
+    if (backend == nullptr) {
+        return 0;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    if (reg == nullptr) {
+        return 0;
+    }
+    using mem_info_fn = void (*)(ggml_backend_t, size_t *, size_t *);
+    auto * fn = (mem_info_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_mem_info");
+    if (fn == nullptr) {
+        return 0;
+    }
+    size_t scratch = 0;
+    size_t cublas  = 0;
+    fn(backend, &scratch, &cublas);
+    return scratch + cublas;
+}
+
+uint64_t llama_context::moe_scratch_target_bytes() const {
+    uint64_t bytes = moe_decode_scratch;
+    if (!moe_scratch_measured && bytes < kMoeScratchReserve) {
+        bytes = kMoeScratchReserve;
+    }
+    return bytes;
+}
+
+uint64_t llama_context::moe_scratch_charge_bytes() const {
+    const uint64_t target = moe_scratch_target_bytes();
+    const uint64_t actual = moe_device_scratch_bytes();
+    return target > actual ? target : actual;
+}
+
+void llama_context::moe_reset_scratch_peak() {
+    ggml_backend_t backend = moe_backend();
+    if (backend == nullptr) {
+        return;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    if (reg == nullptr) {
+        return;
+    }
+    using reset_fn = void (*)(ggml_backend_t);
+    auto * fn = (reset_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_reset_scratch_peak");
+    if (fn == nullptr) {
+        return;
+    }
+    fn(backend);
+}
+
+bool llama_context::moe_reserve_scratch(uint64_t bytes) {
+    if (bytes == 0) {
+        return true;
+    }
+    ggml_backend_t backend = moe_backend();
+    if (backend == nullptr) {
+        return true;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    if (reg == nullptr) {
+        return true;
+    }
+    using reserve_fn = bool (*)(ggml_backend_t, size_t);
+    auto * fn = (reserve_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_reserve_scratch");
+    if (fn == nullptr) {
+        return true;
+    }
+    return fn(backend, (size_t) bytes);
+}
+
+uint64_t llama_context::moe_trim_scratch() {
+    ggml_backend_t backend = moe_backend();
+    if (backend == nullptr) {
+        return 0;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    if (reg == nullptr) {
+        return 0;
+    }
+    using trim_fn = size_t (*)(ggml_backend_t);
+    auto * fn = (trim_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_trim_scratch");
+    if (fn == nullptr) {
+        return 0;
+    }
+    return fn(backend);
 }
 
 uint64_t llama_context::vram_reclaim_bytes() const {
@@ -3877,7 +4178,11 @@ uint64_t llama_context::vram_reclaim_bytes(const std::vector<size_t> & tg_sizes)
         }
         const size_t pp = i < backend_buf_pp_size.size() ? backend_buf_pp_size[i] : 0;
         const size_t tg = i < tg_sizes.size() ? tg_sizes[i] : 0;
-        return pp > tg ? (uint64_t) (pp - tg) : 0;
+        // the CUDA scratch and cuBLAS workspaces live outside the scheduler
+        // buffers, so leave their share of the reclaimed bytes aside, plus the
+        // measured-vs-actual decode graph slack
+        const uint64_t reserve = moe_scratch_charge_bytes() + kMoeReclaimSlack;
+        return pp > tg + reserve ? (uint64_t) (pp - tg - reserve) : 0;
     }
     return 0;
 }
@@ -3916,6 +4221,15 @@ void llama_context::moe_cache_update_budget() {
         return;
     }
 
+    // on the first decode the pool is still at the base budget and the scratch
+    // guard is held: only record the corrected extra, the next resume applies
+    // it (the guard is trimmed away after this decode, see graph_compute)
+    if (!moe_scratch_measured) {
+        moe_cache_measured_gen = gen;
+        return;
+    }
+
+    memory_report("moe_update_budget: extra changed");
     ggml_backend_sched_synchronize(sched.get());
     moe_cache->suspend();
     if (!moe_cache->resume()) {
@@ -3923,6 +4237,7 @@ void llama_context::moe_cache_update_budget() {
         return;
     }
     moe_cache_measured_gen = moe_cache->layout_generation();
+    memory_report("moe_update_budget: resized");
 }
 
 void llama_context::vram_swap(bool to_prefill) {
@@ -3937,13 +4252,31 @@ void llama_context::vram_swap(bool to_prefill) {
         // decode -> prefill: hand the VRAM back to the compute buffers
         moe_cache->suspend();
         ggml_backend_sched_release_buffers(sched.get());
+        // prefill needs a much larger scratch than decode: forget the decode
+        // peak so the released bytes go to the compute buffers, and let the
+        // prefill graph re-grow the scratch as needed
+        moe_reset_scratch_peak();
+        moe_trim_scratch();
         vram_prefill_mode = true;
     } else {
         // prefill -> decode: hand the VRAM back to the MoE cache. The pool may
         // still hold the prefill-safe base size (first decode after start-up)
         moe_cache->suspend();
         ggml_backend_sched_release_buffers(sched.get());
-        moe_cache->resume();
+        // drop the (large) prefill scratch peak and reserve the decode-phase
+        // scratch before the pool takes the room. The first decode still uses
+        // the one-time guard until the real decode peak is measured
+        moe_reset_scratch_peak();
+        moe_trim_scratch();
+        moe_reserve_scratch(moe_scratch_target_bytes());
+        if (!moe_scratch_measured) {
+            // first decode: the decode extra is still the pre-activation
+            // estimate, so resume at the base only and let the scratch grow
+            // into the released compute region (see moe_cache_update_budget)
+            moe_cache->resume_base();
+        } else {
+            moe_cache->resume();
+        }
         vram_prefill_mode = false;
     }
 
@@ -3954,6 +4287,8 @@ void llama_context::vram_swap(bool to_prefill) {
         }
     }
     gf_res_prev_active = nullptr;
+
+    memory_report(to_prefill ? "vram_swap -> prefill" : "vram_swap -> decode");
 }
 
 uint64_t llama_context::moe_cache_budget_bytes() const {

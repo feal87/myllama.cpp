@@ -20,6 +20,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <map>
+#include <mutex>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -37,13 +40,111 @@ const char * ggml_backend_buft_name(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name(buft);
 }
 
+//
+// backend buffer memory accounting (diagnostics)
+//
+// Every buffer allocated through ggml_backend_buft_alloc_buffer is attributed
+// to the tag pushed by the caller (innermost wins). The live totals are kept in
+// a registry so a report can break the device/host footprint down by consumer
+// instead of lumping everything unaccounted together.
+
+struct ggml_backend_mem_entry {
+    ggml_backend_buffer_type_t buft = nullptr;
+    size_t bytes = 0;
+    size_t count = 0;
+};
+
+static std::mutex g_mem_mutex;
+static std::vector<std::string> g_mem_tag_names = { "unlabeled" };
+static std::unordered_map<std::string, uint32_t> g_mem_tag_ids = { { "unlabeled", 0 } };
+static std::map<std::pair<uintptr_t, uint32_t>, ggml_backend_mem_entry> g_mem_entries;
+// per-thread tag scope: concurrent context creation must not interleave tags
+static thread_local std::vector<uint32_t> g_mem_tag_stack;
+
+// g_mem_mutex held
+static uint32_t ggml_backend_mem_intern(const char * tag) {
+    if (tag == nullptr || tag[0] == '\0' || strcmp(tag, "unlabeled") == 0) {
+        return 0;
+    }
+    auto it = g_mem_tag_ids.find(tag);
+    if (it != g_mem_tag_ids.end()) {
+        return it->second;
+    }
+    const uint32_t id = (uint32_t) g_mem_tag_names.size();
+    g_mem_tag_names.push_back(tag);
+    g_mem_tag_ids.emplace(tag, id);
+    return id;
+}
+
+void ggml_backend_mem_push(const char * tag) {
+    std::lock_guard<std::mutex> lock(g_mem_mutex);
+    g_mem_tag_stack.push_back(ggml_backend_mem_intern(tag));
+}
+
+void ggml_backend_mem_pop(void) {
+    if (!g_mem_tag_stack.empty()) {
+        g_mem_tag_stack.pop_back();
+    }
+}
+
+static void ggml_backend_mem_register(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_mem_mutex);
+    const uint32_t id = g_mem_tag_stack.empty() ? 0 : g_mem_tag_stack.back();
+    buffer->mem_tag_id = id;
+    ggml_backend_mem_entry & e = g_mem_entries[{ (uintptr_t) buffer->buft, id }];
+    e.buft   = buffer->buft;
+    e.bytes += buffer->size;
+    e.count += 1;
+}
+
+static void ggml_backend_mem_unregister(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr || buffer->mem_tag_id == UINT32_MAX) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_mem_mutex);
+    auto it = g_mem_entries.find({ (uintptr_t) buffer->buft, buffer->mem_tag_id });
+    if (it != g_mem_entries.end()) {
+        it->second.bytes -= buffer->size;
+        it->second.count -= 1;
+        if (it->second.count == 0) {
+            g_mem_entries.erase(it);
+        }
+    }
+    buffer->mem_tag_id = UINT32_MAX;
+}
+
+void ggml_backend_mem_foreach(ggml_backend_mem_cb cb, void * user_data) {
+    if (cb == nullptr) {
+        return;
+    }
+    // snapshot under the lock, then call out: the callback may log (slow on Windows)
+    std::vector<std::pair<ggml_backend_buffer_type_t, std::string>> tags;
+    std::vector<ggml_backend_mem_entry>                             ents;
+    {
+        std::lock_guard<std::mutex> lock(g_mem_mutex);
+        tags.reserve(g_mem_entries.size());
+        ents.reserve(g_mem_entries.size());
+        for (const auto & kv : g_mem_entries) {
+            tags.emplace_back(kv.second.buft, g_mem_tag_names[kv.first.second]);
+            ents.push_back(kv.second);
+        }
+    }
+    for (size_t i = 0; i < tags.size(); ++i) {
+        cb(tags[i].first, tags[i].second.c_str(), ents[i].bytes, ents[i].count, user_data);
+    }
+}
+
 ggml_backend_buffer_t ggml_backend_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     GGML_ASSERT(buft);
-    if (size == 0) {
-        // return a dummy buffer for zero-sized allocations
-        return ggml_backend_buffer_init(buft, {}, NULL, 0);
-    }
-    return buft->iface.alloc_buffer(buft, size);
+    ggml_backend_buffer_t buffer = size == 0
+        // dummy buffer for zero-sized allocations
+        ? ggml_backend_buffer_init(buft, {}, NULL, 0)
+        : buft->iface.alloc_buffer(buft, size);
+    ggml_backend_mem_register(buffer);
+    return buffer;
 }
 
 size_t ggml_backend_buft_get_alignment(ggml_backend_buffer_type_t buft) {
@@ -100,11 +201,12 @@ ggml_backend_buffer_t ggml_backend_buffer_init(
                void *                     context,
                size_t                     size) {
     ggml_backend_buffer_t buffer = new ggml_backend_buffer {
-        /* .interface = */ iface,
-        /* .buft      = */ buft,
-        /* .context   = */ context,
-        /* .size      = */ size,
-        /* .usage     = */ GGML_BACKEND_BUFFER_USAGE_ANY
+        /* .interface  = */ iface,
+        /* .buft       = */ buft,
+        /* .context    = */ context,
+        /* .size       = */ size,
+        /* .usage      = */ GGML_BACKEND_BUFFER_USAGE_ANY,
+        /* .mem_tag_id = */ UINT32_MAX,
     };
 
     return buffer;
@@ -118,6 +220,8 @@ void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
     if (buffer == NULL) {
         return;
     }
+
+    ggml_backend_mem_unregister(buffer);
 
     if (buffer->iface.free_buffer != NULL) {
         buffer->iface.free_buffer(buffer);

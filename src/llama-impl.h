@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h" // for ggml_log_level
+#include "ggml-backend.h"
 
 #include <cstdlib>
 #include <string>
@@ -31,6 +32,20 @@ void llama_log_callback_default(ggml_log_level level, const char * text, void * 
 #define LLAMA_LOG_ERROR(...) llama_log_internal(GGML_LOG_LEVEL_ERROR, __VA_ARGS__)
 #define LLAMA_LOG_DEBUG(...) llama_log_internal(GGML_LOG_LEVEL_DEBUG, __VA_ARGS__)
 #define LLAMA_LOG_CONT(...)  llama_log_internal(GGML_LOG_LEVEL_CONT , __VA_ARGS__)
+
+//
+// memory accounting
+//
+
+// attribute every backend buffer allocated on this thread until the guard is
+// destroyed to `tag` (diagnostics, see ggml_backend_mem_foreach)
+struct llama_mem_tag_scope {
+    explicit llama_mem_tag_scope(const char * tag) { ggml_backend_mem_push(tag); }
+    ~llama_mem_tag_scope() { ggml_backend_mem_pop(); }
+
+    llama_mem_tag_scope(const llama_mem_tag_scope &) = delete;
+    llama_mem_tag_scope & operator=(const llama_mem_tag_scope &) = delete;
+};
 
 //
 // helpers

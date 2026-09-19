@@ -171,6 +171,11 @@ class llama_moe_cache {
     bool suspend();
     bool resume();
 
+    // resume() at the base budget only, ignoring the reclaimed decode extra.
+    // Used on the first decode so the CUDA scratch can grow into the released
+    // compute region before its peak (and the real decode extra) is known
+    bool resume_base();
+
     // total device bytes of the pool (0 when disabled): the load-time gate for
     // the mmproj hot swap compares this against the mmproj worst-case usage
     uint64_t budget_bytes() const;

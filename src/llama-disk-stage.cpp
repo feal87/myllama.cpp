@@ -766,6 +766,8 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     pimpl(std::make_unique<impl>(model)) {
     impl & p = *pimpl;
 
+    llama_mem_tag_scope mem_scope("disk");
+
 #if !defined(_WIN32)
     GGML_UNUSED(dev);
     GGML_UNUSED(n_pin_experts);

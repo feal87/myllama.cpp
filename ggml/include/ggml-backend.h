@@ -67,6 +67,23 @@ extern "C" {
     GGML_API ggml_backend_buffer_type_t     ggml_backend_buffer_get_type      (ggml_backend_buffer_t buffer);
     GGML_API void                           ggml_backend_buffer_reset         (ggml_backend_buffer_t buffer);
 
+    //
+    // Backend buffer memory accounting (diagnostics)
+    //
+    // Buffers allocated through ggml_backend_buft_alloc_buffer while a tag is
+    // pushed are attributed to that tag. Tags nest; the innermost one wins and
+    // buffers allocated outside any tag go to "unlabeled". The registry tracks
+    // live buffers only (allocation minus free), so a report taken at a graph
+    // boundary reflects the current footprint. Cheap enough for lifecycle
+    // points, not for per-token use.
+    GGML_API void ggml_backend_mem_push(const char * tag);
+    GGML_API void ggml_backend_mem_pop (void);
+
+    // invoked once per live (buffer type, tag) pair; `bytes`/`count` are the
+    // live totals. buft -> device with ggml_backend_buft_get_device
+    typedef void (*ggml_backend_mem_cb)(ggml_backend_buffer_type_t buft, const char * tag, size_t bytes, size_t count, void * user_data);
+    GGML_API void ggml_backend_mem_foreach(ggml_backend_mem_cb cb, void * user_data);
+
     // tensor copy between different backends
     GGML_API void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst);
 
