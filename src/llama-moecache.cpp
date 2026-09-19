@@ -303,6 +303,15 @@ static size_t expert_slice_bytes(const ggml_tensor * w) {
     return w->nb[2];
 }
 
+// bytes a backend charges for a tensor on top of its data (for example the CUDA
+// quantized row padding). Read from the source shape so the layout sizing can
+// charge the cache tensor for it before the cache tensor exists
+static size_t expert_fixed_overhead(ggml_backend_buffer_type_t buft, const ggml_tensor * w) {
+    const size_t alloc = ggml_backend_buft_get_alloc_size(buft, w);
+    const size_t data  = w->nb[2] * (size_t) w->ne[2];
+    return alloc > data ? alloc - data : 0;
+}
+
 // write one layer's full expert->slot table to both copies (device + host).
 // Batching every boundary change into one per-layer refresh keeps the device
 // traffic at a single small copy per changed layer instead of one 4-byte set
@@ -633,15 +642,28 @@ void llama_moe_cache::activate(bool relayout) {
     // cost when it earns its first slot (the dummy slot, the device table and
     // the tensor alignment padding), so the layout carved into the pool below
     // always fits inside the reserved budget.
-    const size_t align = ggml_backend_buffer_get_alignment(p->pool);
+    // size against the pool actually held, not budget_bytes: the reclaimed
+    // decode extra raises budget_bytes before the pool is re-reserved
+    // (resume_base keeps the base pool until the first decode is measured), so
+    // the two can diverge and the layout must fit what is really allocated
+    const size_t align     = ggml_backend_buffer_get_alignment(p->pool);
+    const size_t pool_size = ggml_backend_buffer_get_size(p->pool);
+    const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(p->pool);
     std::vector<int32_t> caps(p->model.layers.size(), 0);
     std::vector<size_t> bytes_per_layer(p->model.layers.size(), 0);
     std::vector<size_t> fixed_bytes(p->model.layers.size(), 0);
     for (const auto & c : p->cands) {
         bytes_per_layer[c.il] = c.nbytes_1slot;
-        fixed_bytes[c.il]    = c.nbytes_1slot + (size_t) c.n_expert*sizeof(int32_t) + 4*align;
+        // the dummy slot, the device table, the per-tensor alignment padding,
+        // plus whatever the backend adds on top of the tensor data
+        size_t overhead = expert_fixed_overhead(buft, c.gate_src);
+        if (!c.fused) {
+            overhead += expert_fixed_overhead(buft, c.up_src);
+        }
+        overhead += expert_fixed_overhead(buft, c.d_src);
+        fixed_bytes[c.il] = c.nbytes_1slot + (size_t) c.n_expert*sizeof(int32_t) + 4*align + overhead;
     }
-    if (p->hot->assign_global_capacity(p->budget_bytes, bytes_per_layer, fixed_bytes, caps) <= 0) {
+    if (p->hot->assign_global_capacity(pool_size, bytes_per_layer, fixed_bytes, caps) <= 0) {
         if (relayout) {
             // keep the old layout serving rather than tearing it down for a
             // profile that gives no layer any slot
@@ -757,7 +779,6 @@ void llama_moe_cache::activate(bool relayout) {
     // aligned slice after the other (the same layout the per-layer buffers
     // used, so the assignment overhead charges match the real footprint)
     char * const pool_base = (char *) ggml_backend_buffer_get_base(p->pool);
-    const size_t pool_size = ggml_backend_buffer_get_size(p->pool);
     size_t off = 0;
 
     for (const auto & c : p->cands) {
@@ -960,7 +981,7 @@ void llama_moe_cache::activate(bool relayout) {
         }
         LLAMA_LOG_INFO("%s: MoE expert cache %s: %d layer(s), %zu VRAM slots total (%.1f of the reserved %.1f MiB pool used), up to %d uploads queued (global); profile: %s\n",
                 __func__, relayout ? "layout rebuilt for the new prompt" : "enabled",
-                n_cached, n_slots_total, off/(1024.0*1024.0), p->budget_bytes/(1024.0*1024.0), p->max_inserts, layers_str.c_str());
+                n_cached, n_slots_total, off/(1024.0*1024.0), pool_size/(1024.0*1024.0), p->max_inserts, layers_str.c_str());
     }
 
     // seed the content from the current ranking immediately, then kick the
