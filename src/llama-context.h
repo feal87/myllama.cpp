@@ -276,6 +276,15 @@ public:
 private:
     llm_graph_result * get_gf_res_prev();
 
+    // measure the decode graph with the active MoE cache and update the cache's
+    // decode-time budget so the reclaimed prefill memory matches the real decode
+    // compute buffer (the cache chain grows it); no-op when the layout is
+    // unchanged
+    void moe_cache_update_budget();
+
+    // vram_reclaim_bytes() against an explicit per-backend decode size
+    uint64_t vram_reclaim_bytes(const std::vector<size_t> & tg_sizes) const;
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -326,6 +335,10 @@ private:
     // MoE cache reclaims when the prefill buffers are released
     std::vector<size_t> backend_buf_pp_size;
     std::vector<size_t> backend_buf_tg_size;
+
+    // layout generation of the MoE cache that backend_buf_tg_size was last
+    // measured against (see moe_cache_update_budget)
+    uint32_t moe_cache_measured_gen = 0;
 
     // --load-mode dio: direct-read streaming of the MoE expert weights into a
     // pinned host slab and a per-layer decode cache (null when not requested)

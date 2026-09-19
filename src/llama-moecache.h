@@ -95,7 +95,9 @@ class llama_moe_cache {
     // hot:      ranking source (must outlive this object; the hot cache itself is
     //           kept by llama_context, destroyed after this)
     // budget_bytes: total device memory of the whole cache, reserved up-front as
-    //           a single pool at context creation (see reserve()). The per-layer
+    //           a single pool at context creation (see reserve()). When the
+    //           requested budget does not fit, 25 MiB are shaved off this base
+    //           and the allocation retried. The per-layer
     //           layout is carved from it once routing has been observed, and the
     //           budget hand-out guarantees the layout always fits (dummy slot +
     //           device tables included). 0 = disabled
@@ -124,14 +126,20 @@ class llama_moe_cache {
     // pool of budget_bytes from the layer routers' device, so whether the
     // requested budget fits is answered here instead of mid-generation. No-op
     // when disabled or already reserved; marks the cache failed (with a
-    // warning) when no cacheable layer exists; throws when the pool cannot be
-    // allocated (not enough free device memory for the requested budget).
+    // warning) when no cacheable layer exists or when the pool cannot be
+    // allocated even after shaving the base budget to 25 MiB
     void reserve();
 
     // add the device bytes reclaimed from the prefill compute buffer to the
-    // decode-time budget (called once at context creation, after reserve()).
-    // The --moe-expert-cache-budget-mib value stays the prefill-safe base
-    void set_decode_budget_extra(uint64_t extra_bytes);
+    // decode-time budget. The --moe-expert-cache-budget-mib value stays the
+    // prefill-safe base. Returns whether the value changed (llama_context calls
+    // it again once the active decode graph has been measured)
+    bool set_decode_budget_extra(uint64_t extra_bytes);
+
+    // shave one 25 MiB step off the base budget so the next resume() leaves the
+    // compute buffers more room (called when a decode graph could not be
+    // allocated with the cache active). Returns false at the floor
+    bool shrink_decode_budget();
 
     // called before every decode ubatch until activated: sizes the per-layer
     // capacities from the observed routing profile and binds the cache tensors
@@ -156,8 +164,10 @@ class llama_moe_cache {
     // same budget and rebuilds the layout from the ranking observed so far, so
     // the cache does not wait for a new profile window. The caller must ensure
     // no graph referencing the cache tensors is in flight. Both are no-ops (and
-    // return false) when the cache is disabled; resume() aborts when the pool
-    // cannot be reallocated, as the swap was validated to fit at load time.
+    // return false) when the cache is disabled; resume() shaves the base budget
+    // like reserve() and returns false when no pool can be allocated even at
+    // the floor, leaving the cache suspended (decode falls back to the host
+    // chain)
     bool suspend();
     bool resume();
 

@@ -262,8 +262,10 @@ llama_context::llama_context(
             // sizes its per-layer capacities from the observed routing profile).
             // The device pool of the budget is reserved at the end of the
             // constructor (see llama_moe_cache::reserve), so whether the budget
-            // fits is decided at load time; the per-layer capacities are still
-            // sized lazily once routing has been observed (maybe_activate).
+            // fits is decided at load time; a base that does not fit is shaved
+            // in 25 MiB steps instead of failing the load. The per-layer
+            // capacities are still sized lazily once routing has been observed
+            // (maybe_activate).
             moe_cache = std::make_unique<llama_moe_cache>(
                 model, hot_experts.get(), cparams.n_moe_cache_budget_bytes,
                 cparams.n_moe_cache_inserts);
@@ -1559,11 +1561,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // pre-activation graph, so the decode graph is rebuilt with the cache chain.
     if (ubatch.n_tokens == 1 && moe_cache) {
         moe_cache->maybe_activate();
+        moe_cache_update_budget();
     }
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -1577,51 +1580,69 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
-        gf_res_prev_active = nullptr;
-        res->reset();
+        for (;;) {
+            gf_res_prev_active = nullptr;
+            res->reset();
 
-        ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+            ggml_backend_sched_reset(sched.get());
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        //const auto t_start_us = ggml_time_us();
+            //const auto t_start_us = ggml_time_us();
 
-        gf = model.build_graph(gparams);
+            gf = model.build_graph(gparams);
 
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+            //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
-        if (!gf) {
-            LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
-            ret = GGML_STATUS_FAILED;
-            return nullptr;
-        }
-
-        // register the decode graph's top-k expert-id tensors so their values can
-        // be read after the compute to feed the hot-expert ranking. They are kept
-        // alive for the whole graph (GGML_TENSOR_FLAG_OUTPUT), which replaces the
-        // mid-graph eval callback that used to chunk the decode graph at every MoE
-        // layer (see llama_hot_expert_cache::observe_decode).
-        std::fill(hot_topk_tensors.begin(), hot_topk_tensors.end(), nullptr);
-        if (hot_experts && hot_observe_decode && ubatch.n_tokens == 1) {
-            static const char topk_prefix[] = "ffn_moe_topk-";
-            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-                struct ggml_tensor * node = ggml_graph_node(gf, i);
-                if (strncmp(node->name, topk_prefix, sizeof(topk_prefix) - 1) != 0) {
-                    continue;
-                }
-                const char * p  = node->name + sizeof(topk_prefix) - 1;
-                int          il = 0;
-                for (; *p >= '0' && *p <= '9'; ++p) {
-                    il = il * 10 + (*p - '0');
-                }
-                if (*p != '\0' || il < 0 || il >= (int) hot_topk_tensors.size()) {
-                    continue;
-                }
-                ggml_set_output(node);
-                hot_topk_tensors[il] = node;
+            if (!gf) {
+                LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
             }
-        }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+            // register the decode graph's top-k expert-id tensors so their values can
+            // be read after the compute to feed the hot-expert ranking. They are kept
+            // alive for the whole graph (GGML_TENSOR_FLAG_OUTPUT), which replaces the
+            // mid-graph eval callback that used to chunk the decode graph at every MoE
+            // layer (see llama_hot_expert_cache::observe_decode).
+            std::fill(hot_topk_tensors.begin(), hot_topk_tensors.end(), nullptr);
+            if (hot_experts && hot_observe_decode && ubatch.n_tokens == 1) {
+                static const char topk_prefix[] = "ffn_moe_topk-";
+                for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                    struct ggml_tensor * node = ggml_graph_node(gf, i);
+                    if (strncmp(node->name, topk_prefix, sizeof(topk_prefix) - 1) != 0) {
+                        continue;
+                    }
+                    const char * p  = node->name + sizeof(topk_prefix) - 1;
+                    int          il = 0;
+                    for (; *p >= '0' && *p <= '9'; ++p) {
+                        il = il * 10 + (*p - '0');
+                    }
+                    if (*p != '\0' || il < 0 || il >= (int) hot_topk_tensors.size()) {
+                        continue;
+                    }
+                    ggml_set_output(node);
+                    hot_topk_tensors[il] = node;
+                }
+            }
+
+            if (ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                break;
+            }
+
+            // the MoE cache pool can still starve the compute buffers (device
+            // fragmentation, another consumer): shrink the pool one step, rebuild
+            // its layout and retry with the smaller cache. Falls through to the
+            // error once the pool cannot shrink any further
+            if (moe_cache && moe_cache->is_active() && moe_cache->shrink_decode_budget()) {
+                LLAMA_LOG_WARN("%s: graph allocation failed with the MoE cache active - shrinking the cache and retrying\n", __func__);
+                ggml_backend_sched_synchronize(sched.get());
+                moe_cache->suspend();
+                if (moe_cache->resume()) {
+                    gparams = graph_params(res, ubatch, mctx, gtype);
+                    continue;
+                }
+            }
+
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
@@ -3839,6 +3860,10 @@ bool llama_context::moe_cache_resume() {
 }
 
 uint64_t llama_context::vram_reclaim_bytes() const {
+    return vram_reclaim_bytes(backend_buf_tg_size);
+}
+
+uint64_t llama_context::vram_reclaim_bytes(const std::vector<size_t> & tg_sizes) const {
     if (!moe_cache) {
         return 0;
     }
@@ -3851,10 +3876,53 @@ uint64_t llama_context::vram_reclaim_bytes() const {
             continue;
         }
         const size_t pp = i < backend_buf_pp_size.size() ? backend_buf_pp_size[i] : 0;
-        const size_t tg = i < backend_buf_tg_size.size() ? backend_buf_tg_size[i] : 0;
+        const size_t tg = i < tg_sizes.size() ? tg_sizes[i] : 0;
         return pp > tg ? (uint64_t) (pp - tg) : 0;
     }
     return 0;
+}
+
+// The decode graph grows once the MoE cache chain is active, so the tg size
+// measured before activation overstates the memory the prefill buffers can
+// hand over. Measure the active decode graph and correct the cache's extra
+// before it is built; a changed extra is applied by rebuilding the pool at the
+// corrected size (suspend + resume).
+void llama_context::moe_cache_update_budget() {
+    if (!moe_cache || !vram_swap_enabled || !moe_cache->is_active()) {
+        return;
+    }
+    const uint32_t gen = moe_cache->layout_generation();
+    if (gen == moe_cache_measured_gen) {
+        return;
+    }
+
+    // a fresh full memory context, like the startup reserve: the active partial
+    // one could build a different decode graph
+    llama_memory_context_ptr mctx_full;
+    if (memory) {
+        mctx_full = memory->init_full();
+        if (!mctx_full) {
+            return;
+        }
+    }
+
+    const uint32_t n = cparams.n_seq_max;
+    std::vector<size_t> sizes(backend_ptrs.size(), 0);
+    graph_reserve(n, n, n, mctx_full.get(), /*split_only =*/ true, sizes.data());
+
+    const uint64_t extra = vram_reclaim_bytes(sizes);
+    if (!moe_cache->set_decode_budget_extra(extra)) {
+        moe_cache_measured_gen = gen; // layout already fits this extra
+        return;
+    }
+
+    ggml_backend_sched_synchronize(sched.get());
+    moe_cache->suspend();
+    if (!moe_cache->resume()) {
+        moe_cache_measured_gen = 0; // no pool; re-measure once it comes back
+        return;
+    }
+    moe_cache_measured_gen = moe_cache->layout_generation();
 }
 
 void llama_context::vram_swap(bool to_prefill) {

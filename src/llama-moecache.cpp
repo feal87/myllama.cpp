@@ -16,7 +16,6 @@
 #include <cstdio>
 #include <deque>
 #include <mutex>
-#include <stdexcept>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -32,6 +31,12 @@ static constexpr uint64_t kMinProfileContentTokens = 512;
 // content tokens between content rebalances (each rebalance reconciles the
 // residents with the current global ranking)
 static constexpr uint64_t kRebalanceContentTokens = 256;
+
+// bytes shaved off the user's MoE cache base budget per failed pool allocation.
+// A device short on VRAM degrades the cache by 25 MiB instead of failing the
+// load; when the base reaches this floor and the allocation still fails, the
+// cache is disabled
+static constexpr uint64_t kBudgetReduceStep = 25 * 1024 * 1024;
 
 struct llama_moe_cache::impl {
     // one layer the cache can serve (static once the model is loaded: expert
@@ -92,9 +97,10 @@ struct llama_moe_cache::impl {
     llama_hot_expert_cache * const hot;
     llama_disk_stage * disk = nullptr; // set by set_disk_stage() before reserve()
     bool disk_mode = false;            // == disk != nullptr
-    uint64_t budget_bytes;         // current total device footprint of the cache (budget_base + budget_extra)
-    const uint64_t budget_base;    // the user's prefill-safe --moe-expert-cache-budget-mib value
-    uint64_t budget_extra = 0;     // prefill compute bytes reclaimed for decode (VRAM swap)
+    uint64_t budget_bytes;           // current total device footprint of the cache (budget_base + budget_extra)
+    uint64_t budget_base;            // prefill-safe budget; shaved when the device is short (see alloc_pool_reducing)
+    const uint64_t budget_requested; // the user's --moe-expert-cache-budget-mib value (for logging the shave)
+    uint64_t budget_extra = 0;       // prefill compute bytes reclaimed for decode (VRAM swap)
     const int32_t  max_inserts;
     bool activated = false;
     bool activated_once = false; // a layout was built at least once (survives suspend)
@@ -220,8 +226,34 @@ struct llama_moe_cache::impl {
 
     impl(const llama_model & model_, llama_hot_expert_cache * hot_,
          uint64_t budget_, int32_t inserts_) :
-        model(model_), hot(hot_), budget_bytes(budget_), budget_base(budget_), max_inserts(inserts_),
-        layer_idx(model_.layers.size(), -1) {}
+        model(model_), hot(hot_), budget_bytes(budget_), budget_base(budget_), budget_requested(budget_),
+        max_inserts(inserts_), layer_idx(model_.layers.size(), -1) {}
+
+    // allocate the device pool for the current budget. On failure shave 25 MiB
+    // off the base budget and retry, so a busy device both keeps the cache
+    // usable and stays within what is actually free. Returns null once the base
+    // reached the 25 MiB floor and that attempt failed too
+    ggml_backend_buffer_t alloc_pool_reducing(ggml_backend_buffer_type_t buft) {
+        for (;;) {
+            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, budget_bytes);
+            if (buf != nullptr) {
+                if (budget_base < budget_requested) {
+                    LLAMA_LOG_WARN("%s: MoE expert cache base budget reduced by %.1f MiB (from %.1f to %.1f MiB) to fit the free device memory\n",
+                            __func__, (budget_requested - budget_base)/(1024.0*1024.0),
+                            budget_requested/(1024.0*1024.0), budget_base/(1024.0*1024.0));
+                }
+                return buf;
+            }
+            if (budget_base <= kBudgetReduceStep) {
+                return nullptr;
+            }
+            const uint64_t shave = std::min<uint64_t>(kBudgetReduceStep, budget_base - kBudgetReduceStep);
+            LLAMA_LOG_WARN("%s: MoE expert cache: failed to allocate %.1f MiB of device memory, retrying with %.1f MiB\n",
+                    __func__, budget_bytes/(1024.0*1024.0), (budget_base - shave + budget_extra)/(1024.0*1024.0));
+            budget_base  -= shave;
+            budget_bytes  = budget_base + budget_extra;
+        }
+    }
 
     layer_state * find_layer(int il) {
         if (il < 0 || il >= (int) layer_idx.size()) {
@@ -382,14 +414,28 @@ bool llama_moe_cache::is_active() const {
     return pimpl != nullptr && pimpl->activated;
 }
 
-void llama_moe_cache::set_decode_budget_extra(uint64_t extra_bytes) {
-    if (!pimpl) {
-        return;
+bool llama_moe_cache::set_decode_budget_extra(uint64_t extra_bytes) {
+    if (!pimpl || pimpl->budget_extra == extra_bytes) {
+        return false;
     }
     // only the future resume() allocations use the enlarged budget; the pool
     // currently held (if any) keeps its size until the next suspend()
     pimpl->budget_extra = extra_bytes;
     pimpl->budget_bytes = pimpl->budget_base + extra_bytes;
+    return true;
+}
+
+bool llama_moe_cache::shrink_decode_budget() {
+    auto * p = pimpl.get();
+    if (!p || p->failed || p->budget_base <= kBudgetReduceStep) {
+        return false;
+    }
+    const uint64_t shave = std::min<uint64_t>(kBudgetReduceStep, p->budget_base - kBudgetReduceStep);
+    LLAMA_LOG_WARN("%s: MoE expert cache base budget reduced by %.1f MiB (from %.1f to %.1f MiB) to leave room for the compute buffers\n",
+            __func__, shave/(1024.0*1024.0), p->budget_base/(1024.0*1024.0), (p->budget_base - shave)/(1024.0*1024.0));
+    p->budget_base -= shave;
+    p->budget_bytes = p->budget_base + p->budget_extra;
+    return true;
 }
 
 void llama_moe_cache::set_disk_stage(llama_disk_stage * disk) {
@@ -519,10 +565,12 @@ void llama_moe_cache::reserve() {
         }
     }
 
-    p->pool = ggml_backend_buft_alloc_buffer(buft, p->budget_bytes);
+    p->pool = p->alloc_pool_reducing(buft);
     if (!p->pool) {
-        throw std::runtime_error("failed to reserve " + std::to_string(p->budget_bytes/(1024*1024)) +
-                " MiB of device memory for the MoE expert cache (--moe-expert-cache-budget-mib): the device must have this much free VRAM on top of the model");
+        LLAMA_LOG_WARN("%s: could not allocate a MoE expert cache pool even at the %.1f MiB floor - MoE expert cache stays disabled\n",
+                __func__, kBudgetReduceStep/(1024.0*1024.0));
+        p->failed = true;
+        return;
     }
 
     LLAMA_LOG_INFO("%s: MoE expert cache: reserved %.1f MiB of device memory over %zu cacheable layer(s)\n",
@@ -997,10 +1045,10 @@ bool llama_moe_cache::suspend() {
 }
 
 // re-reserve the pool and rebuild the layout from the ranking observed so far.
-// The budget and buffer type are the ones reserve() validated at load time, so
-// after releasing the pool to the mmproj and freeing it again the same block is
-// expected to come back; a failure here means the device allocator diverged and
-// is treated as fatal (the swap was gated on the sizes matching).
+// The buffer type is the one reserve() validated at load time; the budget may
+// have shrunk since (alloc_pool_reducing) to fit what is actually free. A pool
+// that cannot come back even at the floor leaves the cache suspended: decode
+// falls back to the host chain instead of aborting.
 bool llama_moe_cache::resume() {
     auto * p = pimpl.get();
     if (!p || p->failed) {
@@ -1011,11 +1059,11 @@ bool llama_moe_cache::resume() {
     }
 
     const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(p->cands[0].router->buffer);
-    p->pool = ggml_backend_buft_alloc_buffer(buft, p->budget_bytes);
+    p->pool = p->alloc_pool_reducing(buft);
     if (!p->pool) {
-        LLAMA_LOG_ERROR("%s: failed to re-reserve %.1f MiB of device memory for the MoE expert cache after it was released\n",
-                __func__, p->budget_bytes/(1024.0*1024.0));
-        GGML_ABORT("MoE expert cache could not be restored after it was released");
+        LLAMA_LOG_WARN("%s: could not re-reserve a MoE expert cache pool even at the %.1f MiB floor - cache stays suspended (host-only decode)\n",
+                __func__, kBudgetReduceStep/(1024.0*1024.0));
+        return false;
     }
 
     // rebuild the layout from the ranking observed so far. Before the first
