@@ -46,6 +46,7 @@ struct server_ckpt_store {
         std::string key;
         bool        use_dio  = false;
         bool        has_mtmd = false;
+        bool        partial_ckpt = false; // hybrid/recurrent model: checkpoints carry the recurrent state only
         size_t      max_bytes = 0; // 0 = no limit
     };
 

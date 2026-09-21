@@ -1002,6 +1002,10 @@ private:
 
     std::unique_ptr<server_ckpt_store> ckpt_store;
 
+    // hybrid/recurrent models keep recurrent-only checkpoints on disk, the
+    // attention part is reconstructed from the live cache
+    bool ckpt_partial = false;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1571,6 +1575,9 @@ private:
             store_cfg.use_dio   = use_dio;
             store_cfg.has_mtmd  = has_mmproj;
             store_cfg.max_bytes = max_bytes;
+
+            ckpt_partial = llama_model_is_hybrid(model_tgt) || llama_model_is_recurrent(model_tgt);
+            store_cfg.partial_ckpt = ckpt_partial;
 
             ckpt_store = std::make_unique<server_ckpt_store>(std::move(store_cfg));
 
@@ -2745,16 +2752,18 @@ private:
         }
 
         if (ckpt_store) {
-            const size_t n = llama_state_seq_get_size_ext(ctx_tgt, slot.id, 0);
+            const uint32_t ckpt_flags = ckpt_partial ? LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY : LLAMA_STATE_SEQ_FLAGS_NONE;
+
+            const size_t n = llama_state_seq_get_size_ext(ctx_tgt, slot.id, ckpt_flags);
             std::vector<uint8_t> tgt(n);
-            const bool has_tgt = n > 0 && llama_state_seq_get_data_ext(ctx_tgt, tgt.data(), n, slot.id, 0) == n;
+            const bool has_tgt = n > 0 && llama_state_seq_get_data_ext(ctx_tgt, tgt.data(), n, slot.id, ckpt_flags) == n;
 
             std::vector<uint8_t> dft;
             if (has_tgt && ctx_dft != nullptr) {
-                const size_t n_dft = llama_state_seq_get_size_ext(ctx_dft, slot.id, 0);
+                const size_t n_dft = llama_state_seq_get_size_ext(ctx_dft, slot.id, ckpt_flags);
                 if (n_dft > 0) {
                     dft.resize(n_dft);
-                    if (llama_state_seq_get_data_ext(ctx_dft, dft.data(), n_dft, slot.id, 0) != n_dft) {
+                    if (llama_state_seq_get_data_ext(ctx_dft, dft.data(), n_dft, slot.id, ckpt_flags) != n_dft) {
                         dft.clear();
                     }
                 }
@@ -3846,40 +3855,59 @@ private:
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
+                                    bool restored = false;
                                     if (!do_reset) {
                                         // restore the context checkpoint
                                         if (it->on_disk && ckpt_store) {
+                                            // a partial checkpoint carries only the recurrent
+                                            // state, the attention must already be in the cache
+                                            bool usable = true;
+                                            if (ckpt_partial) {
+                                                usable = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) >= it->pos_max;
+                                            }
+
+                                            const uint32_t state_flags = ckpt_partial
+                                                ? LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY
+                                                : LLAMA_STATE_SEQ_FLAGS_NONE;
+
                                             std::vector<uint8_t> buf(it->size_tgt);
-                                            if (ckpt_store->read(slot.id, it->disk_id, it->off_tgt, it->size_tgt, buf.data())) {
-                                                llama_state_seq_set_data_ext(ctx_tgt, buf.data(), buf.size(), slot.id, 0);
-                                            }
-                                            if (ctx_dft != nullptr && it->size_dft > 0) {
-                                                buf.resize(it->size_dft);
-                                                if (ckpt_store->read(slot.id, it->disk_id, it->off_dft, it->size_dft, buf.data())) {
-                                                    llama_state_seq_set_data_ext(ctx_dft, buf.data(), buf.size(), slot.id, 0);
+                                            if (usable && ckpt_store->read(slot.id, it->disk_id, it->off_tgt, it->size_tgt, buf.data()) &&
+                                                    llama_state_seq_set_data_ext(ctx_tgt, buf.data(), buf.size(), slot.id, state_flags) == it->size_tgt) {
+                                                if (ctx_dft != nullptr && it->size_dft > 0) {
+                                                    buf.resize(it->size_dft);
+                                                    if (ckpt_store->read(slot.id, it->disk_id, it->off_dft, it->size_dft, buf.data())) {
+                                                        llama_state_seq_set_data_ext(ctx_dft, buf.data(), buf.size(), slot.id, state_flags);
+                                                    }
                                                 }
-                                            }
-                                            if (it->size_spec > 0) {
-                                                std::vector<uint8_t> spec_state(it->size_spec);
-                                                if (ckpt_store->read(slot.id, it->disk_id, it->off_spec, it->size_spec, spec_state.data())) {
-                                                    common_speculative_set_state(spec.get(), slot.id, spec_state);
+                                                if (it->size_spec > 0) {
+                                                    std::vector<uint8_t> spec_state(it->size_spec);
+                                                    if (ckpt_store->read(slot.id, it->disk_id, it->off_spec, it->size_spec, spec_state.data())) {
+                                                        common_speculative_set_state(spec.get(), slot.id, spec_state);
+                                                    }
                                                 }
+
+                                                // the recurrent state is back at the checkpoint, drop
+                                                // the attention past it so the tail starts clean
+                                                restored = ckpt_partial
+                                                    ? llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, it->pos_max + 1, -1)
+                                                    : true;
                                             }
                                         } else {
                                             it->load_tgt(ctx_tgt, slot.id, 0);
                                             it->load_dft(ctx_dft, slot.id, 0);
                                             // restore the draft's speculative state
                                             common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+                                            restored = true;
                                         }
+                                    }
 
+                                    if (restored) {
                                         // the verified checkpoint is authoritative: reprocess from
                                         // exactly its token position, not from the live cache's prefix
                                         n_past   = (int) it->n_tokens;
                                         pos_next = (llama_pos) it->n_tokens;
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
-                                    }
-
-                                    if (do_reset) {
+                                    } else {
                                         SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                         pos_next = 0;

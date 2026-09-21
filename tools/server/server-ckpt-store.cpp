@@ -35,9 +35,10 @@ constexpr const char * REC_SUFFIX    = ".bin";
 constexpr const char * TMP_SUFFIX    = ".tmp";
 
 constexpr char META_MAGIC[8] = {'L', 'L', 'S', 'L', 'O', 'T', 'C', 'K'};
-constexpr uint32_t META_VERSION = 4;
+constexpr uint32_t META_VERSION = 5;
 constexpr uint32_t META_FLAG_MTMD     = 1u << 0;
 constexpr uint32_t META_FLAG_HAS_FULL = 1u << 1;
+constexpr uint32_t META_FLAG_PARTIAL  = 1u << 2;
 constexpr uint64_t META_HEADER_SIZE = 80;
 constexpr uint64_t META_CKPT_SIZE   = 104;
 
@@ -320,8 +321,9 @@ bool server_ckpt_store::read_meta(const std::filesystem::path & meta_path, sessi
     ok = ok &&
         std::memcmp(magic, META_MAGIC, sizeof(magic)) == 0 &&
         version == META_VERSION &&
-        (flags & ~(META_FLAG_MTMD | META_FLAG_HAS_FULL)) == 0 &&
+        (flags & ~(META_FLAG_MTMD | META_FLAG_HAS_FULL | META_FLAG_PARTIAL)) == 0 &&
         ((flags & META_FLAG_MTMD) != 0) == cfg.has_mtmd &&
+        ((flags & META_FLAG_PARTIAL) != 0) == cfg.partial_ckpt &&
         key_size == cfg.key.size() &&
         tokens_size > 0 &&
         tokens_size <= 1024ull * 1024ull * 1024ull &&
@@ -640,6 +642,9 @@ void server_ckpt_store::write_meta(int slot_id, const server_tokens & tokens, co
 
     std::list<common_prompt_checkpoint> disk;
     uint32_t flags = tokens.has_mtmd ? META_FLAG_MTMD : 0;
+    if (cfg.partial_ckpt) {
+        flags |= META_FLAG_PARTIAL;
+    }
     if (s.full.valid()) {
         flags |= META_FLAG_HAS_FULL;
     }
