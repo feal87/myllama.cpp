@@ -3851,15 +3851,13 @@ private:
 
                                 if (pos_min >= pos_min_thold) {
                                     // the ubatch starts a cold fill of the current prompt would use:
-                                    // a restored checkpoint must sit on one of these, otherwise the
-                                    // reprocessed tail is grouped differently and the logits drift
+                                    // in-RAM checkpoints live at those boundaries, and a restore has
+                                    // to land on one or the reprocessed tail is grouped differently
                                     auto request_batch_starts = [&](int64_t L) {
                                         std::vector<int64_t> starts;
                                         for (int64_t p = 0; p < L; ) {
                                             starts.push_back(p);
                                             int64_t next = p + n_batch;
-                                            // the trailing-break heuristic only applies without the
-                                            // disk store, which checkpoints every batch instead
                                             if (ckpt_store == nullptr) {
                                                 for (const int offset : {4 + n_ubatch, 4}) {
                                                     const int64_t n_last = std::min<int64_t>(n_batch, offset);
@@ -3893,10 +3891,11 @@ private:
                                             if (cur.fingerprint != common_prompt_checkpoint::hash_tokens(req_tokens.data(), cur.n_tokens)) {
                                                 continue;
                                             }
-                                            // a checkpoint from the same request is always on a ubatch
-                                            // start; one from an older request only when it lands on one
-                                            // of this request's starts
-                                            if (cur.len_ctx != slot.task->n_tokens() &&
+                                            // the disk store checkpoints every batch, so a session
+                                            // that grew past one batch is off this request's grid.
+                                            // those positions are still valid, and refusing them
+                                            // would drop back to a much older checkpoint
+                                            if (ckpt_store == nullptr && cur.len_ctx != slot.task->n_tokens() &&
                                                     std::find(batch_starts.begin(), batch_starts.end(), cur.n_tokens) == batch_starts.end()) {
                                                 continue;
                                             }
