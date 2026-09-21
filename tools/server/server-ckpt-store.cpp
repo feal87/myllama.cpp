@@ -691,6 +691,16 @@ bool server_ckpt_store::append_attention(int slot_id, int64_t pos_end, const ser
     return true;
 }
 
+bool server_ckpt_store::session_diverged(int slot_id, const server_tokens & tokens) const {
+    auto it = slots.find(slot_id);
+    if (it == slots.end() || it->second.attn_covered <= 0 || it->second.attn_tokens.empty()) {
+        return false;
+    }
+
+    const slot_state & s = it->second;
+    return (int64_t) s.attn_tokens.get_common_prefix(tokens) < s.attn_covered;
+}
+
 bool server_ckpt_store::load_attention(int slot_id, llama_context * ctx, llama_seq_id seq_id) {
     auto it = slots.find(slot_id);
     if (it == slots.end() || it->second.dir.empty()) {

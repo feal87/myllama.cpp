@@ -1883,20 +1883,28 @@ private:
             }
 
             // the store keeps a full state plus a checkpoint ladder per session.
-            // when it covers a longer prefix than the prompt cache restored, load
-            // the full state (attention + recurrent) and adopt its checkpoints.
-            if (ckpt_store &&
-                    task.type == SERVER_TASK_TYPE_COMPLETION &&
-                    ret->prompt.checkpoints.empty()) {
+            // when one covers a longer prefix than the live prompt, adopt it and
+            // replace what the slot held.
+            if (ckpt_store && task.type == SERVER_TASK_TYPE_COMPLETION) {
                 size_t index = 0;
                 float f_keep = 0.0f;
                 float f_sim  = 0.0f;
 
-                if (ckpt_store->find_best(task.tokens, index, f_keep, f_sim)) {
+                const bool    slot_empty = ret->prompt.checkpoints.empty();
+                const int64_t slot_lcp   = ret->prompt.tokens.get_common_prefix(task.tokens);
+
+                if (ckpt_store->find_best(task.tokens, index, f_keep, f_sim) &&
+                        (slot_empty || (int64_t) (f_sim * task.tokens.size()) > slot_lcp)) {
                     server_tokens tokens;
                     server_ckpt_store::full_state full;
                     std::list<common_prompt_checkpoint> checkpoints;
                     if (ckpt_store->adopt(ret->id, index, tokens, full, checkpoints)) {
+                        if (!slot_empty) {
+                            // the adopted session replaces what this slot held
+                            ret->mem.seq_rm(ret->id, 0, -1);
+                            ret->prompt.clear();
+                        }
+
                         const bool use_full = full.valid() &&
                             (ret->prompt.tokens.empty() || tokens.size() >= ret->prompt.tokens.size());
 
@@ -3959,6 +3967,16 @@ private:
                                         n_past = 0;
                                     }
                                 }
+                            }
+
+                            // the request will be processed from scratch and it does not
+                            // continue this session: keep the old one matchable and make
+                            // room for a new one, instead of overwriting it
+                            if (ckpt_store && n_past == 0 && slot.prompt.n_tokens() > 0 &&
+                                    ckpt_store->session_diverged(slot.id, slot.task->tokens)) {
+                                SLT_TRC(slot, "%s", "prompt diverged from the active session\n");
+                                ckpt_store->finalize(slot.id);
+                                slot.prompt.checkpoints.clear();
                             }
 
                             {

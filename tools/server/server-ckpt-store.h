@@ -92,6 +92,10 @@ struct server_ckpt_store {
     // when the whole log was applied.
     bool load_attention(int slot_id, llama_context * ctx, llama_seq_id seq_id);
 
+    // true when `tokens` no longer shares the prefix the slot's session was
+    // built from, i.e. the request started a different history
+    bool session_diverged(int slot_id, const server_tokens & tokens) const;
+
     // persist the session sidecar: token list, full state and on-disk checkpoints
     void write_meta(int slot_id, const server_tokens & tokens, const std::list<common_prompt_checkpoint> & checkpoints);
 
