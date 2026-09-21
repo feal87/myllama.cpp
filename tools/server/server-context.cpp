@@ -1006,6 +1006,10 @@ private:
     // attention part is reconstructed from the live cache
     bool ckpt_partial = false;
 
+    // keep the attention part in one append-only file per session instead of
+    // rewriting a full state every turn. needs the range state API.
+    bool ckpt_attn = false;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1577,12 +1581,19 @@ private:
             store_cfg.max_bytes = max_bytes;
 
             ckpt_partial = llama_model_is_hybrid(model_tgt) || llama_model_is_recurrent(model_tgt);
+
+            // the log only carries the target attention, so a draft context
+            // keeps the per-turn full state
+            ckpt_attn = ckpt_partial && ctx_dft == nullptr &&
+                llama_state_seq_get_size_range_ext(ctx_tgt, 0, 0, 1, 0) > 0;
+
             store_cfg.partial_ckpt = ckpt_partial;
+            store_cfg.attn_log     = ckpt_attn;
 
             ckpt_store = std::make_unique<server_ckpt_store>(std::move(store_cfg));
 
-            SRV_TRC("slot checkpoint store on disk: %s (dio = %d, max = %zu MiB)\n",
-                    params_base.cache_disk_path.c_str(), (int) use_dio, max_bytes / (1024 * 1024));
+            SRV_INF("slot checkpoint store on disk: %s (dio = %d, partial = %d, attn log = %d, max = %zu MiB)\n",
+                    params_base.cache_disk_path.c_str(), (int) use_dio, (int) ckpt_partial, (int) ckpt_attn, max_bytes / (1024 * 1024));
         }
 
         if (!params_base.model_alias.empty()) {
@@ -1908,6 +1919,17 @@ private:
                         if (loaded) {
                             if (ret->prompt.tokens.empty()) {
                                 ret->prompt.tokens = std::move(tokens);
+                            }
+                            if (ckpt_attn) {
+                                // rebuild the live attention and the recurrent state,
+                                // then clip the adopted token list to what the caches
+                                // really hold
+                                ckpt_store->load_attention(ret->id, ctx_tgt, ret->id);
+
+                                const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), ret->id);
+                                if (pos_max >= 0 && ret->prompt.n_tokens() > (int64_t) pos_max + 1) {
+                                    ret->prompt.tokens.keep_first((int64_t) pos_max + 1);
+                                }
                             }
                             const size_t n = checkpoints.size();
                             for (auto & c : checkpoints) {
@@ -2631,6 +2653,11 @@ private:
             return;
         }
 
+        // the attention log replaces the per-turn full state
+        if (ckpt_attn) {
+            return;
+        }
+
         server_slot * slot = get_slot_by_id(id_slot);
         if (slot == nullptr || slot->prompt.tokens.empty()) {
             return;
@@ -2777,6 +2804,24 @@ private:
             if (has_tgt &&
                     !ckpt_store->write_checkpoint(slot.id, std::move(tgt), std::move(dft), std::move(spec_state), cur)) {
                 SLT_WRN(slot, "%s", "failed to write context checkpoint\n");
+            }
+
+            if (ckpt_attn && has_tgt) {
+                ckpt_store->append_attention(slot.id, cur.pos_max + 1, slot.prompt.tokens, [&](int64_t begin, int64_t end) {
+                    const llama_pos p0 = (llama_pos) begin;
+                    const llama_pos p1 = (llama_pos) end;
+
+                    const size_t n_attn = llama_state_seq_get_size_range_ext(ctx_tgt, slot.id, p0, p1, 0);
+                    if (n_attn == 0) {
+                        return std::vector<uint8_t>();
+                    }
+
+                    std::vector<uint8_t> attn(n_attn);
+                    if (llama_state_seq_get_data_range_ext(ctx_tgt, attn.data(), n_attn, slot.id, p0, p1, 0) != n_attn) {
+                        return std::vector<uint8_t>();
+                    }
+                    return attn;
+                });
             }
         }
 

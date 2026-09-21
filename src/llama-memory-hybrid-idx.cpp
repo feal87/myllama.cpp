@@ -265,6 +265,24 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
     }
 }
 
+void llama_memory_hybrid_idx::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos pos_begin, llama_pos pos_end, llama_state_seq_flags flags) const {
+    // the indexer mirrors the attention cells, so a range state would leave it
+    // behind. an indexer with no layers carries no state, so it can be skipped.
+    if (mem_idx && !mem_idx->get_layer_ids().empty()) {
+        throw std::runtime_error("state_write_range is not supported with an indexer cache");
+    }
+
+    llama_memory_hybrid::state_write_range(io, seq_id, pos_begin, pos_end, flags);
+}
+
+void llama_memory_hybrid_idx::state_read_range(llama_io_read_i & io, llama_seq_id seq_id, llama_pos pos_begin, llama_pos pos_end, llama_state_seq_flags flags) {
+    if (mem_idx && !mem_idx->get_layer_ids().empty()) {
+        throw std::runtime_error("state_read_range is not supported with an indexer cache");
+    }
+
+    llama_memory_hybrid::state_read_range(io, seq_id, pos_begin, pos_end, flags);
+}
+
 void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
     // dropped directly, not via seq_rm: the recurrent cache may refuse it and then only the other two get cleared
     if (seq_id < 0) {

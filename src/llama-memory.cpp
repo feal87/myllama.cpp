@@ -1,5 +1,7 @@
 #include "llama-memory.h"
 
+#include <stdexcept>
+
 llama_memory_status llama_memory_status_combine(llama_memory_status s0, llama_memory_status s1) {
     bool has_update = false;
 
@@ -56,4 +58,24 @@ bool llama_memory_status_is_fail(llama_memory_status status) {
     }
 
     return false;
+}
+
+void llama_memory_i::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos pos_begin, llama_pos pos_end, llama_state_seq_flags flags) const {
+    GGML_UNUSED(io);
+    GGML_UNUSED(seq_id);
+    GGML_UNUSED(pos_begin);
+    GGML_UNUSED(pos_end);
+    GGML_UNUSED(flags);
+
+    throw std::runtime_error("state_write_range is not supported by this memory type");
+}
+
+void llama_memory_i::state_read_range(llama_io_read_i & io, llama_seq_id seq_id, llama_pos pos_begin, llama_pos pos_end, llama_state_seq_flags flags) {
+    GGML_UNUSED(io);
+    GGML_UNUSED(seq_id);
+    GGML_UNUSED(pos_begin);
+    GGML_UNUSED(pos_end);
+    GGML_UNUSED(flags);
+
+    throw std::runtime_error("state_read_range is not supported by this memory type");
 }

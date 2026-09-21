@@ -133,6 +133,12 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    // attention-only position range, used to build an append-only attention log.
+    // the setter merges the range into the live cache instead of replacing the sequence.
+    // the default implementations throw; only the caches that support range states override them.
+    virtual void state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos pos_begin, llama_pos pos_end, llama_state_seq_flags flags = 0) const;
+    virtual void state_read_range (llama_io_read_i  & io, llama_seq_id seq_id, llama_pos pos_begin, llama_pos pos_end, llama_state_seq_flags flags = 0);
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

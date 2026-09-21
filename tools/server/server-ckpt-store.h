@@ -47,6 +47,7 @@ struct server_ckpt_store {
         bool        use_dio  = false;
         bool        has_mtmd = false;
         bool        partial_ckpt = false; // hybrid/recurrent model: checkpoints carry the recurrent state only
+        bool        attn_log     = false; // keep one append-only attention file per session instead of per-turn full states
         size_t      max_bytes = 0; // 0 = no limit
     };
 
@@ -79,6 +80,17 @@ struct server_ckpt_store {
 
     // write the full target/draft state under a new generation
     bool write_full(int slot_id, std::vector<uint8_t> tgt, std::vector<uint8_t> dft);
+
+    // append attention to the session's attention log so that it covers
+    // [0, pos_end). `gen` produces the serialized range state for a range.
+    // the log is restarted when the checked-out history forked, which is when
+    // `tokens` no longer shares a prefix with what the log was built from.
+    bool append_attention(int slot_id, int64_t pos_end, const server_tokens & tokens,
+            const std::function<std::vector<uint8_t>(int64_t, int64_t)> & gen);
+
+    // rebuild the live attention of a slot from its attention log. returns true
+    // when the whole log was applied.
+    bool load_attention(int slot_id, llama_context * ctx, llama_seq_id seq_id);
 
     // persist the session sidecar: token list, full state and on-disk checkpoints
     void write_meta(int slot_id, const server_tokens & tokens, const std::list<common_prompt_checkpoint> & checkpoints);
@@ -136,6 +148,11 @@ private:
         std::string dir;
         uint64_t    next_file_id = 1;
 
+        // extent of the attention log: highest position it covers (pos_max + 1)
+        // and the token history it was built from
+        int64_t     attn_covered = 0;
+        server_tokens attn_tokens;
+
         // record file in the committed sidecar; the previous generation is
         // deleted once a newer one is committed
         uint64_t    full_committed = 0;
@@ -158,6 +175,7 @@ private:
     bool start_session(int slot_id, slot_state & s);
 
     std::string record_path(const std::string & dir, uint64_t file_id) const;
+    std::string attn_path  (const std::string & dir) const;
 
     // read raw bytes, direct IO when enabled and possible
     bool read_file(const std::string & path, uint64_t off, size_t size, uint8_t * dst) const;

@@ -211,6 +211,15 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     mem_recr->state_read(io, seq_id, flags);
 }
 
+void llama_memory_hybrid::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos pos_begin, llama_pos pos_end, llama_state_seq_flags flags) const {
+    // the recurrent state is position-independent, so a range state carries the attention part only
+    mem_attn->state_write_range(io, seq_id, pos_begin, pos_end, flags);
+}
+
+void llama_memory_hybrid::state_read_range(llama_io_read_i & io, llama_seq_id seq_id, llama_pos pos_begin, llama_pos pos_end, llama_state_seq_flags flags) {
+    mem_attn->state_read_range(io, seq_id, pos_begin, pos_end, flags);
+}
+
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
     return mem_attn.get();
 }

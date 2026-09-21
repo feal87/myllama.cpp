@@ -1030,6 +1030,34 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
+    // Get/set a position range of a sequence state. Unlike the _ext variants,
+    // these work only on the attention part of a hybrid cache and the setter
+    // merges into the live cache instead of replacing the sequence.
+    LLAMA_API size_t llama_state_seq_get_size_range_ext(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                      llama_pos   pos_begin,
+                      llama_pos   pos_end,
+           llama_state_seq_flags   flags);
+
+    LLAMA_API size_t llama_state_seq_get_data_range_ext(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size,
+                    llama_seq_id   seq_id,
+                      llama_pos   pos_begin,
+                      llama_pos   pos_end,
+           llama_state_seq_flags   flags);
+
+    LLAMA_API size_t llama_state_seq_set_data_range_ext(
+            struct llama_context * ctx,
+                   const uint8_t * src,
+                          size_t   size,
+                    llama_seq_id   dest_seq_id,
+                      llama_pos   pos_begin,
+                      llama_pos   pos_end,
+           llama_state_seq_flags   flags);
+
     //
     // Decoding
     //

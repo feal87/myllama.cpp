@@ -30,6 +30,7 @@ namespace {
 constexpr const char * DIR_PREFIX    = "llama-session-";
 constexpr const char * LEGACY_PREFIX = "llama-slot-";
 constexpr const char * META_NAME     = "meta.bin";
+constexpr const char * ATTN_NAME     = "attn.bin";
 constexpr const char * REC_PREFIX    = "rec-";
 constexpr const char * REC_SUFFIX    = ".bin";
 constexpr const char * TMP_SUFFIX    = ".tmp";
@@ -158,6 +159,10 @@ server_ckpt_store::slot_state & server_ckpt_store::state_for(int slot_id) {
 
 std::string server_ckpt_store::record_path(const std::string & dir, uint64_t file_id) const {
     return (std::filesystem::path(dir) / record_name(file_id)).string();
+}
+
+std::string server_ckpt_store::attn_path(const std::string & dir) const {
+    return (std::filesystem::path(dir) / ATTN_NAME).string();
 }
 
 void server_ckpt_store::remove_dir(const std::string & dir) const {
@@ -492,6 +497,8 @@ bool server_ckpt_store::start_session(int slot_id, slot_state & s) {
 
     s.next_file_id    = 1;
     s.full_committed  = 0;
+    s.attn_covered    = 0;
+    s.attn_tokens.clear();
     s.pending_remove.clear();
     s.has_meta        = false;
     s.full            = {};
@@ -630,6 +637,115 @@ bool server_ckpt_store::write_full(int slot_id, std::vector<uint8_t> tgt, std::v
             LOG_WRN("[ckpt-store] failed to write record %s\n", path.c_str());
         }
     });
+    return true;
+}
+
+bool server_ckpt_store::append_attention(int slot_id, int64_t pos_end, const server_tokens & tokens,
+        const std::function<std::vector<uint8_t>(int64_t, int64_t)> & gen) {
+    auto it = slots.find(slot_id);
+    if (it == slots.end() || it->second.dir.empty() || pos_end <= 0) {
+        return false;
+    }
+    slot_state & s = it->second;
+
+    // the log is valid up to the common prefix with the history it was built
+    // from. a log that was just adopted, or one that runs past either of those,
+    // has to be rebuilt from zero.
+    const size_t lcp = s.attn_tokens.empty() ? 0 : s.attn_tokens.get_common_prefix(tokens);
+    const bool reset = s.attn_covered <= 0 || s.attn_covered > pos_end || (int64_t) lcp < s.attn_covered;
+    const int64_t begin = reset ? 0 : s.attn_covered;
+    if (pos_end <= begin) {
+        return true;
+    }
+
+    std::vector<uint8_t> data = gen(begin, pos_end);
+    if (data.empty()) {
+        return false;
+    }
+    const size_t n_bytes = data.size();
+
+    const std::string path = attn_path(s.dir);
+    enqueue([path, data = std::move(data), reset]() {
+        FILE * f = std::fopen(path.c_str(), reset ? "wb" : "ab");
+        if (f == nullptr) {
+            LOG_WRN("[ckpt-store] failed to open attention %s\n", path.c_str());
+            return;
+        }
+        bool ok = std::fwrite(data.data(), 1, data.size(), f) == data.size();
+        if (std::fflush(f) != 0) {
+            ok = false;
+        }
+        if (std::fclose(f) != 0) {
+            ok = false;
+        }
+        if (!ok) {
+            LOG_WRN("[ckpt-store] failed to write attention %s\n", path.c_str());
+        }
+    });
+
+    s.attn_covered = pos_end;
+    s.attn_tokens  = tokens.clone();
+    st.write_bytes += n_bytes;
+    LOG_TRC("[ckpt-store] append attention slot %d [%" PRId64 ", %" PRId64 ") size=%zu reset=%d\n",
+            slot_id, begin, pos_end, n_bytes, (int) reset);
+    return true;
+}
+
+bool server_ckpt_store::load_attention(int slot_id, llama_context * ctx, llama_seq_id seq_id) {
+    auto it = slots.find(slot_id);
+    if (it == slots.end() || it->second.dir.empty()) {
+        return false;
+    }
+
+    // a rebuild from the log is the only consumer, so drain first
+    wait_idle();
+
+    std::ifstream input(attn_path(it->second.dir), std::ios::binary);
+    if (!input) {
+        return true; // no log yet
+    }
+
+    std::vector<uint8_t> buf((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    if (buf.empty()) {
+        return true;
+    }
+
+    size_t off = 0;
+    while (off < buf.size()) {
+        const size_t n = llama_state_seq_set_data_range_ext(ctx, buf.data() + off, buf.size() - off, seq_id, -1, -1, 0);
+        if (n == 0) {
+            LOG_WRN("[ckpt-store] failed to rebuild attention at offset %zu of %zu\n", off, buf.size());
+            return false;
+        }
+        off += n;
+    }
+
+    st.reads++;
+    st.read_bytes += buf.size();
+
+    // the log carries attention only, so the recurrent cache would still be
+    // empty. put it back at the newest checkpoint, which the log covers, so
+    // the caches agree on a position again.
+    const common_prompt_checkpoint * best = nullptr;
+    for (const auto & c : it->second.meta_ckpts) {
+        if (c.on_disk && c.size_tgt > 0 && (best == nullptr || c.n_tokens > best->n_tokens)) {
+            best = &c;
+        }
+    }
+    if (best == nullptr) {
+        LOG_WRN("[ckpt-store] attention log for slot %d has no checkpoint to pair with\n", slot_id);
+        return false;
+    }
+
+    std::vector<uint8_t> recr(best->size_tgt);
+    if (!read_file(record_path(it->second.dir, best->disk_id), best->off_tgt, best->size_tgt, recr.data()) ||
+            llama_state_seq_set_data_ext(ctx, recr.data(), recr.size(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != best->size_tgt) {
+        LOG_WRN("[ckpt-store] failed to restore the recurrent state for slot %d\n", slot_id);
+        return false;
+    }
+
+    LOG_INF("[ckpt-store] rebuilt attention for slot %d from %.1f MiB, recurrent at %" PRId64 "\n",
+            slot_id, buf.size() / 1024.0 / 1024.0, best->n_tokens);
     return true;
 }
 
@@ -779,8 +895,10 @@ bool server_ckpt_store::find_best(const server_tokens & tokens, size_t & out_ind
 
         const size_t lcp = s.tokens.get_common_prefix(tokens);
         // the stored session must cover a prefix of the slot prompt, so its
-        // checkpoint positions are valid for the prompt being processed
-        if (lcp != s.tokens.size()) {
+        // checkpoint positions are valid for the prompt being processed. when
+        // there is no full state, only checkpoints are reused, so a session
+        // that runs past the request is fine too.
+        if (lcp != s.tokens.size() && !(lcp == tokens.size() && !s.full.valid())) {
             continue;
         }
 
@@ -834,6 +952,10 @@ bool server_ckpt_store::adopt(int slot_id, size_t index_pos, server_tokens & tok
     st_slot.next_file_id   = next_file_id;
     st_slot.full           = s.full;
     st_slot.full_committed = s.full.file_id;
+    // the committed extent of the attention log is not tracked across restarts,
+    // so the next checkpoint rebuilds it from zero
+    st_slot.attn_covered   = 0;
+    st_slot.attn_tokens.clear();
     st_slot.pending_remove.clear();
     st_slot.has_meta       = true;
     st_slot.meta_tokens    = std::move(s.tokens);
@@ -913,6 +1035,8 @@ void server_ckpt_store::finalize(int slot_id) {
     s.dir.clear();
     s.next_file_id   = 1;
     s.full_committed = 0;
+    s.attn_covered   = 0;
+    s.attn_tokens.clear();
     s.pending_remove.clear();
     s.has_meta       = false;
     s.full           = {};
