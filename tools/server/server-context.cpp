@@ -3893,8 +3893,11 @@ private:
                                             }
                                             // the disk store checkpoints every batch, so a session
                                             // that grew past one batch is off this request's grid.
-                                            // those positions are still valid, and refusing them
-                                            // would drop back to a much older checkpoint
+                                            // those positions are still valid: an off-grid restore
+                                            // only changes the reduction order of the reprocessed
+                                            // tail, so the generation is normal, just not bit-exact
+                                            // with a cold fill. refusing them would drop back to a
+                                            // much older checkpoint instead
                                             if (ckpt_store == nullptr && cur.len_ctx != slot.task->n_tokens() &&
                                                     std::find(batch_starts.begin(), batch_starts.end(), cur.n_tokens) == batch_starts.end()) {
                                                 continue;
