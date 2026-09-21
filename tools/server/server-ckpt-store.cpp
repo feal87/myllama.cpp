@@ -10,7 +10,9 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <functional>
+#include <sstream>
 #include <system_error>
 
 #ifdef _WIN32
@@ -25,30 +27,127 @@
 
 namespace {
 
-constexpr const char * FILE_PREFIX = "llama-slot-";
-constexpr const char * FILE_SUFFIX = ".bin";
+constexpr const char * DIR_PREFIX    = "llama-session-";
+constexpr const char * LEGACY_PREFIX = "llama-slot-";
+constexpr const char * META_NAME     = "meta.bin";
+constexpr const char * REC_PREFIX    = "rec-";
+constexpr const char * REC_SUFFIX    = ".bin";
+constexpr const char * TMP_SUFFIX    = ".tmp";
 
 constexpr char META_MAGIC[8] = {'L', 'L', 'S', 'L', 'O', 'T', 'C', 'K'};
-constexpr uint32_t META_VERSION = 3;
+constexpr uint32_t META_VERSION = 4;
 constexpr uint32_t META_FLAG_MTMD     = 1u << 0;
 constexpr uint32_t META_FLAG_HAS_FULL = 1u << 1;
 constexpr uint64_t META_HEADER_SIZE = 80;
-constexpr uint64_t META_CKPT_SIZE   = 96;
+constexpr uint64_t META_CKPT_SIZE   = 104;
 
 const uint8_t zeros[server_ckpt_store::align_bytes] = {};
+
+std::string record_name(uint64_t file_id) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%s%" PRIu64 "%s", REC_PREFIX, file_id, REC_SUFFIX);
+    return buf;
+}
+
+bool parse_record_id(const std::string & name, uint64_t & file_id) {
+    const size_t prefix_len = std::strlen(REC_PREFIX);
+    const size_t suffix_len = std::strlen(REC_SUFFIX);
+    if (name.rfind(REC_PREFIX, 0) != 0 || name.size() <= prefix_len + suffix_len ||
+            !string_ends_with(name, REC_SUFFIX)) {
+        return false;
+    }
+
+    uint64_t value = 0;
+    for (size_t i = prefix_len; i < name.size() - suffix_len; ++i) {
+        if (name[i] < '0' || name[i] > '9') {
+            return false;
+        }
+        value = value * 10 + (uint64_t) (name[i] - '0');
+    }
+    file_id = value;
+    return true;
+}
+
+uint64_t dir_size(const std::filesystem::path & dir) {
+    std::error_code ec;
+    uint64_t total = 0;
+    for (const auto & entry : std::filesystem::recursive_directory_iterator(dir, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!entry.is_regular_file(ec) || ec) {
+            ec.clear();
+            continue;
+        }
+        total += (uint64_t) entry.file_size(ec);
+        if (ec) {
+            ec.clear();
+        }
+    }
+    return total;
+}
 
 } // namespace
 
 server_ckpt_store::server_ckpt_store(config cfg) : cfg(std::move(cfg)) {
     load_index();
+    worker = std::thread([this]() { worker_loop(); });
 }
 
 server_ckpt_store::~server_ckpt_store() {
-    for (auto & kv : slots) {
-        if (kv.second.fp != nullptr) {
-            std::fclose(kv.second.fp);
-            kv.second.fp = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        stopping = true;
+    }
+    cv.notify_all();
+    if (worker.joinable()) {
+        worker.join();
+    }
+}
+
+void server_ckpt_store::enqueue(std::function<void()> fn) {
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        queue.push_back(std::move(fn));
+        pending++;
+    }
+    cv.notify_one();
+}
+
+void server_ckpt_store::wait_idle() {
+    std::unique_lock<std::mutex> lock(mtx);
+    cv_done.wait(lock, [this]() { return pending == 0; });
+}
+
+void server_ckpt_store::worker_loop() {
+    while (true) {
+        std::function<void()> fn;
+        {
+            std::unique_lock<std::mutex> lock(mtx);
+            cv.wait(lock, [this]() { return stopping || !queue.empty(); });
+            if (queue.empty()) {
+                if (stopping) {
+                    return;
+                }
+                continue;
+            }
+            fn = std::move(queue.front());
+            queue.pop_front();
         }
+
+        try {
+            fn();
+        } catch (const std::exception & e) {
+            LOG_WRN("[ckpt-store] write job failed: %s\n", e.what());
+        } catch (...) {
+            LOG_WRN("%s", "[ckpt-store] write job failed\n");
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            pending--;
+        }
+        cv_done.notify_all();
     }
 }
 
@@ -56,13 +155,13 @@ server_ckpt_store::slot_state & server_ckpt_store::state_for(int slot_id) {
     return slots[slot_id];
 }
 
-void server_ckpt_store::remove_files(const std::string & path) const {
+std::string server_ckpt_store::record_path(const std::string & dir, uint64_t file_id) const {
+    return (std::filesystem::path(dir) / record_name(file_id)).string();
+}
+
+void server_ckpt_store::remove_dir(const std::string & dir) const {
     std::error_code ec;
-    std::filesystem::remove(path, ec);
-    ec.clear();
-    std::filesystem::remove(path + ".meta", ec);
-    ec.clear();
-    std::filesystem::remove(path + ".meta.tmp", ec);
+    std::filesystem::remove_all(dir, ec);
 }
 
 void server_ckpt_store::load_index() {
@@ -74,21 +173,29 @@ void server_ckpt_store::load_index() {
         if (ec) {
             break;
         }
-        if (!entry.is_regular_file(ec) || ec) {
-            ec.clear();
-            continue;
-        }
 
         const std::string name = entry.path().filename().string();
-        if (name.rfind(FILE_PREFIX, 0) != 0) {
+        if (!entry.is_directory(ec) || ec) {
+            ec.clear();
+            // remove files from an older format, they are not compatible
+            if (entry.is_regular_file(ec) && name.rfind(LEGACY_PREFIX, 0) == 0) {
+                std::error_code ec2;
+                std::filesystem::remove(entry.path(), ec2);
+            }
             continue;
         }
 
-        if (string_ends_with(name, ".bin.meta")) {
-            metas.push_back(entry.path());
-        } else if (string_ends_with(name, ".bin.meta.tmp")) {
-            std::filesystem::remove(entry.path(), ec);
+        if (name.rfind(DIR_PREFIX, 0) != 0) {
+            continue;
+        }
+
+        const std::filesystem::path meta_path = entry.path() / META_NAME;
+        if (std::filesystem::exists(meta_path, ec) && !ec) {
+            metas.push_back(meta_path);
+        } else {
             ec.clear();
+            LOG_WRN("[ckpt-store] removing incomplete session %s\n", entry.path().string().c_str());
+            remove_dir(entry.path().string());
         }
     }
     if (ec) {
@@ -116,39 +223,49 @@ void server_ckpt_store::load_index() {
             LOG_WRN("[ckpt-store] failed to read sidecar %s: %s\n", meta_path.string().c_str(), e.what());
         }
         if (!ok) {
-            std::filesystem::path data_path = meta_path;
-            data_path.replace_extension();
-            LOG_WRN("[ckpt-store] removing incompatible or invalid session %s\n", data_path.string().c_str());
-            remove_files(data_path.string());
+            LOG_WRN("[ckpt-store] removing incompatible or invalid session %s\n", meta_path.parent_path().string().c_str());
+            remove_dir(meta_path.parent_path().string());
             st.discarded++;
             continue;
         }
 
+        // drop record files written after the last sidecar commit
+        {
+            std::vector<uint64_t> referenced;
+            if (s.full.file_id != 0) {
+                referenced.push_back(s.full.file_id);
+            }
+            for (const auto & c : s.checkpoints) {
+                referenced.push_back(c.disk_id);
+            }
+
+            std::error_code ec2;
+            for (const auto & entry : std::filesystem::directory_iterator(s.dir, ec2)) {
+                if (ec2 || !entry.is_regular_file(ec2) || ec2) {
+                    ec2.clear();
+                    continue;
+                }
+                const std::string name = entry.path().filename().string();
+                if (string_ends_with(name, TMP_SUFFIX)) {
+                    std::error_code ec3;
+                    std::filesystem::remove(entry.path(), ec3);
+                    continue;
+                }
+
+                uint64_t file_id = 0;
+                if (!parse_record_id(name, file_id)) {
+                    continue;
+                }
+                if (std::find(referenced.begin(), referenced.end(), file_id) == referenced.end()) {
+                    LOG_TRC("[ckpt-store] removing orphan record %s\n", entry.path().string().c_str());
+                    std::error_code ec3;
+                    std::filesystem::remove(entry.path(), ec3);
+                }
+            }
+        }
+
         index.push_back(std::move(s));
         st.restored++;
-    }
-
-    // raw files without a committed sidecar are interrupted writes
-    for (const auto & entry : std::filesystem::directory_iterator(cfg.dir, ec)) {
-        if (ec) {
-            break;
-        }
-        if (!entry.is_regular_file(ec) || ec) {
-            ec.clear();
-            continue;
-        }
-
-        const std::string name = entry.path().filename().string();
-        if (name.rfind(FILE_PREFIX, 0) != 0 || !string_ends_with(name, ".bin")) {
-            continue;
-        }
-
-        const std::filesystem::path meta_path = entry.path().string() + ".meta";
-        if (!std::filesystem::exists(meta_path, ec) || ec) {
-            ec.clear();
-            LOG_WRN("[ckpt-store] removing incomplete session %s\n", entry.path().string().c_str());
-            remove_files(entry.path().string());
-        }
     }
 
     if (!index.empty()) {
@@ -163,6 +280,8 @@ bool server_ckpt_store::read_meta(const std::filesystem::path & meta_path, sessi
         return false;
     }
 
+    const std::filesystem::path dir = meta_path.parent_path();
+
     std::ifstream input(meta_path, std::ios::binary);
     if (!input) {
         return false;
@@ -175,8 +294,8 @@ bool server_ckpt_store::read_meta(const std::filesystem::path & meta_path, sessi
     uint32_t flags = 0;
     uint64_t key_size = 0;
     uint64_t tokens_size = 0;
-    uint64_t file_size = 0;
     uint64_t checkpoint_count = 0;
+    uint64_t full_file_id = 0;
     uint64_t off_full_tgt = 0;
     uint64_t size_full_tgt = 0;
     uint64_t off_full_dft = 0;
@@ -187,8 +306,8 @@ bool server_ckpt_store::read_meta(const std::filesystem::path & meta_path, sessi
         server_disk_meta_read(input, flags) &&
         server_disk_meta_read(input, key_size) &&
         server_disk_meta_read(input, tokens_size) &&
-        server_disk_meta_read(input, file_size) &&
         server_disk_meta_read(input, checkpoint_count) &&
+        server_disk_meta_read(input, full_file_id) &&
         server_disk_meta_read(input, off_full_tgt) &&
         server_disk_meta_read(input, size_full_tgt) &&
         server_disk_meta_read(input, off_full_dft) &&
@@ -215,17 +334,36 @@ bool server_ckpt_store::read_meta(const std::filesystem::path & meta_path, sessi
         expected_metadata_size == (uint64_t) metadata_file_size &&
         (checkpoint_count > 0 || has_full) &&
         (has_full
-            ? size_full_tgt > 0 &&
-              off_full_tgt % align_bytes == 0 &&
-              off_full_dft % align_bytes == 0 &&
-              server_disk_range_valid(off_full_tgt, size_full_tgt, file_size) &&
-              server_disk_range_valid(off_full_dft, size_full_dft, file_size)
+            ? size_full_tgt > 0 && off_full_tgt == 0 && off_full_dft % align_bytes == 0
             : size_full_tgt == 0 && size_full_dft == 0 && off_full_tgt == 0 && off_full_dft == 0);
     if (!ok) {
         LOG_WRN("[ckpt-store] reject %s: header (ver=%u flags=%u key_size=%" PRIu64 " expected=%zu tokens=%" PRIu64 " ckpt=%" PRIu64 " meta=%" PRIu64 " got=%" PRIu64 ")\n",
                 meta_path.string().c_str(), version, flags, key_size, cfg.key.size(), tokens_size, checkpoint_count,
                 expected_metadata_size, (uint64_t) metadata_file_size);
         return false;
+    }
+
+    auto record_size = [&](uint64_t file_id, uint64_t & size) -> bool {
+        if (file_id == 0) {
+            return false;
+        }
+        std::error_code ec2;
+        const uintmax_t s = std::filesystem::file_size(dir / record_name(file_id), ec2);
+        if (ec2) {
+            return false;
+        }
+        size = (uint64_t) s;
+        return true;
+    };
+
+    if (has_full) {
+        uint64_t size_file = 0;
+        if (!record_size(full_file_id, size_file) ||
+                !server_disk_range_valid(off_full_tgt, size_full_tgt, size_file) ||
+                (size_full_dft > 0 && (!server_disk_range_valid(off_full_dft, size_full_dft, size_file) || off_full_dft == 0))) {
+            LOG_WRN("[ckpt-store] reject %s: invalid full state record\n", meta_path.string().c_str());
+            return false;
+        }
     }
 
     std::string key(key_size, '\0');
@@ -257,6 +395,7 @@ bool server_ckpt_store::read_meta(const std::filesystem::path & meta_path, sessi
         uint32_t reserved = 0;
         int64_t pos_min = 0;
         int64_t pos_max = 0;
+        uint64_t disk_id = 0;
         uint64_t off_tgt = 0;
         uint64_t size_tgt = 0;
         uint64_t off_dft = 0;
@@ -271,6 +410,7 @@ bool server_ckpt_store::read_meta(const std::filesystem::path & meta_path, sessi
             server_disk_meta_read(input, reserved) &&
             server_disk_meta_read(input, pos_min) &&
             server_disk_meta_read(input, pos_max) &&
+            server_disk_meta_read(input, disk_id) &&
             server_disk_meta_read(input, off_tgt) &&
             server_disk_meta_read(input, size_tgt) &&
             server_disk_meta_read(input, off_dft) &&
@@ -280,20 +420,17 @@ bool server_ckpt_store::read_meta(const std::filesystem::path & meta_path, sessi
             server_disk_meta_read(input, len_ctx) &&
             server_disk_meta_read(input, fingerprint);
 
+        uint64_t size_file = 0;
         ok = ok &&
             reserved == 0 &&
             n_tokens >= 0 && (uint64_t) n_tokens <= tokens.size() &&
             pos_min >= std::numeric_limits<llama_pos>::min() && pos_min <= std::numeric_limits<llama_pos>::max() &&
             pos_max >= std::numeric_limits<llama_pos>::min() && pos_max <= std::numeric_limits<llama_pos>::max() &&
-            off_tgt % align_bytes == 0 &&
-            size_tgt > 0 &&
-            server_disk_range_valid(off_tgt, size_tgt, file_size) &&
-            off_dft % align_bytes == 0 &&
-            server_disk_range_valid(off_dft, size_dft, file_size) &&
-            off_spec % align_bytes == 0 &&
-            server_disk_range_valid(off_spec, size_spec, file_size) &&
-            (size_dft > 0 || off_dft == 0) &&
-            (size_spec > 0 || off_spec == 0);
+            record_size(disk_id, size_file) &&
+            off_tgt == 0 && size_tgt > 0 &&
+            server_disk_range_valid(off_tgt, size_tgt, size_file) &&
+            (size_dft > 0 ? (off_dft != 0 && off_dft % align_bytes == 0 && server_disk_range_valid(off_dft, size_dft, size_file)) : off_dft == 0) &&
+            (size_spec > 0 ? (off_spec != 0 && off_spec % align_bytes == 0 && server_disk_range_valid(off_spec, size_spec, size_file)) : off_spec == 0);
         if (!ok) {
             LOG_WRN("[ckpt-store] reject %s: bad checkpoint %" PRIu64 "\n", meta_path.string().c_str(), i);
             return false;
@@ -307,6 +444,7 @@ bool server_ckpt_store::read_meta(const std::filesystem::path & meta_path, sessi
         checkpoint.len_ctx     = len_ctx;
         checkpoint.fingerprint = fingerprint;
         checkpoint.on_disk   = true;
+        checkpoint.disk_id   = disk_id;
         checkpoint.off_tgt   = off_tgt;
         checkpoint.size_tgt  = size_tgt;
         checkpoint.off_dft   = off_dft;
@@ -316,22 +454,15 @@ bool server_ckpt_store::read_meta(const std::filesystem::path & meta_path, sessi
         checkpoints.push_back(std::move(checkpoint));
     }
 
-    std::filesystem::path data_path = meta_path;
-    data_path.replace_extension();
-    ec.clear();
-    const uintmax_t data_file_size = std::filesystem::file_size(data_path, ec);
-    if (ec || (uint64_t) data_file_size < file_size) {
-        LOG_WRN("[ckpt-store] reject %s: data file missing or short (want %" PRIu64 ")\n", meta_path.string().c_str(), file_size);
-        return false;
-    }
-
-    out.path = data_path.string();
-    out.file_size = file_size;
+    out.dir = dir.string();
     out.tokens = std::move(tokens);
-    out.full.off_tgt  = off_full_tgt;
-    out.full.size_tgt = size_full_tgt;
-    out.full.off_dft  = off_full_dft;
-    out.full.size_dft = size_full_dft;
+    if (has_full) {
+        out.full.file_id  = full_file_id;
+        out.full.off_tgt  = off_full_tgt;
+        out.full.size_tgt = size_full_tgt;
+        out.full.off_dft  = off_full_dft;
+        out.full.size_dft = size_full_dft;
+    }
     out.checkpoints = std::move(checkpoints);
     std::error_code ec_mtime;
     out.mtime = std::filesystem::last_write_time(meta_path, ec_mtime);
@@ -339,104 +470,170 @@ bool server_ckpt_store::read_meta(const std::filesystem::path & meta_path, sessi
 }
 
 bool server_ckpt_store::start_session(int slot_id, slot_state & s) {
-    if (s.fp != nullptr) {
+    if (!s.dir.empty()) {
         return true;
     }
 
     std::error_code ec;
     std::filesystem::create_directories(cfg.dir, ec);
 
-    // id includes the model key hash so a different model never reuses the file
+    // the key hash keeps a different model from reusing the directory
     char name[128];
-    std::snprintf(name, sizeof(name), "%s%d-%08x-%" PRId64 "%s",
-            FILE_PREFIX, slot_id, (unsigned) (std::hash<std::string>{}(cfg.key) & 0xffffffff),
-            ggml_time_us(), FILE_SUFFIX);
+    std::snprintf(name, sizeof(name), "%s%08x-%" PRId64,
+            DIR_PREFIX, (unsigned) (std::hash<std::string>{}(cfg.key) & 0xffffffff), ggml_time_us());
 
-    s.path = (std::filesystem::path(cfg.dir) / name).string();
-    s.fp   = std::fopen(s.path.c_str(), "wb");
-    s.end  = 0;
-    s.live = 0;
-    s.dead = 0;
-    s.recs.clear();
-    s.has_meta = false;
-    s.full = {};
-    s.meta_tokens.clear();
-    s.meta_ckpts.clear();
-
-    if (s.fp == nullptr) {
+    s.dir = (std::filesystem::path(cfg.dir) / name).string();
+    if (!std::filesystem::create_directories(s.dir, ec) && ec) {
+        s.dir.clear();
         return false;
     }
+
+    s.next_file_id    = 1;
+    s.full_committed  = 0;
+    s.pending_remove.clear();
+    s.has_meta        = false;
+    s.full            = {};
+    s.meta_tokens.clear();
+    s.meta_ckpts.clear();
 
     enforce_cap(0);
     return true;
 }
 
-uint64_t server_ckpt_store::append(int slot_id, const uint8_t * data, size_t size) {
-    slot_state & s = state_for(slot_id);
+namespace {
 
-    if (!start_session(slot_id, s)) {
-        return UINT64_MAX;
+// write tgt/dft/spec back to back, each padded to the alignment so direct IO
+// reads never cross the end of the file
+bool write_record_file(const std::string & path,
+        const std::vector<uint8_t> & tgt,
+        const std::vector<uint8_t> & dft,
+        const std::vector<uint8_t> & spec) {
+    FILE * f = std::fopen(path.c_str(), "wb");
+    if (f == nullptr) {
+        return false;
     }
 
-    const uint64_t off = s.end;
-    const uint64_t pad = round_up(size) - size;
+    bool ok = true;
+    auto put = [&](const std::vector<uint8_t> & data) {
+        if (!ok || data.empty()) {
+            return;
+        }
+        if (std::fwrite(data.data(), 1, data.size(), f) != data.size()) {
+            ok = false;
+            return;
+        }
+        const size_t pad = (size_t) (server_ckpt_store::round_up(data.size()) - data.size());
+        if (pad > 0 && std::fwrite(zeros, 1, pad, f) != pad) {
+            ok = false;
+        }
+    };
 
-    if (std::fwrite(data, 1, size, s.fp) != size) {
-        return UINT64_MAX;
+    put(tgt);
+    put(dft);
+    put(spec);
+
+    if (std::fflush(f) != 0) {
+        ok = false;
     }
-    if (pad > 0 && std::fwrite(zeros, 1, pad, s.fp) != pad) {
-        return UINT64_MAX;
+    if (std::fclose(f) != 0) {
+        ok = false;
     }
-
-    s.end  += round_up(size);
-    s.live += round_up(size);
-    s.recs.push_back({ off, size, true });
-
-    st.appends++;
-    st.write_bytes += size;
-    LOG_TRC("[ckpt-store] append slot %d off=%" PRIu64 " size=%zu\n", slot_id, off, size);
-    return off;
+    return ok;
 }
 
-bool server_ckpt_store::write_full(int slot_id, const uint8_t * tgt, size_t size_tgt, const uint8_t * dft, size_t size_dft) {
-    if (size_tgt == 0) {
+} // namespace
+
+bool server_ckpt_store::write_checkpoint(int slot_id,
+        std::vector<uint8_t> tgt,
+        std::vector<uint8_t> dft,
+        std::vector<uint8_t> spec,
+        common_prompt_checkpoint & out) {
+    if (tgt.empty()) {
         return false;
-    }
-
-    // a superseded snapshot is dead weight, drop it so compaction can reclaim it
-    auto prev = slots.find(slot_id);
-    if (prev != slots.end() && prev->second.full.off_tgt != 0) {
-        release(slot_id, prev->second.full.off_tgt);
-        if (prev->second.full.off_dft != 0) {
-            release(slot_id, prev->second.full.off_dft);
-        }
-        prev->second.full = {};
-    }
-
-    const uint64_t off_tgt = append(slot_id, tgt, size_tgt);
-    if (off_tgt == UINT64_MAX) {
-        return false;
-    }
-
-    uint64_t off_dft = 0;
-    if (size_dft > 0) {
-        off_dft = append(slot_id, dft, size_dft);
-        if (off_dft == UINT64_MAX) {
-            return false;
-        }
     }
 
     slot_state & s = state_for(slot_id);
-    s.full.off_tgt  = off_tgt;
-    s.full.size_tgt = size_tgt;
-    s.full.off_dft  = off_dft;
-    s.full.size_dft = size_dft;
+    if (!start_session(slot_id, s)) {
+        return false;
+    }
+
+    const uint64_t file_id  = s.next_file_id;
+    const uint64_t size_tgt = tgt.size();
+    const uint64_t size_dft = dft.size();
+    const uint64_t size_spec = spec.size();
+    s.next_file_id = file_id + 1;
+
+    out.on_disk   = true;
+    out.disk_id   = file_id;
+    out.off_tgt   = 0;
+    out.size_tgt  = size_tgt;
+    out.off_dft   = size_dft  > 0 ? round_up(size_tgt) : 0;
+    out.size_dft  = size_dft;
+    out.off_spec  = size_spec > 0 ? round_up(size_tgt) + round_up(size_dft) : 0;
+    out.size_spec = size_spec;
+
+    st.appends++;
+    st.write_bytes += size_tgt + size_dft + size_spec;
+    LOG_TRC("[ckpt-store] write checkpoint slot %d file=%" PRIu64 " size=%" PRIu64 "\n", slot_id, file_id, size_tgt);
+
+    const std::string path = record_path(s.dir, file_id);
+    enqueue([path, tgt = std::move(tgt), dft = std::move(dft), spec = std::move(spec)]() {
+        if (!write_record_file(path, tgt, dft, spec)) {
+            LOG_WRN("[ckpt-store] failed to write record %s\n", path.c_str());
+        }
+    });
+    return true;
+}
+
+bool server_ckpt_store::write_full(int slot_id, std::vector<uint8_t> tgt, std::vector<uint8_t> dft) {
+    if (tgt.empty()) {
+        return false;
+    }
+
+    slot_state & s = state_for(slot_id);
+    if (!start_session(slot_id, s)) {
+        return false;
+    }
+
+    // drop a full state that was written but never committed; the queue is FIFO,
+    // so the delete lands after the pending write of that generation
+    if (s.full.file_id != 0 && s.full.file_id != s.full_committed) {
+        const std::string stale = record_path(s.dir, s.full.file_id);
+        enqueue([stale]() {
+            std::error_code ec;
+            std::filesystem::remove(stale, ec);
+        });
+    }
+
+    const uint64_t file_id  = s.next_file_id;
+    const uint64_t size_tgt = tgt.size();
+    const uint64_t size_dft = dft.size();
+    s.next_file_id = file_id + 1;
+
+    full_state full;
+    full.file_id  = file_id;
+    full.off_tgt  = 0;
+    full.size_tgt = size_tgt;
+    full.off_dft  = size_dft > 0 ? round_up(size_tgt) : 0;
+    full.size_dft = size_dft;
+    s.full = full;
+
+    st.appends++;
+    st.write_bytes += size_tgt + size_dft;
+    LOG_TRC("[ckpt-store] write full slot %d file=%" PRIu64 " size=%" PRIu64 "\n", slot_id, file_id, size_tgt);
+
+    const std::string path = record_path(s.dir, file_id);
+    enqueue([path, tgt = std::move(tgt), dft = std::move(dft)]() {
+        if (!write_record_file(path, tgt, dft, {})) {
+            LOG_WRN("[ckpt-store] failed to write record %s\n", path.c_str());
+        }
+    });
     return true;
 }
 
 void server_ckpt_store::write_meta(int slot_id, const server_tokens & tokens, const std::list<common_prompt_checkpoint> & checkpoints) {
     auto it = slots.find(slot_id);
-    if (it == slots.end() || it->second.fp == nullptr || it->second.path.empty()) {
+    if (it == slots.end() || it->second.dir.empty()) {
         return;
     }
     slot_state & s = it->second;
@@ -457,78 +654,103 @@ void server_ckpt_store::write_meta(int slot_id, const server_tokens & tokens, co
 
     const uint64_t key_size = cfg.key.size();
     const uint64_t tokens_size = serialized_tokens.size();
-    const uint64_t file_size = s.end;
     const uint64_t checkpoint_count = disk.size();
+    const uint64_t full_file_id  = s.full.file_id;
     const uint64_t off_full_tgt  = s.full.off_tgt;
     const uint64_t size_full_tgt = s.full.size_tgt;
     const uint64_t off_full_dft  = s.full.off_dft;
     const uint64_t size_full_dft = s.full.size_dft;
 
-    const std::string meta_path = s.path + ".meta";
-    std::fflush(s.fp);
+    std::ostringstream body;
+    body.write(META_MAGIC, sizeof(META_MAGIC));
+    bool ok = body.good() &&
+        server_disk_meta_write(body, META_VERSION) &&
+        server_disk_meta_write(body, flags) &&
+        server_disk_meta_write(body, key_size) &&
+        server_disk_meta_write(body, tokens_size) &&
+        server_disk_meta_write(body, checkpoint_count) &&
+        server_disk_meta_write(body, full_file_id) &&
+        server_disk_meta_write(body, off_full_tgt) &&
+        server_disk_meta_write(body, size_full_tgt) &&
+        server_disk_meta_write(body, off_full_dft) &&
+        server_disk_meta_write(body, size_full_dft);
 
-    const bool ok = server_disk_meta_commit(meta_path, [&](std::ostream & output) {
-        output.write(META_MAGIC, sizeof(META_MAGIC));
-        bool ok = output.good() &&
-            server_disk_meta_write(output, META_VERSION) &&
-            server_disk_meta_write(output, flags) &&
-            server_disk_meta_write(output, key_size) &&
-            server_disk_meta_write(output, tokens_size) &&
-            server_disk_meta_write(output, file_size) &&
-            server_disk_meta_write(output, checkpoint_count) &&
-            server_disk_meta_write(output, off_full_tgt) &&
-            server_disk_meta_write(output, size_full_tgt) &&
-            server_disk_meta_write(output, off_full_dft) &&
-            server_disk_meta_write(output, size_full_dft);
+    if (ok && key_size > 0) {
+        body.write(cfg.key.data(), key_size);
+        ok = body.good();
+    }
+    if (ok && tokens_size > 0) {
+        body.write(serialized_tokens.data(), tokens_size);
+        ok = body.good();
+    }
 
-        if (ok && key_size > 0) {
-            output.write(cfg.key.data(), key_size);
-            ok = output.good();
-        }
-        if (ok && tokens_size > 0) {
-            output.write(serialized_tokens.data(), tokens_size);
-            ok = output.good();
-        }
+    for (const auto & c : disk) {
+        const int64_t  n_tokens  = c.n_tokens;
+        const int32_t  id_task   = c.id_task;
+        const uint32_t reserved  = 0;
+        const int64_t  pos_min   = c.pos_min;
+        const int64_t  pos_max   = c.pos_max;
+        const uint64_t disk_id   = c.disk_id;
+        const uint64_t off_tgt   = c.off_tgt;
+        const uint64_t size_tgt  = c.size_tgt;
+        const uint64_t off_dft   = c.off_dft;
+        const uint64_t size_dft  = c.size_dft;
+        const uint64_t off_spec  = c.off_spec;
+        const uint64_t size_spec = c.size_spec;
+        const int64_t  len_ctx     = c.len_ctx;
+        const uint64_t fingerprint = c.fingerprint;
 
-        for (const auto & c : disk) {
-            const int64_t  n_tokens  = c.n_tokens;
-            const int32_t  id_task   = c.id_task;
-            const uint32_t reserved  = 0;
-            const int64_t  pos_min   = c.pos_min;
-            const int64_t  pos_max   = c.pos_max;
-            const uint64_t off_tgt   = c.off_tgt;
-            const uint64_t size_tgt  = c.size_tgt;
-            const uint64_t off_dft   = c.off_dft;
-            const uint64_t size_dft  = c.size_dft;
-            const uint64_t off_spec  = c.off_spec;
-            const uint64_t size_spec = c.size_spec;
-            const int64_t  len_ctx     = c.len_ctx;
-            const uint64_t fingerprint = c.fingerprint;
-
-            ok = ok &&
-                server_disk_meta_write(output, n_tokens) &&
-                server_disk_meta_write(output, id_task) &&
-                server_disk_meta_write(output, reserved) &&
-                server_disk_meta_write(output, pos_min) &&
-                server_disk_meta_write(output, pos_max) &&
-                server_disk_meta_write(output, off_tgt) &&
-                server_disk_meta_write(output, size_tgt) &&
-                server_disk_meta_write(output, off_dft) &&
-                server_disk_meta_write(output, size_dft) &&
-                server_disk_meta_write(output, off_spec) &&
-                server_disk_meta_write(output, size_spec) &&
-                server_disk_meta_write(output, len_ctx) &&
-                server_disk_meta_write(output, fingerprint);
-        }
-
-        return ok;
-    });
+        ok = ok &&
+            server_disk_meta_write(body, n_tokens) &&
+            server_disk_meta_write(body, id_task) &&
+            server_disk_meta_write(body, reserved) &&
+            server_disk_meta_write(body, pos_min) &&
+            server_disk_meta_write(body, pos_max) &&
+            server_disk_meta_write(body, disk_id) &&
+            server_disk_meta_write(body, off_tgt) &&
+            server_disk_meta_write(body, size_tgt) &&
+            server_disk_meta_write(body, off_dft) &&
+            server_disk_meta_write(body, size_dft) &&
+            server_disk_meta_write(body, off_spec) &&
+            server_disk_meta_write(body, size_spec) &&
+            server_disk_meta_write(body, len_ctx) &&
+            server_disk_meta_write(body, fingerprint);
+    }
 
     if (!ok) {
-        LOG_WRN("[ckpt-store] failed to write sidecar %s\n", meta_path.c_str());
+        LOG_WRN("[ckpt-store] failed to serialize sidecar for slot %d\n", slot_id);
         return;
     }
 
+    // paths to delete once the new sidecar is in place
+    std::vector<std::string> to_delete;
+    if (s.full_committed != 0 && s.full_committed != s.full.file_id) {
+        to_delete.push_back(record_path(s.dir, s.full_committed));
+    }
+    for (const uint64_t file_id : s.pending_remove) {
+        to_delete.push_back(record_path(s.dir, file_id));
+    }
+
+    const std::string meta_path = (std::filesystem::path(s.dir) / META_NAME).string();
+    std::string body_str = body.str();
+
+    enqueue([meta_path, body_str = std::move(body_str), to_delete = std::move(to_delete)]() {
+        const bool committed = server_disk_meta_commit(meta_path, [&](std::ostream & output) {
+            output.write(body_str.data(), body_str.size());
+            return output.good();
+        });
+        if (!committed) {
+            LOG_WRN("[ckpt-store] failed to write sidecar %s\n", meta_path.c_str());
+            return;
+        }
+        for (const auto & path : to_delete) {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+    });
+
+    s.full_committed = s.full.file_id;
+    s.pending_remove.clear();
     s.has_meta = true;
     s.meta_tokens = tokens.clone();
     s.meta_ckpts = std::move(disk);
@@ -586,173 +808,67 @@ bool server_ckpt_store::adopt(int slot_id, size_t index_pos, server_tokens & tok
         return false;
     }
 
-    // make room: the slot may still hold an active (unfinished) session
+    // make room: the slot may still hold an active session
     auto it = slots.find(slot_id);
-    if (it != slots.end() && it->second.fp != nullptr) {
+    if (it != slots.end() && !it->second.dir.empty()) {
         finalize(slot_id);
     }
 
-    // a crash between an append and the sidecar commit leaves bytes past the
-    // committed size; drop them so the record offsets stay aligned
-    std::error_code ec;
-    std::filesystem::resize_file(s.path, s.file_size, ec);
-
-    FILE * fp = std::fopen(s.path.c_str(), "ab");
-    if (fp == nullptr) {
-        LOG_WRN("[ckpt-store] failed to open session %s for append\n", s.path.c_str());
-        return false;
+    uint64_t next_file_id = 1;
+    if (s.full.file_id >= next_file_id) {
+        next_file_id = s.full.file_id + 1;
+    }
+    for (const auto & c : s.checkpoints) {
+        if (c.disk_id >= next_file_id) {
+            next_file_id = c.disk_id + 1;
+        }
     }
 
     slot_state & st_slot = slots[slot_id];
-    st_slot.path = s.path;
-    st_slot.fp   = fp;
-    st_slot.end  = s.file_size;
-    st_slot.live = 0;
-    st_slot.dead = 0;
-    st_slot.recs.clear();
-    st_slot.full = s.full;
-    for (const auto & c : s.checkpoints) {
-        st_slot.recs.push_back({ c.off_tgt, c.size_tgt, true });
-        st_slot.live += round_up(c.size_tgt);
-    }
-    st_slot.has_meta    = true;
-    st_slot.meta_tokens = std::move(s.tokens);
-    st_slot.meta_ckpts  = std::move(s.checkpoints);
+    st_slot.dir            = std::move(s.dir);
+    st_slot.next_file_id   = next_file_id;
+    st_slot.full           = s.full;
+    st_slot.full_committed = s.full.file_id;
+    st_slot.pending_remove.clear();
+    st_slot.has_meta       = true;
+    st_slot.meta_tokens    = std::move(s.tokens);
+    st_slot.meta_ckpts     = std::move(s.checkpoints);
 
     tokens      = st_slot.meta_tokens.clone();
     full        = st_slot.full;
     checkpoints = st_slot.meta_ckpts;
     st.adopted++;
 
-    LOG_INF("[ckpt-store] adopted session %s for slot %d (%zu checkpoints, %.1f MiB)\n",
-            st_slot.path.c_str(), slot_id, checkpoints.size(), st_slot.end / (1024.0 * 1024.0));
+    LOG_INF("[ckpt-store] adopted session %s for slot %d (%zu checkpoints)\n",
+            st_slot.dir.c_str(), slot_id, checkpoints.size());
     return true;
 }
 
-bool server_ckpt_store::read(int slot_id, uint64_t off, size_t size, uint8_t * dst) {
+bool server_ckpt_store::read(int slot_id, uint64_t file_id, uint64_t off, size_t size, uint8_t * dst) {
     auto it = slots.find(slot_id);
-    if (it == slots.end()) {
+    if (it == slots.end() || it->second.dir.empty()) {
         return false;
     }
 
-    // the record may still be in the write buffer of the append handle
-    if (it->second.fp != nullptr) {
-        std::fflush(it->second.fp);
-    }
+    // the record may still be queued for the write worker
+    wait_idle();
 
-    const bool ok = read_file(it->second.path, off, size, dst);
+    const bool ok = read_file(record_path(it->second.dir, file_id), off, size, dst);
     if (ok) {
         st.reads++;
         st.read_bytes += size;
-        LOG_TRC("[ckpt-store] read slot %d off=%" PRIu64 " size=%zu\n", slot_id, off, size);
+        LOG_TRC("[ckpt-store] read slot %d file=%" PRIu64 " off=%" PRIu64 " size=%zu\n", slot_id, file_id, off, size);
     }
     return ok;
 }
 
-void server_ckpt_store::release(int slot_id, uint64_t off) {
+void server_ckpt_store::release_file(int slot_id, uint64_t file_id) {
     auto it = slots.find(slot_id);
-    if (it == slots.end()) {
+    if (it == slots.end() || it->second.dir.empty() || file_id == 0) {
         return;
     }
 
-    for (auto & r : it->second.recs) {
-        if (r.off == off && r.live) {
-            r.live = false;
-            const uint64_t n = round_up(r.size);
-            it->second.live -= std::min(it->second.live, n);
-            it->second.dead += n;
-            return;
-        }
-    }
-}
-
-void server_ckpt_store::maybe_compact(int slot_id, std::vector<std::pair<uint64_t, uint64_t>> & remap) {
-    auto it = slots.find(slot_id);
-    if (it == slots.end()) {
-        return;
-    }
-    slot_state & s = it->second;
-
-    if (s.fp == nullptr || s.dead <= s.live) {
-        return;
-    }
-
-    // close the write handle so the rewrite can read the same path on Windows
-    std::fflush(s.fp);
-    std::fclose(s.fp);
-    s.fp = nullptr;
-
-    const std::string tmp = s.path + ".tmp";
-    FILE * out = std::fopen(tmp.c_str(), "wb");
-    if (out == nullptr) {
-        s.fp = std::fopen(s.path.c_str(), "ab");
-        return;
-    }
-
-    std::vector<uint8_t> buf;
-    std::vector<rec>     new_recs;
-    uint64_t             new_end = 0;
-
-    for (auto & r : s.recs) {
-        if (!r.live) {
-            continue;
-        }
-
-        buf.resize(r.size);
-        if (!read_file(s.path, r.off, r.size, buf.data())) {
-            std::fclose(out);
-            std::remove(tmp.c_str());
-            s.fp = std::fopen(s.path.c_str(), "ab");
-            return;
-        }
-
-        const uint64_t pad = round_up(r.size) - r.size;
-        if (std::fwrite(buf.data(), 1, r.size, out) != r.size ||
-                (pad > 0 && std::fwrite(zeros, 1, pad, out) != pad)) {
-            std::fclose(out);
-            std::remove(tmp.c_str());
-            s.fp = std::fopen(s.path.c_str(), "ab");
-            return;
-        }
-
-        remap.emplace_back(r.off, new_end);
-        new_recs.push_back({ new_end, r.size, true });
-        new_end += round_up(r.size);
-    }
-
-    std::fclose(out);
-    std::remove(s.path.c_str());
-    std::rename(tmp.c_str(), s.path.c_str());
-
-    const uint64_t dead_before = s.dead;
-    const uint64_t live_before = s.live;
-
-    s.fp   = std::fopen(s.path.c_str(), "ab");
-    s.end  = new_end;
-    s.live = new_end;
-    s.dead = 0;
-    s.recs = std::move(new_recs);
-
-    // the full state record moved too, keep the sidecar reference valid
-    auto remap_off = [&](uint64_t & off) {
-        if (off == 0) {
-            return;
-        }
-        for (const auto & m : remap) {
-            if (m.first == off) {
-                off = m.second;
-                return;
-            }
-        }
-    };
-    remap_off(s.full.off_tgt);
-    remap_off(s.full.off_dft);
-
-    st.compactions++;
-    st.compact_read += new_end;
-
-    LOG_INF("[ckpt-store] compacted slot %d: %.1f MiB written (was %.1f MiB live + %.1f MiB dead)\n",
-            slot_id, new_end / (1024.0 * 1024.0), live_before / (1024.0 * 1024.0), dead_before / (1024.0 * 1024.0));
+    it->second.pending_remove.push_back(file_id);
 }
 
 void server_ckpt_store::finalize(int slot_id) {
@@ -762,32 +878,39 @@ void server_ckpt_store::finalize(int slot_id) {
     }
     slot_state & s = it->second;
 
+    // pending records that the committed sidecar does not reference are orphans
+    for (const uint64_t file_id : s.pending_remove) {
+        bool referenced = file_id == s.full.file_id;
+        for (const auto & c : s.meta_ckpts) {
+            if (c.disk_id == file_id) {
+                referenced = true;
+                break;
+            }
+        }
+        if (!referenced) {
+            std::error_code ec;
+            std::filesystem::remove(record_path(s.dir, file_id), ec);
+        }
+    }
+
     // the sidecar is already current; keep the finished session matchable
-    if (s.has_meta && (!s.meta_ckpts.empty() || s.full.valid()) && !s.path.empty()) {
+    if (s.has_meta && (!s.meta_ckpts.empty() || s.full.valid()) && !s.dir.empty()) {
         session ses;
-        ses.path      = s.path;
-        ses.file_size = s.end;
-        ses.tokens    = std::move(s.meta_tokens);
-        ses.full      = s.full;
+        ses.dir         = s.dir;
+        ses.tokens      = std::move(s.meta_tokens);
+        ses.full        = s.full;
         ses.checkpoints = std::move(s.meta_ckpts);
         std::error_code ec;
-        ses.mtime = std::filesystem::last_write_time(s.path, ec);
+        ses.mtime = std::filesystem::last_write_time(s.dir, ec);
         index.push_back(std::move(ses));
     }
 
-    if (s.fp != nullptr) {
-        std::fflush(s.fp);
-        std::fclose(s.fp);
-        s.fp = nullptr;
-    }
-
-    s.recs.clear();
-    s.path.clear();
-    s.end  = 0;
-    s.live = 0;
-    s.dead = 0;
-    s.has_meta = false;
-    s.full = {};
+    s.dir.clear();
+    s.next_file_id   = 1;
+    s.full_committed = 0;
+    s.pending_remove.clear();
+    s.has_meta       = false;
+    s.full           = {};
     s.meta_tokens.clear();
     s.meta_ckpts.clear();
     s.session++;
@@ -796,15 +919,18 @@ void server_ckpt_store::finalize(int slot_id) {
 size_t server_ckpt_store::total_bytes() const {
     std::error_code ec;
     size_t res = 0;
-    for (const auto & e : std::filesystem::directory_iterator(cfg.dir, ec)) {
-        if (!e.is_regular_file()) {
+    for (const auto & entry : std::filesystem::recursive_directory_iterator(cfg.dir, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!entry.is_regular_file(ec) || ec) {
+            ec.clear();
             continue;
         }
-        const std::string name = e.path().filename().string();
-        if (name.rfind(FILE_PREFIX, 0) != 0 || !string_ends_with(name, FILE_SUFFIX)) {
-            continue;
+        res += (size_t) entry.file_size(ec);
+        if (ec) {
+            ec.clear();
         }
-        res += (size_t) e.file_size();
     }
     return res;
 }
@@ -812,13 +938,15 @@ size_t server_ckpt_store::total_bytes() const {
 size_t server_ckpt_store::n_files() const {
     std::error_code ec;
     size_t res = 0;
-    for (const auto & e : std::filesystem::directory_iterator(cfg.dir, ec)) {
-        if (e.is_regular_file()) {
-            const std::string name = e.path().filename().string();
-            if (name.rfind(FILE_PREFIX, 0) == 0 && string_ends_with(name, FILE_SUFFIX)) {
-                res++;
-            }
+    for (const auto & entry : std::filesystem::recursive_directory_iterator(cfg.dir, ec)) {
+        if (ec) {
+            break;
         }
+        if (!entry.is_regular_file(ec) || ec) {
+            ec.clear();
+            continue;
+        }
+        res++;
     }
     return res;
 }
@@ -828,8 +956,11 @@ void server_ckpt_store::enforce_cap(size_t incoming) {
         return;
     }
 
+    // do not evict a directory while a queued write still targets it
+    wait_idle();
+
     struct entry {
-        std::string path;
+        std::string dir;
         size_t size;
         std::filesystem::file_time_type mtime;
     };
@@ -839,20 +970,25 @@ void server_ckpt_store::enforce_cap(size_t incoming) {
     size_t total = 0;
 
     for (const auto & e : std::filesystem::directory_iterator(cfg.dir, ec)) {
-        if (!e.is_regular_file()) {
+        if (ec) {
+            break;
+        }
+        if (!e.is_directory(ec) || ec) {
+            ec.clear();
             continue;
         }
+
         const std::string name = e.path().filename().string();
-        if (name.rfind(FILE_PREFIX, 0) != 0 || !string_ends_with(name, ".bin")) {
+        if (name.rfind(DIR_PREFIX, 0) != 0) {
             continue;
         }
 
-        const std::string path = e.path().string();
+        const std::string dir = e.path().string();
 
-        // never evict a file that is currently being appended to
+        // never evict the session that a slot is currently writing to
         bool active = false;
         for (const auto & kv : slots) {
-            if (kv.second.path == path) {
+            if (kv.second.dir == dir) {
                 active = true;
                 break;
             }
@@ -861,8 +997,9 @@ void server_ckpt_store::enforce_cap(size_t incoming) {
             continue;
         }
 
-        entries.push_back({ path, (size_t) e.file_size(), e.last_write_time(ec) });
-        total += (size_t) e.file_size();
+        const size_t size = (size_t) dir_size(e.path());
+        entries.push_back({ dir, size, e.last_write_time(ec) });
+        total += size;
     }
 
     if (total + incoming <= cfg.max_bytes) {
@@ -878,16 +1015,16 @@ void server_ckpt_store::enforce_cap(size_t incoming) {
             break;
         }
         std::error_code ec2;
-        if (std::filesystem::remove(e.path, ec2)) {
+        std::filesystem::remove_all(e.dir, ec2);
+        if (!ec2) {
             total -= std::min(total, e.size);
             st.evicted++;
             st.evicted_bytes += e.size;
-            remove_files(e.path);
             index.erase(std::remove_if(index.begin(), index.end(), [&](const session & s) {
-                return s.path == e.path;
+                return s.dir == e.dir;
             }), index.end());
             LOG_INF("[ckpt-store] evicted %s (%.1f MiB)\n",
-                    std::filesystem::path(e.path).filename().string().c_str(), e.size / (1024.0 * 1024.0));
+                    std::filesystem::path(e.dir).filename().string().c_str(), e.size / (1024.0 * 1024.0));
         }
     }
 }
@@ -960,13 +1097,11 @@ bool server_ckpt_store::read_file(const std::string & path, uint64_t off, size_t
 void server_ckpt_store::print_stats() const {
     LOG_INF("[ckpt-store] files=%zu bytes=%.1f MiB | appends=%" PRIu64
             " writes=%.1f MiB | reads=%" PRIu64 " (%.1f MiB)"
-            " | compactions=%" PRIu64 " (%.1f MiB rewritten)"
             " | evicted=%" PRIu64 " (%.1f MiB)"
             " | meta=%" PRIu64 " restored=%" PRIu64 " discarded=%" PRIu64 " adopted=%" PRIu64 "\n",
             n_files(), total_bytes() / (1024.0 * 1024.0),
             st.appends, st.write_bytes / (1024.0 * 1024.0),
             st.reads, st.read_bytes / (1024.0 * 1024.0),
-            st.compactions, st.compact_read / (1024.0 * 1024.0),
             st.evicted, st.evicted_bytes / (1024.0 * 1024.0),
             st.meta_writes, st.restored, st.discarded, st.adopted);
 }

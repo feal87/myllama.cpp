@@ -2303,6 +2303,7 @@ void common_prompt_checkpoint::clear() {
     pos_max = 0;
 
     on_disk   = false;
+    disk_id   = 0;
     off_tgt   = 0;
     size_tgt  = 0;
     off_dft   = 0;

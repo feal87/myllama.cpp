@@ -1885,12 +1885,12 @@ private:
                         bool loaded = !use_full;
                         if (use_full) {
                             std::vector<uint8_t> buf(full.size_tgt);
-                            if (ckpt_store->read(ret->id, full.off_tgt, full.size_tgt, buf.data()) &&
+                            if (ckpt_store->read(ret->id, full.file_id, full.off_tgt, full.size_tgt, buf.data()) &&
                                     llama_state_seq_set_data_ext(ctx_tgt, buf.data(), buf.size(), ret->id, LLAMA_STATE_SEQ_FLAGS_NONE) == full.size_tgt) {
                                 loaded = true;
                                 if (ctx_dft != nullptr && full.size_dft > 0) {
                                     buf.resize(full.size_dft);
-                                    if (ckpt_store->read(ret->id, full.off_dft, full.size_dft, buf.data())) {
+                                    if (ckpt_store->read(ret->id, full.file_id, full.off_dft, full.size_dft, buf.data())) {
                                         llama_state_seq_set_data_ext(ctx_dft, buf.data(), buf.size(), ret->id, LLAMA_STATE_SEQ_FLAGS_NONE);
                                     }
                                 }
@@ -2655,38 +2655,16 @@ private:
             }
         }
 
-        if (!ckpt_store->write_full(id_slot, tgt.data(), tgt.size(),
-                dft.empty() ? nullptr : dft.data(), dft.size())) {
+        const size_t size_tgt = tgt.size();
+        if (!ckpt_store->write_full(id_slot, std::move(tgt), std::move(dft))) {
             SLT_WRN(*slot, "%s", "failed to append the full state\n");
             return;
-        }
-
-        std::vector<std::pair<uint64_t, uint64_t>> remap;
-        ckpt_store->maybe_compact(id_slot, remap);
-        for (auto & c : slot->prompt.checkpoints) {
-            if (!c.on_disk) {
-                continue;
-            }
-            auto remap_off = [&](uint64_t & off) {
-                if (off == 0) {
-                    return;
-                }
-                for (const auto & m : remap) {
-                    if (m.first == off) {
-                        off = m.second;
-                        return;
-                    }
-                }
-            };
-            remap_off(c.off_tgt);
-            remap_off(c.off_dft);
-            remap_off(c.off_spec);
         }
 
         ckpt_store->write_meta(id_slot, slot->prompt.tokens, slot->prompt.checkpoints);
 
         SLT_INF(*slot, "saved full state (%.1f MiB) with %zu checkpoints for restart\n",
-                tgt.size() / (1024.0 * 1024.0), slot->prompt.checkpoints.size());
+                size_tgt / (1024.0 * 1024.0), slot->prompt.checkpoints.size());
     }
 
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
@@ -2701,7 +2679,7 @@ private:
 
         auto erase_ckpt = [&](std::list<common_prompt_checkpoint>::iterator it) {
             if (ckpt_store && it->on_disk) {
-                ckpt_store->release(slot.id, it->off_tgt);
+                ckpt_store->release_file(slot.id, it->disk_id);
             }
             return slot.prompt.checkpoints.erase(it);
         };
@@ -2767,63 +2745,29 @@ private:
         }
 
         if (ckpt_store) {
-            std::vector<std::pair<uint64_t, uint64_t>> remap;
-            ckpt_store->maybe_compact(slot.id, remap);
-            for (auto & c : slot.prompt.checkpoints) {
-                if (!c.on_disk) {
-                    continue;
-                }
-                auto remap_off = [&](uint64_t & off) {
-                    if (off == 0) {
-                        return;
-                    }
-                    for (const auto & m : remap) {
-                        if (m.first == off) {
-                            off = m.second;
-                            return;
-                        }
-                    }
-                };
-                remap_off(c.off_tgt);
-                remap_off(c.off_dft);
-                remap_off(c.off_spec);
-            }
+            const size_t n = llama_state_seq_get_size_ext(ctx_tgt, slot.id, 0);
+            std::vector<uint8_t> tgt(n);
+            const bool has_tgt = n > 0 && llama_state_seq_get_data_ext(ctx_tgt, tgt.data(), n, slot.id, 0) == n;
 
-            size_t n = llama_state_seq_get_size_ext(ctx_tgt, slot.id, 0);
-            std::vector<uint8_t> buf(n);
-            if (n > 0 && llama_state_seq_get_data_ext(ctx_tgt, buf.data(), n, slot.id, 0) == n) {
-                const uint64_t off = ckpt_store->append(slot.id, buf.data(), n);
-                if (off != UINT64_MAX) {
-                    cur.on_disk  = true;
-                    cur.off_tgt  = off;
-                    cur.size_tgt = n;
+            std::vector<uint8_t> dft;
+            if (has_tgt && ctx_dft != nullptr) {
+                const size_t n_dft = llama_state_seq_get_size_ext(ctx_dft, slot.id, 0);
+                if (n_dft > 0) {
+                    dft.resize(n_dft);
+                    if (llama_state_seq_get_data_ext(ctx_dft, dft.data(), n_dft, slot.id, 0) != n_dft) {
+                        dft.clear();
+                    }
                 }
             }
 
-            if (cur.on_disk) {
-                if (ctx_dft != nullptr) {
-                    n = llama_state_seq_get_size_ext(ctx_dft, slot.id, 0);
-                    if (n > 0) {
-                        buf.resize(n);
-                        if (llama_state_seq_get_data_ext(ctx_dft, buf.data(), n, slot.id, 0) == n) {
-                            const uint64_t off = ckpt_store->append(slot.id, buf.data(), n);
-                            if (off != UINT64_MAX) {
-                                cur.off_dft  = off;
-                                cur.size_dft = n;
-                            }
-                        }
-                    }
-                }
-
-                std::vector<uint8_t> spec_state;
+            std::vector<uint8_t> spec_state;
+            if (has_tgt) {
                 common_speculative_get_state(spec.get(), slot.id, spec_state);
-                if (!spec_state.empty()) {
-                    const uint64_t off = ckpt_store->append(slot.id, spec_state.data(), spec_state.size());
-                    if (off != UINT64_MAX) {
-                        cur.off_spec  = off;
-                        cur.size_spec = spec_state.size();
-                    }
-                }
+            }
+
+            if (has_tgt &&
+                    !ckpt_store->write_checkpoint(slot.id, std::move(tgt), std::move(dft), std::move(spec_state), cur)) {
+                SLT_WRN(slot, "%s", "failed to write context checkpoint\n");
             }
         }
 
@@ -3906,18 +3850,18 @@ private:
                                         // restore the context checkpoint
                                         if (it->on_disk && ckpt_store) {
                                             std::vector<uint8_t> buf(it->size_tgt);
-                                            if (ckpt_store->read(slot.id, it->off_tgt, it->size_tgt, buf.data())) {
+                                            if (ckpt_store->read(slot.id, it->disk_id, it->off_tgt, it->size_tgt, buf.data())) {
                                                 llama_state_seq_set_data_ext(ctx_tgt, buf.data(), buf.size(), slot.id, 0);
                                             }
                                             if (ctx_dft != nullptr && it->size_dft > 0) {
                                                 buf.resize(it->size_dft);
-                                                if (ckpt_store->read(slot.id, it->off_dft, it->size_dft, buf.data())) {
+                                                if (ckpt_store->read(slot.id, it->disk_id, it->off_dft, it->size_dft, buf.data())) {
                                                     llama_state_seq_set_data_ext(ctx_dft, buf.data(), buf.size(), slot.id, 0);
                                                 }
                                             }
                                             if (it->size_spec > 0) {
                                                 std::vector<uint8_t> spec_state(it->size_spec);
-                                                if (ckpt_store->read(slot.id, it->off_spec, it->size_spec, spec_state.data())) {
+                                                if (ckpt_store->read(slot.id, it->disk_id, it->off_spec, it->size_spec, spec_state.data())) {
                                                     common_speculative_set_state(spec.get(), slot.id, spec_state);
                                                 }
                                             }
