@@ -2660,13 +2660,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             return il < hparams.n_layer() && hparams.is_recr(il);
                         };
 
-                        if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
+                        if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0 && llama_qsa_allowed()) {
                             // QSA runs on the dense-attention layers only, and only where the
                             // metadata gives a block size and the process opted in
                             // (LLAMA_QSA_ALLOW). Everywhere else the indexer cache would
                             // reserve buffers nothing will ever touch
                             filter_idx = [&](uint32_t il) {
-                                return llama_qsa_allowed() && il < hparams.n_layer() &&
+                                return il < hparams.n_layer() &&
                                        !hparams.is_recr(il) && hparams.dsv4_compress_ratios[il] > 0;
                             };
                         }

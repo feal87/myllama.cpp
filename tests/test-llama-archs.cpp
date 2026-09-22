@@ -1202,31 +1202,46 @@ static void test_lazy_kv_ladder(size_t seed, float stdev, ggml_backend_dev_t dev
         GGML_ASSERT(llama_state_seq_set_data_ext(c, data.data(), data.size(), 0, 0) == data.size());
     };
 
-    // every ladder here holds 1024, then 2048, then all 4096 cells
+    // each rung holds as many cells as its fixed pool allows, so the test drives the
+    // ladder by capacity instead of assuming a fixed cell count per rung
     GGML_ASSERT(ctx->get_memory()->get_has_lazy_quant());
 
-    decode(0, 16);
-    check_type(expect_k[0], expect_v[0]);
-    GGML_ASSERT(ctx->get_memory()->get_has_lazy_quant());
-    const auto s_first = save(ctx.get());
+    auto kv_size = [&]() -> uint32_t {
+        auto * mem = dynamic_cast<llama_kv_cache *>(ctx->get_memory());
+        GGML_ASSERT(mem);
+        return mem->get_size();
+    };
 
-    decode(16, 1100);
-    check_type(expect_k[1], expect_v[1]);
-    GGML_ASSERT(ctx->get_memory()->get_has_lazy_quant());
-    const auto s_mid = save(ctx.get());
+    std::vector<std::vector<uint8_t>> states;
 
-    decode(1116, 1100);
-    check_type(expect_k[2], expect_v[2]);
-    GGML_ASSERT(!ctx->get_memory()->get_has_lazy_quant());
-    const auto s_last = save(ctx.get());
+    int pos = 0;
+    for (size_t r = 0; r < expect_k.size(); ++r) {
+        if (r == 0) {
+            decode(pos, 16);
+            pos += 16;
+        } else {
+            // fill the current rung and add one cell to force the advance to rung r
+            const int need = (int) kv_size() - pos + 1;
+            GGML_ASSERT(need > 0);
+            decode(pos, need);
+            pos += need;
+        }
+
+        check_type(expect_k[r], expect_v[r]);
+        GGML_ASSERT(ctx->get_memory()->get_has_lazy_quant() == (r + 1 < expect_k.size()));
+        states.push_back(save(ctx.get()));
+    }
+
+    const auto & s_first = states.front();
+    const auto & s_last  = states.back();
 
     // a snapshot from any rung restores into a fresh ladder
-    for (const auto * s : { &s_first, &s_mid, &s_last }) {
+    for (const auto & s : states) {
         llama_context_ptr fresh(llama_init_from_model(model.get(), p));
         GGML_ASSERT(fresh);
 
-        restore(fresh.get(), *s);
-        GGML_ASSERT(save(fresh.get()) == *s);
+        restore(fresh.get(), s);
+        GGML_ASSERT(save(fresh.get()) == s);
     }
 
     // a more precise snapshot converts down into a cache already at the last rung
@@ -1372,6 +1387,10 @@ int main(int argc, char ** argv) {
                         test_lazy_kv_ladder(seed, stdev, dev, "f16/f16,q8_0/q8_0,q8_0/q4_0", GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
                                 { GGML_TYPE_F16,  GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 },
                                 { GGML_TYPE_F16,  GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 });
+                        // a high precision asymmetric rung in the middle, then the symmetric target
+                        test_lazy_kv_ladder(seed, stdev, dev, "f16/f16,q8_0/q8_0,q8_0/q4_0,q4_0/q4_0", GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
+                                { GGML_TYPE_F16,  GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 },
+                                { GGML_TYPE_F16,  GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0 });
                     }
                 }
             }

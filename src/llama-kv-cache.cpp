@@ -64,23 +64,18 @@ static ggml_tensor * llama_kv_cache_view_as_3d(
         ggml_type      type,
         int64_t        ne0,
         int64_t        ne1,
-        int64_t        ne2) {
+        int64_t        ne2,
+        size_t         view_offs) {
     ggml_tensor * result = ggml_new_tensor_3d(ctx, type, ne0, ne1, ne2);
 
     GGML_ASSERT(result->data == nullptr);
     GGML_ASSERT(result->view_src == nullptr);
-    GGML_ASSERT(ggml_nbytes(result) <= ggml_nbytes(src));
+    GGML_ASSERT(view_offs + ggml_nbytes(result) <= ggml_nbytes(src));
 
-    result->view_src = src;
+    result->view_src  = src;
+    result->view_offs = view_offs;
 
     return result;
-}
-
-static uint32_t llama_kv_cache_size_for_type(uint32_t kv_size, ggml_type type_src, ggml_type type_dst, uint32_t n_pad) {
-    const uint64_t num = (uint64_t) kv_size * ggml_type_size(type_src) * ggml_blck_size(type_dst);
-    const uint64_t den = (uint64_t) ggml_type_size(type_dst) * ggml_blck_size(type_src);
-
-    return (num / den / n_pad) * n_pad;
 }
 
 // types a lazy rung can use and a checkpoint can convert between
@@ -349,9 +344,25 @@ llama_kv_cache::llama_kv_cache(
     bool lazy_quant = !lazy_stages.empty() && !v_trans && n_stream == 1 && other == nullptr && !hparams.no_alloc;
 
     if (lazy_quant) {
-        // keep every rung inside the configured allocation, so each one fits the memory of the target
+        // each rung is carved from the same pool, so a rung can spend the bytes the
+        // other role leaves unused instead of wasting them
         const uint32_t n_pad_lazy = std::max(n_pad, 256u);
-        const bool has_v = !hparams.is_mla();
+        const size_t   lazy_align = 256;
+        const bool     has_v      = !hparams.is_mla();
+
+        std::vector<uint32_t> lazy_layers;
+        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+            if (hparams.has_kv(il)) {
+                lazy_layers.push_back(il);
+            }
+        }
+
+        // bytes of the pool of one layer: final K + final V at the configured cell count
+        auto lazy_pool_bytes = [&](uint32_t il) -> size_t {
+            const size_t rk = ggml_row_size(type_k, hparams.n_embd_k_gqa(il));
+            const size_t rv = has_v ? ggml_row_size(type_v, hparams.n_embd_v_gqa(il)) : 0;
+            return ((size_t) target.size*rk + lazy_align - 1)/lazy_align*lazy_align + (size_t) target.size*rv;
+        };
 
         uint32_t prev_size = 0;
         std::string ladder_str;
@@ -359,11 +370,29 @@ llama_kv_cache::llama_kv_cache(
             const ggml_type tk = stage.first;
             const ggml_type tv = stage.second;
 
-            const uint32_t size_k = llama_kv_cache_size_for_type(target.size, type_k, tk, n_pad_lazy);
-            const uint32_t size_v = has_v ? llama_kv_cache_size_for_type(target.size, type_v, tv, n_pad_lazy) : std::numeric_limits<uint32_t>::max();
-            const uint32_t size   = std::min(size_k, size_v);
+            // largest shared cell count whose K and V regions fit the pool of every layer
+            uint32_t size = std::numeric_limits<uint32_t>::max();
 
-            if (size == 0) {
+            for (uint32_t il : lazy_layers) {
+                const size_t rk = ggml_row_size(tk, hparams.n_embd_k_gqa(il));
+                const size_t rv = has_v ? ggml_row_size(tv, hparams.n_embd_v_gqa(il)) : 0;
+                const size_t pool = lazy_pool_bytes(il);
+
+                uint32_t cur = (uint32_t) (pool / (rk + rv));
+                cur = (cur / n_pad_lazy) * n_pad_lazy;
+
+                // the K region is aligned before V starts, so the raw ratio can overshoot
+                while (cur > 0 && ((size_t) cur*rk + lazy_align - 1)/lazy_align*lazy_align + (size_t) cur*rv > pool) {
+                    cur -= n_pad_lazy;
+                }
+
+                size = std::min(size, cur);
+            }
+
+            // the pool always holds at least the configured cells, so never exceed them
+            size = std::min(size, target.size);
+
+            if (size == 0 || size == std::numeric_limits<uint32_t>::max()) {
                 LLAMA_LOG_WARN("%s: invalid lazy stage k=%s v=%s (%u cells), disabling lazy quantization\n",
                         __func__, ggml_type_name(tk), ggml_type_name(tv), size);
                 lazy_ladder.clear();
@@ -412,7 +441,8 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(lazy_quant ? (uint32_t) lazy_ladder.size() : 1u)*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(2u*(lazy_quant ? (uint32_t) lazy_ladder.size() : 1u)*(1 + n_stream)*n_layer*ggml_tensor_overhead() +
+                                               (lazy_quant ? size_t(n_layer)*ggml_tensor_overhead() : 0)),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -528,15 +558,27 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_tensor * k_target = has_k ? ggml_new_tensor_3d(ctx, target.type_k, n_embd_k_gqa, target.size, n_stream) : nullptr;
-        ggml_tensor * v_target = has_v ? ggml_new_tensor_3d(ctx, target.type_v, n_embd_v_gqa, target.size, n_stream) : nullptr;
+        ggml_tensor * k_target = nullptr;
+        ggml_tensor * v_target = nullptr;
 
-        if (lazy_quant) {
-            has_k && ggml_format_name(k_target, "cache_%sk_l%d_target", name_tag, il);
-            has_v && ggml_format_name(v_target, "cache_%sv_l%d_target", name_tag, il);
+        if (!lazy_quant) {
+            k_target = has_k ? ggml_new_tensor_3d(ctx, target.type_k, n_embd_k_gqa, target.size, n_stream) : nullptr;
+            v_target = has_v ? ggml_new_tensor_3d(ctx, target.type_v, n_embd_v_gqa, target.size, n_stream) : nullptr;
         }
 
-        // one view per lazy rung: the front is the overlay, the back is the target backing tensor
+        // a lazy ladder carves every rung out of one pool, so a rung can spend the
+        // bytes the other role leaves unused instead of wasting them
+        ggml_tensor * lazy_pool = nullptr;
+        if (lazy_quant) {
+            const size_t row_fk = ggml_row_size(target.type_k, n_embd_k_gqa);
+            const size_t row_fv = has_v ? ggml_row_size(target.type_v, n_embd_v_gqa) : 0;
+            const size_t pool_bytes = ((size_t) target.size*row_fk + 255)/256*256 + (size_t) target.size*row_fv;
+
+            lazy_pool = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) pool_bytes);
+            ggml_format_name(lazy_pool, "cache_%skv_l%d_pool", name_tag, il);
+        }
+
+        // one view per lazy rung: the front is the overlay, the back is the target
         const uint32_t n_step = lazy_quant ? (uint32_t) lazy_ladder.size() : 1;
 
         std::vector<ggml_tensor *> k_step;
@@ -550,9 +592,16 @@ llama_kv_cache::llama_kv_cache(
             ggml_tensor * ki = k_target;
             ggml_tensor * vi = v_target;
 
-            if (lazy_quant && i + 1 < n_step) {
-                ki = has_k ? llama_kv_cache_view_as_3d(ctx, k_target, f.type_k, n_embd_k_gqa, f.size, n_stream) : nullptr;
-                vi = has_v ? llama_kv_cache_view_as_3d(ctx, v_target, f.type_v, n_embd_v_gqa, f.size, n_stream) : nullptr;
+            if (lazy_quant) {
+                const size_t row_k = ggml_row_size(f.type_k, n_embd_k_gqa);
+                const size_t row_v = has_v ? ggml_row_size(f.type_v, n_embd_v_gqa) : 0;
+                const size_t k_bytes = (size_t) f.size*row_k;
+                const size_t v_off = ((k_bytes + 255)/256)*256;
+
+                GGML_ASSERT(v_off + (size_t) f.size*row_v <= ggml_nbytes(lazy_pool));
+
+                ki = has_k ? llama_kv_cache_view_as_3d(ctx, lazy_pool, f.type_k, n_embd_k_gqa, f.size, n_stream, 0) : nullptr;
+                vi = has_v ? llama_kv_cache_view_as_3d(ctx, lazy_pool, f.type_v, n_embd_v_gqa, f.size, n_stream, v_off) : nullptr;
 
                 has_k && ggml_format_name(ki, "cache_%sk_l%d_rung%u", name_tag, il, i);
                 has_v && ggml_format_name(vi, "cache_%sv_l%d_rung%u", name_tag, il, i);
@@ -569,6 +618,11 @@ llama_kv_cache::llama_kv_cache(
             v_step.push_back(vi);
             k_stream_step.push_back(std::move(k_stream));
             v_stream_step.push_back(std::move(v_stream));
+        }
+
+        if (lazy_quant) {
+            k_target = k_step.back();
+            v_target = v_step.back();
         }
 
         map_layer_ids[il] = layers.size();
@@ -1104,7 +1158,13 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
     return std::make_unique<llama_kv_cache_context>(this, lctx, do_shift, std::move(sc_info));
 }
 
-static void llama_kv_cache_convert(llama_io_tensor_converter & converter, ggml_tensor * src, ggml_tensor * dst, int64_t n_rows, uint32_t n_rot) {
+static void llama_kv_cache_convert(
+        llama_io_tensor_converter & converter,
+        ggml_tensor * src,
+        ggml_tensor * dst,
+        int64_t n_rows,
+        uint32_t n_rot,
+        const uint8_t * src_host = nullptr) {
     GGML_ASSERT(src->ne[0] == dst->ne[0]);
     GGML_ASSERT(src->ne[2] == 1 && dst->ne[2] == 1);
     GGML_ASSERT(src->ne[3] == 1 && dst->ne[3] == 1);
@@ -1115,12 +1175,19 @@ static void llama_kv_cache_convert(llama_io_tensor_converter & converter, ggml_t
     // The views overlap. Forward conversion must not overwrite unread rows.
     GGML_ASSERT(dst_row_size <= src_row_size);
     const int64_t chunk_rows = 256;
-    std::vector<uint8_t> data(chunk_rows*src_row_size);
+    std::vector<uint8_t> data;
+
+    if (!src_host) {
+        data.resize(chunk_rows*src_row_size);
+    }
 
     for (int64_t row = 0; row < n_rows; row += chunk_rows) {
         const int64_t n = std::min(chunk_rows, n_rows - row);
-        ggml_backend_tensor_get(src, data.data(), row*src_row_size, n*src_row_size);
-        converter.set_tensor(dst, data.data(), row*dst_row_size, n*src_row_size, { src->type, n_rot });
+        const uint8_t * cur = src_host ? src_host + row*src_row_size : data.data();
+        if (!src_host) {
+            ggml_backend_tensor_get(src, data.data(), row*src_row_size, n*src_row_size);
+        }
+        converter.set_tensor(dst, cur, row*dst_row_size, n*src_row_size, { src->type, n_rot });
     }
 
     const size_t converted_size = n_rows*dst_row_size;
@@ -1152,10 +1219,22 @@ bool llama_kv_cache::try_lazy_quantize(llama_context * lctx) {
     const uint32_t rot_v = src.n_rot_v == dst.n_rot_v ? 0 : dst.n_rot_v;
     GGML_ASSERT(src.n_rot_k == dst.n_rot_k || src.n_rot_k == 0);
     GGML_ASSERT(src.n_rot_v == dst.n_rot_v || src.n_rot_v == 0);
+
+    std::vector<uint8_t> staged_v;
+
     for (auto & layer : layers) {
+        // when the next rung gives K more room, its new region overlaps the current
+        // V region: stage V on the host so the K conversion cannot clobber it
+        const bool stage_v = layer.v && ggml_nbytes(layer.k_step[next]) > ggml_nbytes(layer.k);
+        if (stage_v) {
+            const size_t src_row_size = ggml_row_size(layer.v->type, layer.v->ne[0]);
+            staged_v.resize((size_t) n_rows*src_row_size);
+            ggml_backend_tensor_get(layer.v, staged_v.data(), 0, (size_t) n_rows*src_row_size);
+        }
+
         llama_kv_cache_convert(converter, layer.k, layer.k_step[next], n_rows, rot_k);
         if (layer.v) {
-            llama_kv_cache_convert(converter, layer.v, layer.v_step[next], n_rows, rot_v);
+            llama_kv_cache_convert(converter, layer.v, layer.v_step[next], n_rows, rot_v, stage_v ? staged_v.data() : nullptr);
         }
 
         layer.k = layer.k_step[next];
