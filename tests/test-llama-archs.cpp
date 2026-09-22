@@ -1129,6 +1129,113 @@ static void test_lazy_kv(llm_arch arch, size_t seed, float stdev, ggml_backend_d
     LOG_INF("%s: %s passed\n", __func__, llm_arch_name(arch));
 }
 
+// the lazy ladder can have more than one intermediate rung: f16 -> q8_0 -> q4_0
+static void test_lazy_kv_ladder(size_t seed, float stdev, ggml_backend_dev_t dev) {
+    common_set_env("LLAMA_KV_CACHE_LAZY_QUANT", "f16,q8_0,q4_0");
+
+    auto gguf = get_gguf_ctx(LLM_ARCH_LLAMA, false);
+    auto mp = llama_model_default_params();
+    ggml_backend_dev_t devices[] = {dev, nullptr};
+    mp.devices = dev ? devices : nullptr;
+    mp.n_gpu_layers = dev ? 999 : 0;
+    tensor_data_params tensor_params = { seed, stdev };
+    llama_model_ptr model(llama_model_init_from_user(gguf.get(), set_tensor_data, &tensor_params, mp));
+    GGML_ASSERT(model);
+
+    std::vector<ggml_type> attention_types;
+    auto p = llama_context_default_params();
+    p.n_ctx = 4096;
+    p.n_batch = 512;
+    p.n_ubatch = 128;
+    p.n_seq_max = 1;
+    p.kv_unified = true;
+    p.n_threads = p.n_threads_batch = 2;
+    p.type_k = p.type_v = GGML_TYPE_Q4_0;
+    p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    p.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
+        if (ask && t->op == GGML_OP_FLASH_ATTN_EXT) {
+            static_cast<std::vector<ggml_type> *>(data)->push_back(t->src[1]->type);
+        }
+        return false;
+    };
+    p.cb_eval_user_data = &attention_types;
+
+    llama_context_ptr ctx(llama_init_from_model(model.get(), p));
+    GGML_ASSERT(ctx);
+
+    auto decode = [&](int start, int count) {
+        for (int done = 0; done < count; ) {
+            const int chunk = std::min<int>(512, count - done);
+
+            attention_types.clear();
+
+            auto b = llama_batch_init(chunk, 0, 1);
+            for (int i = 0; i < chunk; ++i) {
+                common_batch_add(b, 1 + (start + done + i)%100, start + done + i, {0}, i == chunk - 1);
+            }
+            GGML_ASSERT(llama_decode(ctx.get(), b) == 0);
+            llama_batch_free(b);
+
+            llama_synchronize(ctx.get());
+            GGML_ASSERT(!attention_types.empty());
+
+            done += chunk;
+        }
+    };
+    auto check_type = [&](ggml_type type) {
+        for (auto actual : attention_types) {
+            GGML_ASSERT(actual == type);
+        }
+    };
+    auto save = [](llama_context * c) {
+        std::vector<uint8_t> data(llama_state_seq_get_size_ext(c, 0, 0));
+        GGML_ASSERT(llama_state_seq_get_data_ext(c, data.data(), data.size(), 0, 0) == data.size());
+        return data;
+    };
+    auto restore = [](llama_context * c, const std::vector<uint8_t> & data) {
+        GGML_ASSERT(llama_state_seq_set_data_ext(c, data.data(), data.size(), 0, 0) == data.size());
+    };
+
+    // f16 holds 1024 cells, q8_0 holds 2048, q4_0 holds all 4096
+    GGML_ASSERT(ctx->get_memory()->get_has_lazy_quant());
+
+    decode(0, 16);
+    check_type(GGML_TYPE_F16);
+    GGML_ASSERT(ctx->get_memory()->get_has_lazy_quant());
+    const auto s_f16 = save(ctx.get());
+
+    decode(16, 1100);
+    check_type(GGML_TYPE_Q8_0);
+    GGML_ASSERT(ctx->get_memory()->get_has_lazy_quant());
+    const auto s_q8 = save(ctx.get());
+
+    decode(1116, 1100);
+    check_type(GGML_TYPE_Q4_0);
+    GGML_ASSERT(!ctx->get_memory()->get_has_lazy_quant());
+    const auto s_q4 = save(ctx.get());
+
+    // a snapshot from any rung restores into a fresh ladder
+    for (const auto * s : { &s_f16, &s_q8, &s_q4 }) {
+        llama_context_ptr fresh(llama_init_from_model(model.get(), p));
+        GGML_ASSERT(fresh);
+
+        restore(fresh.get(), *s);
+        GGML_ASSERT(save(fresh.get()) == *s);
+    }
+
+    // a more precise snapshot converts down into a cache already at the last rung
+    {
+        llama_context_ptr fresh(llama_init_from_model(model.get(), p));
+        GGML_ASSERT(fresh);
+
+        restore(fresh.get(), s_q4);
+        GGML_ASSERT(!fresh->get_memory()->get_has_lazy_quant());
+        restore(fresh.get(), s_f16);
+    }
+
+    LOG_INF("%s: f16 -> q8_0 -> q4_0 passed\n", __func__);
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -1233,6 +1340,9 @@ int main(int argc, char ** argv) {
                 if (arch_matches(arch_filter, test_arch)) {
                     test_lazy_kv(test_arch, seed, stdev, dev, GGML_TYPE_Q8_0);
                     test_lazy_kv(test_arch, seed, stdev, dev, GGML_TYPE_Q4_0);
+                    if (test_arch == LLM_ARCH_LLAMA) {
+                        test_lazy_kv_ladder(seed, stdev, dev);
+                    }
                 }
             }
             return 0;

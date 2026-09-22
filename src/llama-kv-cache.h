@@ -281,11 +281,11 @@ private:
         std::vector<ggml_tensor *> k_stream_target;
         std::vector<ggml_tensor *> v_stream_target;
 
-        // views of the lazy ladder overlay, kept so an empty cache can go back
-        ggml_tensor * k_lazy = nullptr;
-        ggml_tensor * v_lazy = nullptr;
-        std::vector<ggml_tensor *> k_stream_lazy;
-        std::vector<ggml_tensor *> v_stream_lazy;
+        // lazy ladder: one view per rung, k_step[0] is the overlay, k_step.back() is the target
+        std::vector<ggml_tensor *> k_step;
+        std::vector<ggml_tensor *> v_step;
+        std::vector<std::vector<ggml_tensor *>> k_stream_step;
+        std::vector<std::vector<ggml_tensor *>> v_stream_step;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -306,7 +306,11 @@ private:
 
     cache_format current;
     cache_format target;
-    cache_format overlay; // the starting high-precision format of the lazy ladder
+
+    // lazy ladder of rungs from the overlay (front) to the target (back)
+    std::vector<cache_format> lazy_ladder;
+    uint32_t lazy_step = 0;
+
     bool has_lazy_ladder   = false;
     bool lazy_quant_pending = false;
 
