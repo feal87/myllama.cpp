@@ -1129,9 +1129,13 @@ static void test_lazy_kv(llm_arch arch, size_t seed, float stdev, ggml_backend_d
     LOG_INF("%s: %s passed\n", __func__, llm_arch_name(arch));
 }
 
-// the lazy ladder can have more than one intermediate rung: f16 -> q8_0 -> q4_0
-static void test_lazy_kv_ladder(size_t seed, float stdev, ggml_backend_dev_t dev) {
-    common_set_env("LLAMA_KV_CACHE_LAZY_QUANT", "f16,q8_0,q4_0");
+// the lazy ladder can have more than one rung, and K and V can differ per rung
+static void test_lazy_kv_ladder(size_t seed, float stdev, ggml_backend_dev_t dev, const char * env,
+        ggml_type type_k, ggml_type type_v,
+        const std::vector<ggml_type> & expect_k, const std::vector<ggml_type> & expect_v) {
+    GGML_ASSERT(expect_k.size() == expect_v.size());
+
+    common_set_env("LLAMA_KV_CACHE_LAZY_QUANT", env);
 
     auto gguf = get_gguf_ctx(LLM_ARCH_LLAMA, false);
     auto mp = llama_model_default_params();
@@ -1142,7 +1146,7 @@ static void test_lazy_kv_ladder(size_t seed, float stdev, ggml_backend_dev_t dev
     llama_model_ptr model(llama_model_init_from_user(gguf.get(), set_tensor_data, &tensor_params, mp));
     GGML_ASSERT(model);
 
-    std::vector<ggml_type> attention_types;
+    std::vector<std::pair<ggml_type, ggml_type>> attention_types;
     auto p = llama_context_default_params();
     p.n_ctx = 4096;
     p.n_batch = 512;
@@ -1150,11 +1154,12 @@ static void test_lazy_kv_ladder(size_t seed, float stdev, ggml_backend_dev_t dev
     p.n_seq_max = 1;
     p.kv_unified = true;
     p.n_threads = p.n_threads_batch = 2;
-    p.type_k = p.type_v = GGML_TYPE_Q4_0;
+    p.type_k = type_k;
+    p.type_v = type_v;
     p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     p.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
         if (ask && t->op == GGML_OP_FLASH_ATTN_EXT) {
-            static_cast<std::vector<ggml_type> *>(data)->push_back(t->src[1]->type);
+            static_cast<std::vector<std::pair<ggml_type, ggml_type>> *>(data)->emplace_back(t->src[1]->type, t->src[2]->type);
         }
         return false;
     };
@@ -1182,9 +1187,10 @@ static void test_lazy_kv_ladder(size_t seed, float stdev, ggml_backend_dev_t dev
             done += chunk;
         }
     };
-    auto check_type = [&](ggml_type type) {
-        for (auto actual : attention_types) {
-            GGML_ASSERT(actual == type);
+    auto check_type = [&](ggml_type k, ggml_type v) {
+        for (const auto & actual : attention_types) {
+            GGML_ASSERT(actual.first  == k);
+            GGML_ASSERT(actual.second == v);
         }
     };
     auto save = [](llama_context * c) {
@@ -1196,26 +1202,26 @@ static void test_lazy_kv_ladder(size_t seed, float stdev, ggml_backend_dev_t dev
         GGML_ASSERT(llama_state_seq_set_data_ext(c, data.data(), data.size(), 0, 0) == data.size());
     };
 
-    // f16 holds 1024 cells, q8_0 holds 2048, q4_0 holds all 4096
+    // every ladder here holds 1024, then 2048, then all 4096 cells
     GGML_ASSERT(ctx->get_memory()->get_has_lazy_quant());
 
     decode(0, 16);
-    check_type(GGML_TYPE_F16);
+    check_type(expect_k[0], expect_v[0]);
     GGML_ASSERT(ctx->get_memory()->get_has_lazy_quant());
-    const auto s_f16 = save(ctx.get());
+    const auto s_first = save(ctx.get());
 
     decode(16, 1100);
-    check_type(GGML_TYPE_Q8_0);
+    check_type(expect_k[1], expect_v[1]);
     GGML_ASSERT(ctx->get_memory()->get_has_lazy_quant());
-    const auto s_q8 = save(ctx.get());
+    const auto s_mid = save(ctx.get());
 
     decode(1116, 1100);
-    check_type(GGML_TYPE_Q4_0);
+    check_type(expect_k[2], expect_v[2]);
     GGML_ASSERT(!ctx->get_memory()->get_has_lazy_quant());
-    const auto s_q4 = save(ctx.get());
+    const auto s_last = save(ctx.get());
 
     // a snapshot from any rung restores into a fresh ladder
-    for (const auto * s : { &s_f16, &s_q8, &s_q4 }) {
+    for (const auto * s : { &s_first, &s_mid, &s_last }) {
         llama_context_ptr fresh(llama_init_from_model(model.get(), p));
         GGML_ASSERT(fresh);
 
@@ -1228,13 +1234,26 @@ static void test_lazy_kv_ladder(size_t seed, float stdev, ggml_backend_dev_t dev
         llama_context_ptr fresh(llama_init_from_model(model.get(), p));
         GGML_ASSERT(fresh);
 
-        restore(fresh.get(), s_q4);
+        restore(fresh.get(), s_last);
         GGML_ASSERT(!fresh->get_memory()->get_has_lazy_quant());
-        restore(fresh.get(), s_f16);
+        restore(fresh.get(), s_first);
     }
 
-    LOG_INF("%s: f16 -> q8_0 -> q4_0 passed\n", __func__);
+    // a small snapshot at the last stage must still advance on restore: capacity
+    // alone would leave the cache on an earlier stage (K then V may both move)
+    GGML_ASSERT(llama_memory_seq_rm(ctx->get_memory(), 0, 10, -1));
+    const auto s_last_small = save(ctx.get());
+    {
+        llama_context_ptr fresh(llama_init_from_model(model.get(), p));
+        GGML_ASSERT(fresh);
+
+        restore(fresh.get(), s_last_small);
+        GGML_ASSERT(save(fresh.get()) == s_last_small);
+    }
+
+    LOG_INF("%s: %s passed\n", __func__, env);
 }
+
 
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
@@ -1341,7 +1360,18 @@ int main(int argc, char ** argv) {
                     test_lazy_kv(test_arch, seed, stdev, dev, GGML_TYPE_Q8_0);
                     test_lazy_kv(test_arch, seed, stdev, dev, GGML_TYPE_Q4_0);
                     if (test_arch == LLM_ARCH_LLAMA) {
-                        test_lazy_kv_ladder(seed, stdev, dev);
+                        // one ladder for both roles
+                        test_lazy_kv_ladder(seed, stdev, dev, "f16,q8_0,q4_0", GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
+                                { GGML_TYPE_F16,  GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 },
+                                { GGML_TYPE_F16,  GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 });
+                        // K stays high precision longer, V drops first
+                        test_lazy_kv_ladder(seed, stdev, dev, "k=f16,q8_0,q4_0;v=q8_0,q4_0", GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
+                                { GGML_TYPE_F16,  GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 },
+                                { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0 });
+                        // explicit stages, K repeats while only V drops
+                        test_lazy_kv_ladder(seed, stdev, dev, "f16/f16,q8_0/q8_0,q8_0/q4_0", GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
+                                { GGML_TYPE_F16,  GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 },
+                                { GGML_TYPE_F16,  GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 });
                     }
                 }
             }

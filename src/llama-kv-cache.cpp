@@ -143,6 +143,64 @@ static std::vector<ggml_type> llama_kv_cache_parse_ladder(const char * env) {
     return result;
 }
 
+static std::string llama_kv_cache_trim(const std::string & s) {
+    const size_t b = s.find_first_not_of(" \t");
+    if (b == std::string::npos) {
+        return {};
+    }
+
+    const size_t e = s.find_last_not_of(" \t");
+    return s.substr(b, e - b + 1);
+}
+
+// legacy single step derived from the configured type
+static std::vector<ggml_type> llama_kv_cache_legacy_ladder(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q8_0: return { GGML_TYPE_F16,  GGML_TYPE_Q8_0 };
+        case GGML_TYPE_Q4_0: return { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 };
+        default:             return {};
+    }
+}
+
+static bool llama_kv_cache_is_lower_precision(ggml_type hi, ggml_type lo) {
+    const int64_t hi_num = (int64_t) ggml_type_size(hi) * ggml_blck_size(lo);
+    const int64_t lo_num = (int64_t) ggml_type_size(lo) * ggml_blck_size(hi);
+
+    return hi_num > lo_num;
+}
+
+// parse "f16/f16,q8_0/q8_0" into (k, v) stages, empty on any bad entry
+static std::vector<std::pair<ggml_type, ggml_type>> llama_kv_cache_parse_stages(const char * env) {
+    std::vector<std::pair<ggml_type, ggml_type>> result;
+
+    const std::string spec(env);
+    size_t pos = 0;
+    while (pos <= spec.size()) {
+        const size_t comma = spec.find(',', pos);
+        const std::string item = llama_kv_cache_trim(spec.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
+
+        const size_t slash = item.find('/');
+        if (slash == std::string::npos) {
+            return {};
+        }
+
+        const ggml_type type_k = llama_kv_cache_type_from_name(llama_kv_cache_trim(item.substr(0, slash)).c_str());
+        const ggml_type type_v = llama_kv_cache_type_from_name(llama_kv_cache_trim(item.substr(slash + 1)).c_str());
+        if (!llama_kv_cache_is_lazy_type(type_k) || !llama_kv_cache_is_lazy_type(type_v)) {
+            return {};
+        }
+
+        result.emplace_back(type_k, type_v);
+
+        if (comma == std::string::npos) {
+            break;
+        }
+        pos = comma + 1;
+    }
+
+    return result;
+}
+
 //
 // llama_kv_cache
 //
@@ -188,61 +246,148 @@ llama_kv_cache::llama_kv_cache(
 
     // A configured cache type can start in a larger, higher-precision type and
     // be quantized in flight once those cells fill. LLAMA_KV_CACHE_LAZY_QUANT
-    // selects the ladder: "1" is the legacy single step derived from the
-    // configured type, otherwise a comma-separated list such as
-    // "f16,q8_0,q4_0". The last entry must be the configured type.
+    // selects the ladder:
+    //   "1"                            legacy single step derived from each type
+    //   "f16,q8_0,q4_0"                one list for both roles
+    //   "k=f16,q8_0,q4_0;v=q4_0"       one list per role
+    //   "f16/f16,q8_0/q4_0,q4_0/q4_0"  explicit (k, v) stage list
+    // K and V must be non-increasing, and the last stage must be the configured
+    // (-ctk, -ctv) pair.
     const char * LLAMA_KV_CACHE_LAZY_QUANT = getenv("LLAMA_KV_CACHE_LAZY_QUANT");
     const char * lazy_env = LLAMA_KV_CACHE_LAZY_QUANT ? LLAMA_KV_CACHE_LAZY_QUANT : "";
 
-    std::vector<ggml_type> lazy_types;
-    if (type_k == type_v && lazy_env[0] != '\0' && strcmp(lazy_env, "0") != 0) {
+    std::vector<std::pair<ggml_type, ggml_type>> lazy_stages;
+
+    if (lazy_env[0] != '\0' && strcmp(lazy_env, "0") != 0) {
+        std::vector<ggml_type> lazy_types_k;
+        std::vector<ggml_type> lazy_types_v;
+        bool bad = false;
+
         if (strcmp(lazy_env, "1") == 0) {
-            switch (type_k) {
-                case GGML_TYPE_Q8_0: lazy_types = { GGML_TYPE_F16,    GGML_TYPE_Q8_0 }; break;
-                case GGML_TYPE_Q4_0: lazy_types = { GGML_TYPE_Q8_0,   GGML_TYPE_Q4_0 }; break;
-                default:             break;
+            lazy_types_k = llama_kv_cache_legacy_ladder(type_k);
+            lazy_types_v = llama_kv_cache_legacy_ladder(type_v);
+        } else if (strchr(lazy_env, '/') != nullptr) {
+            lazy_stages = llama_kv_cache_parse_stages(lazy_env);
+            bad = lazy_stages.empty();
+        } else if (strchr(lazy_env, '=') != nullptr || strchr(lazy_env, ';') != nullptr) {
+            // each role can have its own ladder. a role the user does not list stays at its configured type
+            const std::string spec(lazy_env);
+            size_t pos = 0;
+            while (pos <= spec.size()) {
+                const size_t semi = spec.find(';', pos);
+                const std::string part = llama_kv_cache_trim(spec.substr(pos, semi == std::string::npos ? std::string::npos : semi - pos));
+                const size_t eq = part.find('=');
+
+                if (eq == std::string::npos) {
+                    bad = true;
+                    break;
+                }
+
+                const std::string role = llama_kv_cache_trim(part.substr(0, eq));
+                std::vector<ggml_type> types = llama_kv_cache_parse_ladder(llama_kv_cache_trim(part.substr(eq + 1)).c_str());
+
+                std::vector<ggml_type> * dst = role == "k" ? &lazy_types_k : role == "v" ? &lazy_types_v : nullptr;
+                if (dst == nullptr || types.empty() || !dst->empty()) {
+                    bad = true;
+                    break;
+                }
+
+                *dst = std::move(types);
+
+                if (semi == std::string::npos) {
+                    break;
+                }
+                pos = semi + 1;
+            }
+
+            if (!bad) {
+                if (lazy_types_k.empty()) lazy_types_k = { type_k };
+                if (lazy_types_v.empty()) lazy_types_v = { type_v };
             }
         } else {
-            lazy_types = llama_kv_cache_parse_ladder(lazy_env);
-            if (lazy_types.size() < 2 || lazy_types.back() != type_k) {
-                LLAMA_LOG_WARN("%s: ignoring LLAMA_KV_CACHE_LAZY_QUANT=%s: the ladder must have at least 2 entries and end at %s\n",
-                        __func__, lazy_env, ggml_type_name(type_k));
-                lazy_types.clear();
+            // one list for both roles
+            lazy_types_k = llama_kv_cache_parse_ladder(lazy_env);
+            lazy_types_v = lazy_types_k;
+        }
+
+        // zip the role lists, padding the shorter one with its last type
+        if (!bad && lazy_stages.empty()) {
+            if (lazy_types_k.empty() || lazy_types_v.empty()) {
+                bad = true;
+            } else {
+                const size_t n_stage = std::max(lazy_types_k.size(), lazy_types_v.size());
+                for (size_t i = 0; i < n_stage; ++i) {
+                    const ggml_type tk = i < lazy_types_k.size() ? lazy_types_k[i] : lazy_types_k.back();
+                    const ggml_type tv = i < lazy_types_v.size() ? lazy_types_v[i] : lazy_types_v.back();
+                    lazy_stages.emplace_back(tk, tv);
+                }
             }
+        }
+
+        // K and V must be non-increasing, and the last stage must be the configured pair
+        if (!bad && lazy_stages.size() >= 2) {
+            if (lazy_stages.back().first != type_k || lazy_stages.back().second != type_v) {
+                bad = true;
+            }
+            for (size_t i = 1; i < lazy_stages.size() && !bad; ++i) {
+                if (llama_kv_cache_is_lower_precision(lazy_stages[i].first,  lazy_stages[i - 1].first) ||
+                    llama_kv_cache_is_lower_precision(lazy_stages[i].second, lazy_stages[i - 1].second)) {
+                    bad = true;
+                }
+            }
+        } else {
+            bad = true;
+        }
+
+        if (bad) {
+            LLAMA_LOG_WARN("%s: ignoring LLAMA_KV_CACHE_LAZY_QUANT=%s: expected at least 2 stages with non-increasing K/V, the last one equal to %s/%s\n",
+                    __func__, lazy_env, ggml_type_name(type_k), ggml_type_name(type_v));
+            lazy_stages.clear();
         }
     }
 
-    bool lazy_quant = !lazy_types.empty() && !v_trans && n_stream == 1 && other == nullptr && !hparams.no_alloc;
+    bool lazy_quant = !lazy_stages.empty() && !v_trans && n_stream == 1 && other == nullptr && !hparams.no_alloc;
 
     if (lazy_quant) {
         // keep every rung inside the configured allocation, so each one fits the memory of the target
         const uint32_t n_pad_lazy = std::max(n_pad, 256u);
+        const bool has_v = !hparams.is_mla();
 
         uint32_t prev_size = 0;
         std::string ladder_str;
-        for (const ggml_type type : lazy_types) {
-            const uint32_t size = llama_kv_cache_size_for_type(target.size, type_k, type, n_pad_lazy);
+        for (const auto & stage : lazy_stages) {
+            const ggml_type tk = stage.first;
+            const ggml_type tv = stage.second;
 
-            if (size == 0 || size <= prev_size) {
-                LLAMA_LOG_WARN("%s: invalid lazy rung %s (%u cells), disabling lazy quantization\n",
-                        __func__, ggml_type_name(type), size);
+            const uint32_t size_k = llama_kv_cache_size_for_type(target.size, type_k, tk, n_pad_lazy);
+            const uint32_t size_v = has_v ? llama_kv_cache_size_for_type(target.size, type_v, tv, n_pad_lazy) : std::numeric_limits<uint32_t>::max();
+            const uint32_t size   = std::min(size_k, size_v);
+
+            if (size == 0) {
+                LLAMA_LOG_WARN("%s: invalid lazy stage k=%s v=%s (%u cells), disabling lazy quantization\n",
+                        __func__, ggml_type_name(tk), ggml_type_name(tv), size);
                 lazy_ladder.clear();
                 break;
             }
 
+            if (size <= prev_size) {
+                // the previous stage already holds this many cells, so this one only loses precision
+                LLAMA_LOG_WARN("%s: skipping lazy stage k=%s v=%s (%u cells, no capacity gain)\n",
+                        __func__, ggml_type_name(tk), ggml_type_name(tv), size);
+                continue;
+            }
+
             prev_size = size;
-            lazy_ladder.push_back({ size, type, type, 0, 0 });
-            ladder_str += " " + std::string(ggml_type_name(type)) + "(" + std::to_string(size) + ")";
+            lazy_ladder.push_back({ size, tk, tv, 0, 0 });
+            ladder_str += " k=" + std::string(ggml_type_name(tk)) + ",v=" + std::string(ggml_type_name(tv)) + "(" + std::to_string(size) + ")";
         }
 
-        if (lazy_ladder.size() < 2) {
+        if (lazy_ladder.size() < 2 || lazy_ladder.back().type_k != type_k || lazy_ladder.back().type_v != type_v) {
             lazy_quant = false;
             lazy_ladder.clear();
         } else {
             // the last rung is the configured allocation exactly, padding aside
             lazy_ladder.back().size   = target.size;
-            lazy_ladder.back().type_k = type_k;
-            lazy_ladder.back().type_v = type_v;
 
             kv_size = lazy_ladder.front().size;
 
@@ -1031,8 +1176,9 @@ bool llama_kv_cache::try_lazy_quantize(llama_context * lctx) {
     current   = dst;
     lazy_quant_pending = false;
 
-    LLAMA_LOG_INFO("%s: converted %u populated %s cells to %s and expanded %u cells to %u in %.2f ms\n",
+    LLAMA_LOG_INFO("%s: converted %u populated cells (k %s -> %s, v %s -> %s), expanded %u to %u in %.2f ms\n",
             __func__, n_rows, ggml_type_name(src.type_k), ggml_type_name(dst.type_k),
+            ggml_type_name(src.type_v), ggml_type_name(dst.type_v),
             src.size, dst.size, (ggml_time_us() - t_start)/1000.0);
 
     return true;
@@ -2939,6 +3085,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     }
 
     // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
+    int32_t k_type_ref = -1;
     for (const auto & layer : layers) {
         const uint32_t il = layer.il;
 
@@ -2949,10 +3096,11 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         // Read type of key
         int32_t k_type_i_ref;
         io.read(&k_type_i_ref, sizeof(k_type_i_ref));
+        k_type_ref = k_type_i_ref;
 
-        // a snapshot can be at any rung; advance the cache until its type matches
+        // a snapshot can be at any stage; advance the cache until its type matches
         // the serialized one, so the read never has to upgrade precision
-        if (get_has_lazy_quant()) {
+        if (get_has_lazy_quant() && (int32_t) current.type_k != k_type_i_ref) {
             for (uint32_t i = lazy_step + 1; i < lazy_ladder.size(); ++i) {
                 if ((int32_t) lazy_ladder[i].type_k != k_type_i_ref) {
                     continue;
@@ -3002,6 +3150,27 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             // Read type of value
             int32_t v_type_i_ref;
             io.read(&v_type_i_ref, sizeof(v_type_i_ref));
+
+            // K and V can move independently: the K phase stops at the first
+            // stage with this K type, so advance on to the stage that also drops
+            // V to the serialized type
+            if (get_has_lazy_quant() && (int32_t) current.type_k == k_type_ref &&
+                    (int32_t) current.type_v != v_type_i_ref) {
+                for (uint32_t i = lazy_step + 1; i < lazy_ladder.size(); ++i) {
+                    if ((int32_t) lazy_ladder[i].type_k != k_type_ref ||
+                        (int32_t) lazy_ladder[i].type_v != v_type_i_ref) {
+                        continue;
+                    }
+
+                    while (get_has_lazy_quant() && lazy_step < i) {
+                        try_lazy_quantize(nullptr);
+                    }
+                    break;
+                }
+
+                v = layer.v_stream[strm];
+            }
+
             const int32_t v_type_i = (int32_t) v->type;
             llama_io_tensor_conversion conversion;
             if (!llama_kv_cache_read_conversion(v_type_i_ref, n_rot_v, v, current.n_rot_v, conversion)) {
