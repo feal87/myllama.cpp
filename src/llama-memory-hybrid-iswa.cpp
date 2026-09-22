@@ -147,6 +147,14 @@ bool llama_memory_hybrid_iswa::get_has_lazy_quant() const {
     return mem_attn->get_has_lazy_quant();
 }
 
+bool llama_memory_hybrid_iswa::can_reset_lazy_quant() const {
+    return mem_attn->can_reset_lazy_quant();
+}
+
+bool llama_memory_hybrid_iswa::reset_lazy_quant() {
+    return mem_attn->reset_lazy_quant();
+}
+
 bool llama_memory_hybrid_iswa::get_can_shift() const {
     // Shifting is trivially supported for recurrent
     return mem_attn->get_can_shift();

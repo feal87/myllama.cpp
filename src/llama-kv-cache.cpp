@@ -330,7 +330,8 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_target, v_target, k_stream, v_stream, k_stream_target, v_stream_target, });
+        layers.push_back({ il, k, v, k_target, v_target, k_stream, v_stream, k_stream_target, v_stream_target,
+                k, v, k_stream, v_stream, });
     }
 
     if (reuse) {
@@ -425,6 +426,11 @@ llama_kv_cache::llama_kv_cache(
             }
         }
     }
+
+    // the overlay is the format a lazy cache starts from. keep it even after the
+    // in-flight downshift, so an empty cache can go back to it
+    has_lazy_ladder = lazy_quant;
+    overlay         = current;
 
     LLAMA_LOG_INFO("%s: n_rot_k = %u, n_embd_head_k_all = %d\n", __func__, current.n_rot_k, n_embd_head_k_all);
     LLAMA_LOG_INFO("%s: n_rot_v = %u, n_embd_head_v_all = %d\n", __func__, current.n_rot_v, n_embd_head_v_all);
@@ -912,6 +918,45 @@ bool llama_kv_cache::try_lazy_quantize(llama_context * lctx) {
 
 bool llama_kv_cache::get_has_lazy_quant() const {
     return current.size != target.size;
+}
+
+bool llama_kv_cache::can_reset_lazy_quant() const {
+    return has_lazy_ladder;
+}
+
+bool llama_kv_cache::reset_lazy_quant() {
+    if (!has_lazy_ladder) {
+        return false;
+    }
+
+    // the downshift cannot be undone, so only an empty cache can go back
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        if (v_cells[s].get_used() != 0) {
+            return false;
+        }
+    }
+
+    current = overlay;
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        v_cells[s].resize(current.size);
+        v_heads[s] = 0;
+    }
+
+    for (auto & layer : layers) {
+        layer.k = layer.k_lazy;
+        layer.v = layer.v_lazy;
+
+        layer.k_stream = layer.k_stream_lazy;
+        layer.v_stream = layer.v_stream_lazy;
+    }
+
+    lazy_quant_pending = false;
+
+    LLAMA_LOG_INFO("%s: reset the lazy KV cache to %s (%u cells)\n",
+            __func__, ggml_type_name(current.type_k), current.size);
+
+    return true;
 }
 
 bool llama_kv_cache::get_needs_lazy_quant() const {

@@ -155,6 +155,17 @@ bool llama_memory_hybrid_idx::get_has_lazy_quant() const {
     return llama_memory_hybrid::get_has_lazy_quant() || (mem_idx && mem_idx->get_has_lazy_quant());
 }
 
+bool llama_memory_hybrid_idx::can_reset_lazy_quant() const {
+    return llama_memory_hybrid::can_reset_lazy_quant() || (mem_idx && mem_idx->can_reset_lazy_quant());
+}
+
+bool llama_memory_hybrid_idx::reset_lazy_quant() {
+    const bool attn = llama_memory_hybrid::reset_lazy_quant();
+    const bool idx  = mem_idx && mem_idx->reset_lazy_quant();
+
+    return attn || idx;
+}
+
 void llama_memory_hybrid_idx::clear(bool data) {
     llama_memory_hybrid::clear(data);
 

@@ -898,6 +898,13 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // Check if the memory has a lazy quantization ladder that can be reset
+    LLAMA_API bool llama_memory_can_reset_lazy_quant(llama_memory_t mem);
+
+    // Reset a lazy-quantized memory to its higher-precision overlay type
+    // Only effective when the memory is empty, returns true if it was reset
+    LLAMA_API bool llama_memory_reset_lazy_quant(llama_memory_t mem);
+
     //
     // State / sessions
     //

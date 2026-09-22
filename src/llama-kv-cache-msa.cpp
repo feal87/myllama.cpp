@@ -164,6 +164,17 @@ bool llama_kv_cache_msa::get_has_lazy_quant() const {
     return kv_base->get_has_lazy_quant() || kv_idx->get_has_lazy_quant();
 }
 
+bool llama_kv_cache_msa::can_reset_lazy_quant() const {
+    return kv_base->can_reset_lazy_quant() || kv_idx->can_reset_lazy_quant();
+}
+
+bool llama_kv_cache_msa::reset_lazy_quant() {
+    const bool base = kv_base->reset_lazy_quant();
+    const bool idx  = kv_idx ->reset_lazy_quant();
+
+    return base || idx;
+}
+
 bool llama_kv_cache_msa::get_can_shift() const {
     return kv_base->get_can_shift() &&
            kv_idx ->get_can_shift() &&

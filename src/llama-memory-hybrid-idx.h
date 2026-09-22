@@ -58,6 +58,10 @@ public:
 
     bool get_has_lazy_quant() const override;
 
+    bool can_reset_lazy_quant() const override;
+
+    bool reset_lazy_quant() override;
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

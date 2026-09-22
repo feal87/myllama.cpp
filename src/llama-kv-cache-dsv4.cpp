@@ -1458,6 +1458,19 @@ bool llama_kv_cache_dsv4::get_has_lazy_quant() const {
     return kv_raw->get_has_lazy_quant() || kv_csa->get_has_lazy_quant() || kv_hca->get_has_lazy_quant() || kv_lid->get_has_lazy_quant();
 }
 
+bool llama_kv_cache_dsv4::can_reset_lazy_quant() const {
+    return kv_raw->can_reset_lazy_quant() || kv_csa->can_reset_lazy_quant() || kv_hca->can_reset_lazy_quant() || kv_lid->can_reset_lazy_quant();
+}
+
+bool llama_kv_cache_dsv4::reset_lazy_quant() {
+    const bool raw = kv_raw->reset_lazy_quant();
+    const bool csa = kv_csa->reset_lazy_quant();
+    const bool hca = kv_hca->reset_lazy_quant();
+    const bool lid = kv_lid->reset_lazy_quant();
+
+    return raw || csa || hca || lid;
+}
+
 bool llama_kv_cache_dsv4::get_can_shift() const {
     // Compressed row metadata uses block-derived positions. Keep shifting
     // disabled until DSV4 compressed-cache shift semantics are wired.

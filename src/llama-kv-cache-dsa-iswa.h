@@ -47,6 +47,10 @@ public:
 
     bool get_has_lazy_quant() const override;
 
+    bool can_reset_lazy_quant() const override;
+
+    bool reset_lazy_quant() override;
+
     bool get_can_shift() const override;
 
     void clear(bool data) override;

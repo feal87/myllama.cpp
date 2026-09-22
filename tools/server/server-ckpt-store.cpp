@@ -426,11 +426,17 @@ bool server_ckpt_store::read_meta(const std::filesystem::path & meta_path, sessi
             server_disk_meta_read(input, size_spec) &&
             server_disk_meta_read(input, len_ctx) &&
             server_disk_meta_read(input, fingerprint);
+        if (!ok) {
+            LOG_WRN("[ckpt-store] reject %s: truncated checkpoint %" PRIu64 "\n", meta_path.string().c_str(), i);
+            return false;
+        }
 
+        // a checkpoint that does not fit the token list is stale, not corrupt:
+        // drop it and keep the session usable
         uint64_t size_file = 0;
-        ok = ok &&
+        const bool valid =
             reserved == 0 &&
-            n_tokens >= 0 && (uint64_t) n_tokens <= tokens.size() &&
+            n_tokens > 0 && (uint64_t) n_tokens <= tokens.size() &&
             pos_min >= std::numeric_limits<llama_pos>::min() && pos_min <= std::numeric_limits<llama_pos>::max() &&
             pos_max >= std::numeric_limits<llama_pos>::min() && pos_max <= std::numeric_limits<llama_pos>::max() &&
             record_size(disk_id, size_file) &&
@@ -438,9 +444,10 @@ bool server_ckpt_store::read_meta(const std::filesystem::path & meta_path, sessi
             server_disk_range_valid(off_tgt, size_tgt, size_file) &&
             (size_dft > 0 ? (off_dft != 0 && off_dft % align_bytes == 0 && server_disk_range_valid(off_dft, size_dft, size_file)) : off_dft == 0) &&
             (size_spec > 0 ? (off_spec != 0 && off_spec % align_bytes == 0 && server_disk_range_valid(off_spec, size_spec, size_file)) : off_spec == 0);
-        if (!ok) {
-            LOG_WRN("[ckpt-store] reject %s: bad checkpoint %" PRIu64 "\n", meta_path.string().c_str(), i);
-            return false;
+        if (!valid) {
+            LOG_WRN("[ckpt-store] dropping invalid checkpoint %" PRIu64 " of %s (n_tokens=%" PRId64 ")\n",
+                    i, meta_path.string().c_str(), n_tokens);
+            continue;
         }
 
         common_prompt_checkpoint checkpoint;
@@ -459,6 +466,11 @@ bool server_ckpt_store::read_meta(const std::filesystem::path & meta_path, sessi
         checkpoint.off_spec  = off_spec;
         checkpoint.size_spec = size_spec;
         checkpoints.push_back(std::move(checkpoint));
+    }
+
+    if (checkpoints.empty() && !has_full) {
+        LOG_WRN("[ckpt-store] reject %s: no usable checkpoint left\n", meta_path.string().c_str());
+        return false;
     }
 
     out.dir = dir.string();
@@ -776,6 +788,13 @@ void server_ckpt_store::write_meta(int slot_id, const server_tokens & tokens, co
     }
     for (const auto & c : checkpoints) {
         if (!c.on_disk) {
+            continue;
+        }
+        // a checkpoint can outlive the prompt it was made from when the session
+        // switches to a shorter history; never let it into the sidecar
+        if (c.n_tokens <= 0 || c.n_tokens > (int64_t) tokens.size()) {
+            LOG_WRN("[ckpt-store] dropping checkpoint n_tokens=%" PRId64 " for a %zu token session\n",
+                    c.n_tokens, tokens.size());
             continue;
         }
         disk.push_back(c);

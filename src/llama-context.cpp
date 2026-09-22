@@ -5181,6 +5181,22 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     return mem->get_can_shift();
 }
 
+bool llama_memory_can_reset_lazy_quant(llama_memory_t mem) {
+    if (!mem) {
+        return false;
+    }
+
+    return mem->can_reset_lazy_quant();
+}
+
+bool llama_memory_reset_lazy_quant(llama_memory_t mem) {
+    if (!mem) {
+        return false;
+    }
+
+    return mem->reset_lazy_quant();
+}
+
 // llama state API
 
 // deprecated

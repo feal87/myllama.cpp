@@ -106,6 +106,17 @@ struct llama_memory_i {
         return false;
     }
 
+    // true when this memory has a lazy quantization ladder that can be reset
+    virtual bool can_reset_lazy_quant() const {
+        return false;
+    }
+
+    // go back to the high-precision overlay of the lazy ladder. only a cache
+    // with no data can do this: the downshift already lost precision
+    virtual bool reset_lazy_quant() {
+        return false;
+    }
+
     // getters
     virtual bool get_can_shift() const = 0;
 

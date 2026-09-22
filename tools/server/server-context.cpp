@@ -44,6 +44,20 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// a diverging session drops a small reused prefix so the lazy KV cache can start
+// again at its high-precision overlay. fraction of the slot context; 0 disables it
+static float server_lazy_reset_frac() {
+    static const float frac = [] {
+        const char * s = getenv("LLAMA_KV_CACHE_LAZY_RESET_FRAC");
+        if (s == nullptr || s[0] == '\0') {
+            return 0.25f;
+        }
+        return (float) atof(s);
+    }();
+
+    return frac;
+}
+
 static void server_prompt_cache_key_add_file(
         std::ostringstream & key,
         const char * label,
@@ -415,6 +429,12 @@ struct server_slot {
         mem.seq_rm(id, -1, -1);
 
         prompt.clear();
+
+        // an empty cache can go back to the lazy overlay
+        llama_memory_reset_lazy_quant(llama_get_memory(ctx_tgt));
+        if (ctx_dft != nullptr) {
+            llama_memory_reset_lazy_quant(llama_get_memory(ctx_dft));
+        }
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -3973,12 +3993,29 @@ private:
 
                             // the request will be processed from scratch and it does not
                             // continue this session: keep the old one matchable and make
-                            // room for a new one, instead of overwriting it
-                            if (ckpt_store && n_past == 0 && slot.prompt.n_tokens() > 0 &&
+                            // room for a new one, instead of overwriting it. a reused
+                            // prefix does not change that: its old ladder must not leak
+                            // into the new session's sidecar
+                            if (ckpt_store && slot.prompt.n_tokens() > 0 &&
                                     ckpt_store->session_diverged(slot.id, slot.task->tokens)) {
                                 SLT_TRC(slot, "%s", "prompt diverged from the active session\n");
                                 ckpt_store->finalize(slot.id);
                                 slot.prompt.checkpoints.clear();
+
+                                // a new session gets the lazy cache's high-precision window
+                                // back: drop a small reused prefix instead of carrying it down
+                                const int64_t reset_max = (int64_t) (server_lazy_reset_frac() * slot.n_ctx);
+                                llama_memory_t mem = llama_get_memory(ctx_tgt);
+                                if (n_past > 0 && n_past <= reset_max && llama_memory_can_reset_lazy_quant(mem)) {
+                                    slot.mem.seq_rm(slot.id, -1, -1);
+                                    llama_memory_reset_lazy_quant(mem);
+                                    if (ctx_dft != nullptr) {
+                                        llama_memory_reset_lazy_quant(llama_get_memory(ctx_dft));
+                                    }
+
+                                    n_past   = 0;
+                                    pos_next = 0;
+                                }
                             }
 
                             {

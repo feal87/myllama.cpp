@@ -135,6 +135,10 @@ public:
 
     bool get_has_lazy_quant() const override;
 
+    bool can_reset_lazy_quant() const override;
+
+    bool reset_lazy_quant() override;
+
     bool get_needs_lazy_quant() const;
 
     bool get_can_shift() const override;
@@ -276,6 +280,12 @@ private:
 
         std::vector<ggml_tensor *> k_stream_target;
         std::vector<ggml_tensor *> v_stream_target;
+
+        // views of the lazy ladder overlay, kept so an empty cache can go back
+        ggml_tensor * k_lazy = nullptr;
+        ggml_tensor * v_lazy = nullptr;
+        std::vector<ggml_tensor *> k_stream_lazy;
+        std::vector<ggml_tensor *> v_stream_lazy;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -296,6 +306,8 @@ private:
 
     cache_format current;
     cache_format target;
+    cache_format overlay; // the starting high-precision format of the lazy ladder
+    bool has_lazy_ladder   = false;
     bool lazy_quant_pending = false;
 
     // SWA

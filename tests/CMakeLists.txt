@@ -151,6 +151,11 @@ endif ()
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-save-load-state.cpp)
 
+llama_build(test-ckpt-store.cpp)
+target_include_directories(test-ckpt-store PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+target_link_libraries(test-ckpt-store PRIVATE server-context)
+llama_test(test-ckpt-store)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp)
