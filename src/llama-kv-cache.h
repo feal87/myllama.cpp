@@ -114,7 +114,10 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+        // mirror caches (indexer, lightning indexer) track the main cache cell for cell,
+        // so they keep one format instead of running their own ladder
+                     bool   lazy_enable = true);
 
     ~llama_kv_cache() = default;
 

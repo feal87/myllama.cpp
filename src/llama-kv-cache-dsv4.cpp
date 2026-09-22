@@ -1308,7 +1308,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_lid = std::make_unique<llama_kv_cache>(
             model, hparams_lid, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr, false);
 
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressor state\n", __func__);
 
@@ -1446,29 +1446,28 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_update(llama_context * lctx, 
 }
 
 bool llama_kv_cache_dsv4::try_lazy_quantize(llama_context * lctx) {
+    // the lightning indexer keeps one format and mirrors the CSA cells, so it takes no part in the ladder
     const bool raw = kv_raw->try_lazy_quantize(lctx);
     const bool csa = kv_csa->try_lazy_quantize(lctx);
     const bool hca = kv_hca->try_lazy_quantize(lctx);
-    const bool lid = kv_lid->try_lazy_quantize(lctx);
 
-    return raw || csa || hca || lid;
+    return raw || csa || hca;
 }
 
 bool llama_kv_cache_dsv4::get_has_lazy_quant() const {
-    return kv_raw->get_has_lazy_quant() || kv_csa->get_has_lazy_quant() || kv_hca->get_has_lazy_quant() || kv_lid->get_has_lazy_quant();
+    return kv_raw->get_has_lazy_quant() || kv_csa->get_has_lazy_quant() || kv_hca->get_has_lazy_quant();
 }
 
 bool llama_kv_cache_dsv4::can_reset_lazy_quant() const {
-    return kv_raw->can_reset_lazy_quant() || kv_csa->can_reset_lazy_quant() || kv_hca->can_reset_lazy_quant() || kv_lid->can_reset_lazy_quant();
+    return kv_raw->can_reset_lazy_quant() || kv_csa->can_reset_lazy_quant() || kv_hca->can_reset_lazy_quant();
 }
 
 bool llama_kv_cache_dsv4::reset_lazy_quant() {
     const bool raw = kv_raw->reset_lazy_quant();
     const bool csa = kv_csa->reset_lazy_quant();
     const bool hca = kv_hca->reset_lazy_quant();
-    const bool lid = kv_lid->reset_lazy_quant();
 
-    return raw || csa || hca || lid;
+    return raw || csa || hca;
 }
 
 bool llama_kv_cache_dsv4::get_can_shift() const {

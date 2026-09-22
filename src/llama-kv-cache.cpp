@@ -217,7 +217,8 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-             const char *   name_tag) :
+             const char *   name_tag,
+                     bool   lazy_enable) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -341,7 +342,7 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
-    bool lazy_quant = !lazy_stages.empty() && !v_trans && n_stream == 1 && other == nullptr && !hparams.no_alloc;
+    bool lazy_quant = lazy_enable && !lazy_stages.empty() && !v_trans && n_stream == 1 && other == nullptr && !hparams.no_alloc;
 
     if (lazy_quant) {
         // each rung is carved from the same pool, so a rung can spend the bytes the

@@ -252,7 +252,8 @@ bool llama_kv_cache_dsa_iswa::reset_lazy_quant() {
 bool llama_kv_cache_dsa_iswa::get_can_shift() const {
     return kv_dsa->get_can_shift() &&
            kv_swa->get_can_shift() &&
-           kv_dsa->get_mla()->get_size() == kv_swa->get_size();
+           // compare final capacities: the two ladders can sit on different rungs
+           kv_dsa->get_mla()->get_size_target() == kv_swa->get_size_target();
 }
 
 void llama_kv_cache_dsa_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {

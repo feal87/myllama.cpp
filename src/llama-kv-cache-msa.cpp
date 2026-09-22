@@ -46,7 +46,7 @@ llama_kv_cache_msa::llama_kv_cache_msa(
     kv_idx = std::make_unique<llama_kv_cache>(
             model, hparams_idx, type_k, type_v,
             v_trans, offload, unified, kv_size, n_seq_max, n_pad,
-            n_swa, swa_type, nullptr, filter_idx, reuse, nullptr);
+            n_swa, swa_type, nullptr, filter_idx, reuse, nullptr, false);
 }
 
 void llama_kv_cache_msa::clear(bool data) {
@@ -152,33 +152,27 @@ llama_memory_context_ptr llama_kv_cache_msa::init_update(llama_context * lctx, b
 }
 
 bool llama_kv_cache_msa::try_lazy_quantize(llama_context * lctx) {
-    const bool base = kv_base->try_lazy_quantize(lctx);
-    const bool idx  = kv_idx ->try_lazy_quantize(lctx);
-
-    GGML_ASSERT(base == idx);
-
-    return base || idx;
+    // the indexer keeps one format and mirrors the base cells, so only the base runs the ladder
+    return kv_base->try_lazy_quantize(lctx);
 }
 
 bool llama_kv_cache_msa::get_has_lazy_quant() const {
-    return kv_base->get_has_lazy_quant() || kv_idx->get_has_lazy_quant();
+    return kv_base->get_has_lazy_quant();
 }
 
 bool llama_kv_cache_msa::can_reset_lazy_quant() const {
-    return kv_base->can_reset_lazy_quant() || kv_idx->can_reset_lazy_quant();
+    return kv_base->can_reset_lazy_quant();
 }
 
 bool llama_kv_cache_msa::reset_lazy_quant() {
-    const bool base = kv_base->reset_lazy_quant();
-    const bool idx  = kv_idx ->reset_lazy_quant();
-
-    return base || idx;
+    return kv_base->reset_lazy_quant();
 }
 
 bool llama_kv_cache_msa::get_can_shift() const {
     return kv_base->get_can_shift() &&
            kv_idx ->get_can_shift() &&
-           kv_base->get_size() == kv_idx->get_size();
+           // compare final capacities: an in-flight ladder rung is smaller than the indexer's fixed one
+           kv_base->get_size_target() == kv_idx->get_size_target();
 }
 
 void llama_kv_cache_msa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {

@@ -50,7 +50,7 @@ llama_kv_cache_dsa::llama_kv_cache_dsa(
     kv_lid = std::make_unique<llama_kv_cache>(
             model, hparams_lid, type_k, type_v,
             v_trans, offload, unified, kv_size, n_seq_max, n_pad,
-            n_swa, swa_type, nullptr, filter_lid, reuse, nullptr);
+            n_swa, swa_type, nullptr, filter_lid, reuse, nullptr, false);
 }
 
 void llama_kv_cache_dsa::clear(bool data) {
@@ -156,37 +156,31 @@ llama_memory_context_ptr llama_kv_cache_dsa::init_update(llama_context * lctx, b
 }
 
 bool llama_kv_cache_dsa::try_lazy_quantize(llama_context * lctx) {
-    const bool mla = kv_mla->try_lazy_quantize(lctx);
-    const bool lid = kv_lid->try_lazy_quantize(lctx);
-
-    GGML_ASSERT(mla == lid);
-
-    return mla || lid;
+    // the lightning indexer keeps one format and mirrors the MLA cells, so only the MLA runs the ladder
+    return kv_mla->try_lazy_quantize(lctx);
 }
 
 bool llama_kv_cache_dsa::get_has_lazy_quant() const {
-    return kv_mla->get_has_lazy_quant() || kv_lid->get_has_lazy_quant();
+    return kv_mla->get_has_lazy_quant();
 }
 
 bool llama_kv_cache_dsa::can_reset_lazy_quant() const {
-    return kv_mla->can_reset_lazy_quant() || kv_lid->can_reset_lazy_quant();
+    return kv_mla->can_reset_lazy_quant();
 }
 
 bool llama_kv_cache_dsa::reset_lazy_quant() {
-    const bool mla = kv_mla->reset_lazy_quant();
-    const bool lid = kv_lid->reset_lazy_quant();
-
-    return mla || lid;
+    return kv_mla->reset_lazy_quant();
 }
 
 bool llama_kv_cache_dsa::get_needs_lazy_quant() const {
-    return kv_mla->get_needs_lazy_quant() || kv_lid->get_needs_lazy_quant();
+    return kv_mla->get_needs_lazy_quant();
 }
 
 bool llama_kv_cache_dsa::get_can_shift() const {
     return kv_mla->get_can_shift() &&
            kv_lid->get_can_shift() &&
-           kv_mla->get_size() == kv_lid->get_size();
+           // compare final capacities: an in-flight ladder rung is smaller than the indexer's fixed one
+           kv_mla->get_size_target() == kv_lid->get_size_target();
 }
 
 void llama_kv_cache_dsa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {

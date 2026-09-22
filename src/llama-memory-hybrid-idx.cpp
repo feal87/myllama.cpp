@@ -64,7 +64,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         return new llama_kv_cache(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
-            nullptr, filter_idx, nullptr, nullptr, "idx_");
+            nullptr, filter_idx, nullptr, nullptr, "idx_", false);
     }()) {}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
@@ -124,6 +124,8 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
         // the indexer uses the attention cache's slot layout; a separate one can drift from it
         llama_kv_cache::slot_info_vec_t heads_idx;
         if (mem_idx) {
+            // the indexer keeps its full capacity, so it can always mirror the attention rung
+            GGML_ASSERT(mem_idx->get_size() >= get_mem_attn()->get_size());
             heads_idx = heads_attn;
         }
 
@@ -143,27 +145,20 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lc
 }
 
 bool llama_memory_hybrid_idx::try_lazy_quantize(llama_context * lctx) {
-    const bool attn = llama_memory_hybrid::try_lazy_quantize(lctx);
-    const bool idx  = mem_idx && mem_idx->try_lazy_quantize(lctx);
-
-    GGML_ASSERT(!mem_idx || attn == idx);
-
-    return attn || idx;
+    // the indexer keeps one format and mirrors the attention cells, so only the attention runs the ladder
+    return llama_memory_hybrid::try_lazy_quantize(lctx);
 }
 
 bool llama_memory_hybrid_idx::get_has_lazy_quant() const {
-    return llama_memory_hybrid::get_has_lazy_quant() || (mem_idx && mem_idx->get_has_lazy_quant());
+    return llama_memory_hybrid::get_has_lazy_quant();
 }
 
 bool llama_memory_hybrid_idx::can_reset_lazy_quant() const {
-    return llama_memory_hybrid::can_reset_lazy_quant() || (mem_idx && mem_idx->can_reset_lazy_quant());
+    return llama_memory_hybrid::can_reset_lazy_quant();
 }
 
 bool llama_memory_hybrid_idx::reset_lazy_quant() {
-    const bool attn = llama_memory_hybrid::reset_lazy_quant();
-    const bool idx  = mem_idx && mem_idx->reset_lazy_quant();
-
-    return attn || idx;
+    return llama_memory_hybrid::reset_lazy_quant();
 }
 
 void llama_memory_hybrid_idx::clear(bool data) {
