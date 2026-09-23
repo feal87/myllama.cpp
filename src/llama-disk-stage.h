@@ -110,7 +110,11 @@ public:
 
     // split-hot variant: fill_cache_begin() sets the tables and hands the disk
     // batch to a worker, then returns so the hot pass computes; fill_cache_wait()
-    // joins the worker and runs the miss copies. Only used when split_hot() is on
+    // joins the worker and runs the miss copies. Only used when split_hot() is on,
+    // i.e. Windows + LLAMA_DISK_STAGE_SPLIT_HOT=1. The cache then carries two
+    // static skip tables that split its resident slots from the transient ones,
+    // so the decoder can run the hot (resident) experts and the cold (disk)
+    // experts as two host passes: the disk read overlaps the hot compute
     void fill_cache_begin(int il, const int32_t * ids, int64_t n_ids);
     void fill_cache_wait(int il);
 
