@@ -218,7 +218,8 @@ llama_kv_cache::llama_kv_cache(
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
              const char *   name_tag,
-                     bool   lazy_enable) :
+                     bool   lazy_enable,
+                 uint32_t   lazy_min_rung_cells) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -423,6 +424,24 @@ llama_kv_cache::llama_kv_cache(
 
             LLAMA_LOG_INFO("%s: lazy KV quantization enabled:%s\n", __func__, ladder_str.c_str());
         }
+    }
+
+    // a small cache (SWA) has no rung that can hold a batch before the first, so the
+    // ladder would advance on the first prefill. pin the whole cache at the first rung.
+    if (lazy_quant && lazy_min_rung_cells > 0 && lazy_ladder.front().size < lazy_min_rung_cells) {
+        const uint32_t size = target.size;
+
+        type_k = lazy_ladder.front().type_k;
+        type_v = lazy_ladder.front().type_v;
+
+        target  = { size, type_k, type_v, 0, 0 };
+        kv_size = size;
+
+        lazy_ladder.clear();
+        lazy_quant = false;
+
+        LLAMA_LOG_INFO("%s: lazy KV quantization: keeping %u cells at %s/%s\n",
+                __func__, size, ggml_type_name(type_k), ggml_type_name(type_v));
     }
 
     current = lazy_quant ? lazy_ladder.front() : cache_format{ kv_size, type_k, type_v, 0, 0 };
