@@ -72,7 +72,8 @@ llama_kv_cache_dsa_iswa::llama_kv_cache_dsa_iswa(
     kv_swa = std::make_unique<llama_kv_cache>(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,
-            hparams.n_swa, hparams.swa_type, nullptr, filter_swa, reuse, nullptr);
+            hparams.n_swa, hparams.swa_type, nullptr, filter_swa, reuse, nullptr,
+            "", true, /* lazy_min_rung_cells */ swa_full ? 0 : n_ubatch);
 }
 
 void llama_kv_cache_dsa_iswa::clear(bool data) {

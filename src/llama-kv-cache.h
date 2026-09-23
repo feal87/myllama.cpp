@@ -117,7 +117,11 @@ public:
                  const char *   name_tag = "",
         // mirror caches (indexer, lightning indexer) track the main cache cell for cell,
         // so they keep one format instead of running their own ladder
-                     bool   lazy_enable = true);
+                     bool   lazy_enable = true,
+        // a small cache (SWA) has no rung that can hold a batch before the first,
+        // so the ladder would advance on the first prefill. pin the whole cache
+        // at the first rung when it holds fewer than this many cells
+                     uint32_t lazy_min_rung_cells = 0);
 
     ~llama_kv_cache() = default;
 
