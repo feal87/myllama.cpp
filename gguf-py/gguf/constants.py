@@ -1334,7 +1334,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.GLM4:             "glm4",
     MODEL_ARCH.GLM4_MOE:         "glm4moe",
     MODEL_ARCH.GLM_DSA:          "glm-dsa",
-    MODEL_ARCH.GLM5_NEXT:        "glm5-next",
+    MODEL_ARCH.GLM5_NEXT:        "glm5next",
     MODEL_ARCH.BITNET:           "bitnet",
     MODEL_ARCH.T5:               "t5",
     MODEL_ARCH.T5ENCODER:        "t5encoder",

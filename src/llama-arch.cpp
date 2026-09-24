@@ -153,7 +153,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_MAINCODER,        "maincoder"        },
     { LLM_ARCH_KIMI_LINEAR,      "kimi-linear"      },
     { LLM_ARCH_KIMI_K3,          "kimi-k3"          },
-    { LLM_ARCH_GLM5_NEXT,        "glm5-next"        },
+    { LLM_ARCH_GLM5_NEXT,        "glm5next"         },
     { LLM_ARCH_TALKIE,           "talkie"           },
     { LLM_ARCH_MELLUM,           "mellum"           },
     { LLM_ARCH_NANBEIGE,         "nanbeige"         },
