@@ -352,11 +352,21 @@ llama_kv_cache::llama_kv_cache(
         const size_t   lazy_align = 256;
         const bool     has_v      = !hparams.is_mla();
 
+        // only the layers this cache really stores K/V for: a hybrid arch (KDA +
+        // MLA here) has layers with no kv heads at all, their K and V row size is
+        // 0 and the rung sizing below would divide by zero on them
         std::vector<uint32_t> lazy_layers;
         for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
-            if (hparams.has_kv(il)) {
-                lazy_layers.push_back(il);
+            if (!hparams.has_kv(il)) {
+                continue;
             }
+            if (filter && !filter(il)) {
+                continue;
+            }
+            if (hparams.n_embd_k_gqa(il) + (has_v ? hparams.n_embd_v_gqa(il) : 0) == 0) {
+                continue;
+            }
+            lazy_layers.push_back(il);
         }
 
         // bytes of the pool of one layer: final K + final V at the configured cell count
