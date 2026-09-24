@@ -1600,8 +1600,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // decode -> prefill transition is the prompt boundary. Reset the expert
     // tiers for the new prompt - the RAM/VRAM hot sets must re-learn its
     // routing priorities (the hot cache divides all counts by 4) and the VRAM
-    // MoE layout rebuilds once the new prompt produced its own 512-token
-    // profile, while the old layout keeps serving that warm-up window.
+    // MoE layout rebuilds once the new prompt produced its own profile,
+    // while the old layout keeps serving that warm-up window.
     if (hot_experts && prev_ubatch_n_tokens == 1 && ubatch.n_tokens > 1) {
         hot_experts->on_prompt_begin();
         if (moe_cache) {
@@ -4186,7 +4186,7 @@ bool llama_context::moe_cache_resume() {
 
 // one-time scratch guard held in the MoE budget until the first decode has
 // grown the CUDA scratch pools to their real decode peak
-static const uint64_t kMoeScratchReserve = 256ull << 20;
+static const uint64_t kMoeScratchReserve = 70ull << 20;
 
 // the decode budget reclaims pp - tg. Keep a small slack for the difference
 // between the measured (full memory context) and the actual (partial) decode

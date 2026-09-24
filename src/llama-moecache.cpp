@@ -26,7 +26,7 @@
 // decode tokens of routing to collect before the VRAM tier sizes itself from
 // the profile (the first decode tokens of the first request: the shared ranking
 // is fed by single-token decode ubatches only, see llama-hot-experts.h)
-static constexpr uint64_t kMinProfileContentTokens = 512;
+static constexpr uint64_t kMinProfileContentTokens = 100;
 
 // content tokens between content rebalances (each rebalance reconciles the
 // residents with the current global ranking)
@@ -608,7 +608,7 @@ void llama_moe_cache::maybe_activate() {
         // first kMinProfileContentTokens decode tokens of that prompt refreshed
         // the ranking. on_prompt_begin() re-arms the epoch at every prompt
         // boundary (see llama-context.cpp), and the old layout keeps serving
-        // the first 512 tokens of the new prompt untouched. A rebuild can shrink
+        // the first kMinProfileContentTokens tokens of the new prompt untouched. A rebuild can shrink
         // or grow the per-layer slot counts, so the cache tensors are re-carved
         // below exactly like the initial activation.
         if (p->epoch_rebuilt) {
@@ -1154,7 +1154,7 @@ ggml_backend_dev_t llama_moe_cache::device() const {
 }
 
 // a new prompt has begun (llama_context detects the decode -> prefill
-// transition): start a fresh 512-token profile window for this prompt. The
+// transition): start a fresh kMinProfileContentTokens-token profile window for this prompt. The
 // existing layout keeps serving normally until the window elapses and
 // maybe_activate() rebuilds it from the new prompt's routing mix.
 void llama_moe_cache::on_prompt_begin() {
