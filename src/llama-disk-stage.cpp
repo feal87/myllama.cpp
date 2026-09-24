@@ -1385,10 +1385,16 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                 l2_groups[g].push_back(il);
                             }
 
-                            // more bundle types than staging slabs: leave the L2
-                            // off (the all_pooled check below reports it)
+                            // more bundle types than staging slabs: pool the
+                            // types that cover the most layers, the remaining
+                            // layers keep streaming (a prefill clears the pools
+                            // anyway, so a partial pool is safe)
                             if ((int) l2_groups.size() > p.n_buf) {
-                                l2_groups.clear();
+                                std::stable_sort(l2_groups.begin(), l2_groups.end(),
+                                                 [](const std::vector<int> & a, const std::vector<int> & b) {
+                                                     return a.size() > b.size();
+                                                 });
+                                l2_groups.resize((size_t) p.n_buf);
                             }
 
                             while ((int) l2_groups.size() < p.n_buf) {
@@ -1462,21 +1468,21 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                 }
                             }
 
-                            bool all_pooled = true;
-                            for (int il = 0; il < n_layer; ++il) {
-                                if (src[il].ok && p.evict_pool_id[il] < 0) {
-                                    all_pooled = false;
-                                    break;
-                                }
-                            }
-                            if (!all_pooled) {
-                                // more bundle types than staging slabs: the pool
-                                // cannot cover them all, so leave it off
-                                p.evict_pools.clear();
-                                p.evict_pool_id.assign(n_layer, -1);
-                                LLAMA_LOG_WARN("%s: more expert-bundle types than staging buffers, "
+                            if (p.evict_pools.empty()) {
+                                LLAMA_LOG_WARN("%s: no expert-bundle type fits a staging buffer, "
                                                "L2 eviction pool disabled\n", __func__);
                             } else {
+                                int n_pooled = 0;
+                                for (int il = 0; il < n_layer; ++il) {
+                                    if (src[il].ok && p.evict_pool_id[il] >= 0) {
+                                        n_pooled++;
+                                    }
+                                }
+                                if (n_pooled < n_staged) {
+                                    LLAMA_LOG_INFO("%s: L2 eviction pool covers %d of %d staged layers, "
+                                                   "the other %d stream from disk\n",
+                                                   __func__, n_pooled, n_staged, n_staged - n_pooled);
+                                }
                                 for (size_t k = 0; k < p.evict_pools.size(); ++k) {
                                     LLAMA_LOG_INFO("%s:   L2 pool %zu: %d slots, strides %zu/%zu/%zu bytes\n",
                                                    __func__, k, p.evict_pools[k].cap,
