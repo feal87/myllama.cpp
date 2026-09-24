@@ -99,6 +99,7 @@ static void usage(char ** argv) {
     LOG("  --lazy-kv                Run the lazy KV cache tests\n");
     LOG("  --device <name>          Run the lazy KV tests on the given backend device\n");
     LOG("  -v <N>                   Set log verbosity level\n");
+    LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -350,7 +351,13 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_KPOOL,        uint32_t(4));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_KPOOL_SELECT_TAIL, true);
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS, uint32_t(1));
-    ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
+    // mrope sections count rope pairs; Ling 3.0 VL files carry [t, h, w] sections
+    // summing to n_rot / 2 (n_rot is 64 in this fixture)
+    if (arch == LLM_ARCH_BAILINGMOE3) {
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({8, 12, 12, 0}));
+    } else {
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
+    }
 
     if (arch == LLM_ARCH_HY_V4) {
         ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,     uint32_t(4));
@@ -723,7 +730,7 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
     return 0;
 }
 
-static int test_backends(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity) {
+static int test_backends(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity, const char * target_backend) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -765,6 +772,9 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
             const size_t device_count = ggml_backend_dev_count();
             for (size_t i = 0; i < device_count; i++) {
                 ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                if (target_backend != nullptr && strcmp(target_backend, ggml_backend_dev_name(dev)) != 0) {
+                    continue;
+                }
                 dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{dev}, ggml_backend_dev_description(dev), LLAMA_SPLIT_MODE_LAYER);
                 max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
 
@@ -775,7 +785,9 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
             }
         }
 
-        dev_configs.emplace_back(devices_meta, "Meta", LLAMA_SPLIT_MODE_TENSOR);
+        if (target_backend == nullptr) {
+            dev_configs.emplace_back(devices_meta, "Meta", LLAMA_SPLIT_MODE_TENSOR);
+        }
     }
 
     size_t max_arch_name_length = 0;
@@ -1296,6 +1308,7 @@ int main(int argc, char ** argv) {
     std::string out;
     bool lazy_kv = false;
     std::string device;
+    const char * target_backend = nullptr;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1362,6 +1375,19 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
+        } else if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--backend") == 0) {
+            if (i + 1 < argc) {
+                const char * backend_name = argv[++i];
+                ggml_backend_dev_t dev = ggml_backend_dev_by_name(backend_name);
+                if (dev == nullptr) {
+                    LOG_ERR("%s: unknown backend device: %s\n", __func__, backend_name);
+                    return 1;
+                }
+                target_backend = ggml_backend_dev_name(dev);
+            } else {
+                usage(argv);
+                return 1;
+            }
         } else {
             LOG_ERR("%s: unknown argument: %s\n", __func__, argv[i]);
             usage(argv);
@@ -1412,7 +1438,7 @@ int main(int argc, char ** argv) {
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);
         }
-        return test_backends(arch_filter, seed, stdev, verbosity);
+        return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;
