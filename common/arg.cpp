@@ -3203,6 +3203,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--sparse-attn"},
+        "use the sparse attention indexer where the model provides one (default: full attention)",
+        [](common_params & params) {
+            params.sparse_attn = true;
+        }
+    ));
+    add_opt(common_arg(
         {"--override-kv"}, "KEY=TYPE:VALUE,...",
         "advanced option to override model metadata by key. to specify multiple overrides, either use comma-separated values.\n"
         "types: int, float, bool, str. example: --override-kv tokenizer.ggml.add_bos_token=bool:false,tokenizer.ggml.add_eos_token=bool:false",

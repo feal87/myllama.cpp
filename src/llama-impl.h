@@ -57,33 +57,6 @@ struct no_init {
     no_init() = default;
 };
 
-// sparse attention is opt-in: a model can carry the indexer metadata and still be served better
-// by full attention, because the indexer keeps only a small budget of cells per token and drops
-// long-range detail. the metadata alone must never switch it on
-static inline bool llama_qsa_allowed() {
-    static const bool allowed = [] {
-        const char * e = getenv("LLAMA_QSA_ALLOW");
-        return e != nullptr && e[0] != '\0' && e[0] != '0';
-    }();
-
-    return allowed;
-}
-
-// GLM5-Next: serve the MLA layers with plain dense attention over the whole MLA
-// cache instead of the k-pool DSA indexer (which caps a query at
-// indexer_top_k/kpool tokens -- 2048 of them -- however long the context is).
-// opt-in via LLAMA_GLM_FULL_ATTN=1. When on, the indexer weights are not loaded,
-// its KV cache is not allocated, and the prefill graph loses the indexer
-// workspace (measured on GLM-5.3-Flash: -1090 MiB of compute buffer at ub 512).
-static inline bool llama_glm_full_attn() {
-    static const bool on = [] {
-        const char * e = getenv("LLAMA_GLM_FULL_ATTN");
-        return e != nullptr && e[0] != '\0' && e[0] != '0';
-    }();
-
-    return on;
-}
-
 template <typename dst_t, typename src_t>
 static inline dst_t llama_cast(src_t v) {
     if constexpr (std::is_same_v<src_t, dst_t>) {

@@ -148,7 +148,7 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
             // built, so skip its weights. TENSOR_SKIP keeps the file's tensor
             // count intact while loading and allocating nothing.
             const int  iflags = flags | (full ? 0 : TENSOR_NOT_REQUIRED) |
-                                (llama_glm_full_attn() ? TENSOR_SKIP : 0);
+                                (!hparams.sparse_attn ? TENSOR_SKIP : 0);
 
             layer.indexer_k_norm     = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM,     "weight", i), {n_embd_indexer}, iflags);
             layer.indexer_k_norm_b   = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM,     "bias",   i), {n_embd_indexer}, iflags);
@@ -325,7 +325,7 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
         const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
         const int64_t n_sel      = kpool*n_top_pool + (hparams.indexer_kpool_select_tail ? kpool - 1 : 0);
         inp->n_sel = (uint32_t) n_sel;
-        inp->gather = !llama_glm_full_attn() && (int64_t) n_tokens <= max_ub && (int64_t) n_kv > n_sel;
+        inp->gather = hparams.sparse_attn && (int64_t) n_tokens <= max_ub && (int64_t) n_kv > n_sel;
 
         if (inp->gather) {
             inp->gather_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_sel, 1, 1, n_tokens);
@@ -365,7 +365,7 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
     auto * inp_attn  = inp_hyb->get_attn();
     // dense attention needs none of the indexer plumbing: no pool inputs, no
     // indexer cache traffic, no top-k selection
-    auto * inp_kpool = llama_glm_full_attn() ? nullptr : build_inp_kpool(mctx_hyb);
+    auto * inp_kpool = hparams.sparse_attn ? build_inp_kpool(mctx_hyb) : nullptr;
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
@@ -763,7 +763,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
     ggml_tensor * kq_mask = inp_attn->get_kq_mask();
 
     ggml_tensor * sel = nullptr;
-    if (llama_glm_full_attn()) {
+    if (!hparams.sparse_attn) {
         // dense: every cached latent is visible, causality is already in kq_mask
         sel = kq_mask;
     } else if (il >= (int) hparams.n_layer() || hparams.is_indexer_full(il)) { // the NextN block always has a full indexer
@@ -818,7 +818,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
         ggml_tensor * v = ggml_view_4d(ctx0, k, kv_lora_rank, k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
         out = build_attn_mha(q_absorbed, k, v, nullptr, mask, nullptr, layer.wv_b,
-                             llama_glm_full_attn() ? 0 : (int64_t) inp_kpool->n_sel, kq_scale, il);
+                             !hparams.sparse_attn ? 0 : (int64_t) inp_kpool->n_sel, kq_scale, il);
     }
     cb(out, "kqv_out", il);
 

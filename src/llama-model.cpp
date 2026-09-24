@@ -1240,6 +1240,8 @@ void llama_model_base::load_stats(llama_model_loader & ml) {
 void llama_model_base::load_hparams(llama_model_loader & ml) {
     const gguf_context * ctx = ml.metadata;
 
+    hparams.sparse_attn = params.sparse_attn;
+
     // get metadata as string
     for (int i = 0; i < gguf_get_n_kv(ctx); i++) {
         gguf_type type = gguf_get_kv_type(ctx, i);
@@ -2454,16 +2456,17 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_GLM5_NEXT:
             {
                 // KDA layers are recurrent, the DSA layers use a K-only MLA cache plus an indexer cache.
-                // tThe Nextn block is never attended by the trunk graph
+                // The NextN block is never attended by the trunk graph
                 llama_memory_hybrid_idx::layer_filter_cb filter_attn = [&](uint32_t il) {
                     return il < hparams.n_layer() && !hparams.is_recr(il);
                 };
-                llama_memory_hybrid_idx::layer_filter_cb filter_idx = [&](uint32_t il) {
-                    if (llama_glm_full_attn()) {
-                        return false; // dense attention: no indexer cache at all
-                    }
-                    return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il);
-                };
+                // full attention does not allocate the indexer cache at all, so no pool state is built
+                llama_memory_hybrid_idx::layer_filter_cb filter_idx = nullptr;
+                if (hparams.sparse_attn) {
+                    filter_idx = [&](uint32_t il) {
+                        return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il);
+                    };
+                }
                 llama_memory_hybrid_idx::layer_filter_cb filter_recr = [&](uint32_t il) {
                     return il < hparams.n_layer() && hparams.is_recr(il);
                 };
@@ -2474,7 +2477,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         throw std::runtime_error("GLM5-Next MTP requires the NextN block, convert without --no-mtp");
                     }
                     filter_attn = [&](uint32_t il) { return il >= hparams.n_layer(); };
-                    filter_idx  = [&](uint32_t il) { return !llama_glm_full_attn() && il >= hparams.n_layer(); };
+                    if (hparams.sparse_attn) {
+                        filter_idx = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                    }
                     filter_recr = [&](uint32_t)    { return false; };
                 }
 
@@ -2710,10 +2715,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             return il < hparams.n_layer() && hparams.is_recr(il);
                         };
 
-                        if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0 && llama_qsa_allowed()) {
+                        if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0 && hparams.sparse_attn) {
                             // QSA runs on the dense-attention layers only, and only where the
                             // metadata gives a block size and the process opted in
-                            // (LLAMA_QSA_ALLOW). Everywhere else the indexer cache would
+                            // (--sparse-attn). Everywhere else the indexer cache would
                             // reserve buffers nothing will ever touch
                             filter_idx = [&](uint32_t il) {
                                 return il < hparams.n_layer() &&
@@ -2937,6 +2942,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.sparse_attn                 =*/ false,
     };
 
     return result;
