@@ -2459,6 +2459,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     return il < hparams.n_layer() && !hparams.is_recr(il);
                 };
                 llama_memory_hybrid_idx::layer_filter_cb filter_idx = [&](uint32_t il) {
+                    if (llama_glm_full_attn()) {
+                        return false; // dense attention: no indexer cache at all
+                    }
                     return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il);
                 };
                 llama_memory_hybrid_idx::layer_filter_cb filter_recr = [&](uint32_t il) {
@@ -2471,7 +2474,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         throw std::runtime_error("GLM5-Next MTP requires the NextN block, convert without --no-mtp");
                     }
                     filter_attn = [&](uint32_t il) { return il >= hparams.n_layer(); };
-                    filter_idx  = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                    filter_idx  = [&](uint32_t il) { return !llama_glm_full_attn() && il >= hparams.n_layer(); };
                     filter_recr = [&](uint32_t)    { return false; };
                 }
 

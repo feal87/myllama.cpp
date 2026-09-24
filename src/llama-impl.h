@@ -69,6 +69,21 @@ static inline bool llama_qsa_allowed() {
     return allowed;
 }
 
+// GLM5-Next: serve the MLA layers with plain dense attention over the whole MLA
+// cache instead of the k-pool DSA indexer (which caps a query at
+// indexer_top_k/kpool tokens -- 2048 of them -- however long the context is).
+// opt-in via LLAMA_GLM_FULL_ATTN=1. When on, the indexer weights are not loaded,
+// its KV cache is not allocated, and the prefill graph loses the indexer
+// workspace (measured on GLM-5.3-Flash: -1090 MiB of compute buffer at ub 512).
+static inline bool llama_glm_full_attn() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_GLM_FULL_ATTN");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+
+    return on;
+}
+
 template <typename dst_t, typename src_t>
 static inline dst_t llama_cast(src_t v) {
     if constexpr (std::is_same_v<src_t, dst_t>) {
