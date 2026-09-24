@@ -2231,30 +2231,28 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // device-side mul_mat_id chain over the cache tensors serves the cached
     // expert ids while the CPU chain (host weights) skips them; the two down
     // projections are summed below, which is exact by construction. Both the
-    // fused gate_up and the separate gate/up layouts are handled. Only engaged
-    // for LLM_FFN_SILU layers whose host activation is the plain swiglu_split
-    // (no swiglu clamp); everything else keeps the stock graph (mc == nullptr).
+    // fused gate_up and the separate gate/up layouts are handled. The device
+    // chain mirrors the host activation, including a swiglu clamp.
     const llama_moe_cache_layer * mc = nullptr;
     if (moe_cache && n_tokens == 1 && type_op == LLM_FFN_SILU &&
             !weight_before_ffn && loras->empty() &&
             !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps_b &&
             !up_exps_s && !gate_exps_s && !down_exps_s) {
-        bool clamp_free = true;
-        if (il >= 0) {
-            constexpr float eps = 1e-6f;
-            clamp_free = hparams.swiglu_clamp_exp[il] <= eps;
-        }
-        if (clamp_free) {
-            if (gate_up_exps && !gate_exps) {
-                mc = moe_cache->lookup(il); // fused layout
-                if (mc && !mc->fused) {
-                    mc = nullptr;
-                }
-            } else if (gate_exps && up_exps) {
-                mc = moe_cache->lookup(il); // separate layout
-                if (mc && mc->fused) {
-                    mc = nullptr;
-                }
+        // A non-zero swiglu clamp (GLM5-Next, DeepSeek-V4, Maple, ...) is NOT a
+        // reason to keep a layer out of the cache: the device chain mirrors the
+        // host activation exactly (see the mc_swiglu lambda below). Keeping the
+        // layer out while still uploading its experts to the VRAM tier is what
+        // silently zeroed those experts: the host chain skips VRAM-served ids
+        // and the sentinel row is never filled.
+        if (gate_up_exps && !gate_exps) {
+            mc = moe_cache->lookup(il); // fused layout
+            if (mc && !mc->fused) {
+                mc = nullptr;
+            }
+        } else if (gate_exps && up_exps) {
+            mc = moe_cache->lookup(il); // separate layout
+            if (mc && mc->fused) {
+                mc = nullptr;
             }
         }
     }
@@ -2448,7 +2446,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (mc) {
         // device-side chain over the cached experts, mirroring the host
-        // activation (plain swiglu_split - clamp layers never reach here)
+        // activation exactly - including a swiglu clamp, which the host applies
+        // for gate/up (separate) layouts only; the fused gate_up host path is a
+        // plain swiglu_split, so the fused cache chain must match that.
+        const bool  mc_clamp_active = gate_exps != nullptr && il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f;
+        const float mc_clamp_val    = mc_clamp_active ? hparams.swiglu_clamp_exp[il] : 0.0f;
+        const auto mc_swiglu = [&](ggml_tensor * mc_g, ggml_tensor * mc_u) -> ggml_tensor * {
+            if (!mc_clamp_active) {
+                return ggml_swiglu_split(ctx0, mc_g, mc_u);
+            }
+            const bool fused_op = arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5_NEXT ||
+                                  (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4;
+            if (fused_op) {
+                return ggml_swiglu_clamp(ctx0, mc_g, mc_u, mc_clamp_val);
+            }
+            ggml_tensor * mc_u_c = ggml_clamp(ctx0, mc_u, -mc_clamp_val, mc_clamp_val);
+            ggml_tensor * mc_g_a = ggml_clamp(ctx0, ggml_silu(ctx0, mc_g), -INFINITY, mc_clamp_val);
+            return ggml_mul(ctx0, mc_g_a, mc_u_c);
+        };
+
         ggml_tensor * mc_slot_ids = ggml_get_rows(ctx0, mc->dev_table, selected_experts); // [1, n_expert_used, n_tokens]
         mc_slot_ids = ggml_reshape_2d(ctx0, mc_slot_ids, selected_experts->ne[0], selected_experts->ne[1]);
 
@@ -2471,7 +2487,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             const int64_t mc_n_ff = mc_gu->ne[0] / 2;
             ggml_tensor * mc_gate = ggml_view_3d(ctx0, mc_gu, mc_n_ff, mc_gu->ne[1], mc_gu->ne[2], mc_gu->nb[1], mc_gu->nb[2], 0);
             ggml_tensor * mc_up   = ggml_view_3d(ctx0, mc_gu, mc_n_ff, mc_gu->ne[1], mc_gu->ne[2], mc_gu->nb[1], mc_gu->nb[2], mc_n_ff * mc_gu->nb[0]);
-            mc_act = ggml_swiglu_split(ctx0, mc_gate, mc_up);
+            mc_act = mc_swiglu(mc_gate, mc_up);
         } else {
             ggml_tensor * mc_gate = ggml_mul_mat_id(ctx0, mc->c_gate, mc_inp, mc_slot_ids); // [n_ff, n_expert_used, n_tokens]
             ggml_tensor * mc_up   = ggml_mul_mat_id(ctx0, mc->c_up,   mc_inp, mc_slot_ids);
@@ -2479,7 +2495,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(mc_up,   "ffn_moe_cache_up",   il);
             mc_set_skip(mc_gate);
             mc_set_skip(mc_up);
-            mc_act = ggml_swiglu_split(ctx0, mc_gate, mc_up);
+            mc_act = mc_swiglu(mc_gate, mc_up);
         }
         cb(mc_act, "ffn_moe_cache_swiglu", il);
 
