@@ -2780,9 +2780,15 @@ void llama_context::output_reorder() {
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     uint32_t res;
-    if (model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_GLM5_NEXT) {
+    if (model.arch == LLM_ARCH_KIMI_K3) {
         // the n_tokens*40 budget below is exhausted at ubatch 3840
         res = std::max<uint32_t>(n_tokens * 160, 64u * model.n_tensors());
+    } else if (model.arch == LLM_ARCH_GLM5_NEXT) {
+        // measured on GLM-5.3-Flash: the pp graph is ~7000 nodes and nearly flat
+        // in n_tokens (6915 at ubatch 3072, 6999 at bs 1), so the per-tensor
+        // floor is the real budget. The n_tokens*160 was inherited from KIMI-K3
+        // and never needed
+        res = std::max<uint32_t>(n_tokens * 8, 64u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_HRM_TEXT) {
         // the 128-slot looped graph needs roughly one stack per token budget
         res = std::max<uint32_t>(n_tokens * 80, 64u * model.n_tensors());
