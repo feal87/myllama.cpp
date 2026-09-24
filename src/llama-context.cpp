@@ -1530,6 +1530,12 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     return true;
 }
 
+void llama_context::flush_expert_profile() {
+    if (hot_experts) {
+        hot_experts->flush_profile();
+    }
+}
+
 void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
     LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
 
@@ -4923,6 +4929,10 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
+}
+
+void llama_expert_profile_flush(llama_context * ctx) {
+    ctx->flush_expert_profile();
 }
 
 float * llama_get_logits(llama_context * ctx) {

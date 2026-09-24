@@ -313,6 +313,9 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // flush the accumulated --expert-profile record to disk
+    void flush_expert_profile();
+
 private:
     llm_graph_result * get_gf_res_prev();
 

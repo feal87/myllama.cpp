@@ -221,6 +221,10 @@ class llama_hot_expert_cache {
     // profiling is disabled.
     void note_output_token(int32_t token);
 
+    // Flush the accumulated decode profile to disk and start a new record. No-op
+    // when profiling is disabled or no routing was seen since the last flush.
+    void flush_profile();
+
     // direct-read expert staging: when set, ubatches fill the stage at each
     // layer's topk instead of prefetching the mmap (--load-mode dio). The disk
     // cache's pools become the RAM tier's pools: shared slots within a pool,

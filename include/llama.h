@@ -1156,6 +1156,10 @@ extern "C" {
     // and is not necessary to call it explicitly in most cases
     LLAMA_API void llama_synchronize(struct llama_context * ctx);
 
+    // Flush the accumulated decode expert profile (--expert-profile) to disk and
+    // start a new record. No-op when profiling is disabled.
+    LLAMA_API void llama_expert_profile_flush(struct llama_context * ctx);
+
     // Token logits obtained from the last call to llama_decode()
     // The logits for which llama_batch.logits[i] != 0 are stored contiguously
     // in the order they have appeared in the batch.

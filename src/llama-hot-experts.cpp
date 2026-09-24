@@ -1540,6 +1540,12 @@ void llama_hot_expert_cache::write_profile() {
     profile_routes = 0;
 }
 
+void llama_hot_expert_cache::flush_profile() {
+    std::lock_guard<std::mutex> lock(mu);
+
+    write_profile();
+}
+
 void llama_hot_expert_cache::on_prompt_begin() {
     std::lock_guard<std::mutex> lock(mu);
 

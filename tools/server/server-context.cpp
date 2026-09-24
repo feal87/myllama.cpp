@@ -649,6 +649,11 @@ struct server_slot {
 
             state = SLOT_STATE_IDLE;
 
+            // flush the --expert-profile record for the turn that just ended
+            if (task->need_sampling()) {
+                llama_expert_profile_flush(ctx_tgt);
+            }
+
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
                 prompt_clear();
