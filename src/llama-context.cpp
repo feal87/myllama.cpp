@@ -949,13 +949,14 @@ void llama_context::sched_reserve() {
             return diff ? format("%d / %d", v_pp, v_tg) : format("%d", v_pp);
         };
 
-        LLAMA_LOG_INFO("%s: graph%s: nodes = %s, splits = %s, input objects = %s, input tensors = %s\n",
+        LLAMA_LOG_INFO("%s: graph%s: nodes = %s, splits = %s, input objects = %s, input tensors = %s, max_nodes = %zu (floor = %zu)\n",
                 __func__,
                 diff ? format(" (pp bs=%d, tg bs=%d)", n_tokens, n_seqs).c_str() : "",
                 val(n_nodes_pp, n_nodes_tg).c_str(),
                 val(n_splits_pp, n_splits_tg).c_str(),
                 val(n_inputs_pp, n_inputs_tg).c_str(),
-                val(n_input_tensors_pp, n_input_tensors_tg).c_str());
+                val(n_input_tensors_pp, n_input_tensors_tg).c_str(),
+                max_nodes, 64u*model.n_tensors());
     }
 
     const int64_t t_end_us = ggml_time_us();
