@@ -2283,11 +2283,13 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_PORO;
                 clean_spaces = false;
             } else if (
+                tokenizer_pre == "glm4" ||
                 tokenizer_pre == "chatglm-bpe") {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_CHATGLM4;
                 special_bos_id = LLAMA_TOKEN_NULL;
+                // GLM-5.3-Flash ships a glm4 pre-tokenizer that ignores merges, a real GLM4 model does not
+                ignore_merges = ml.get_arch() == LLM_ARCH_GLM5_NEXT;
             } else if (
-                tokenizer_pre == "glm4" ||
                 tokenizer_pre == "glm5") {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_CHATGLM4;
                 special_bos_id = LLAMA_TOKEN_NULL;
