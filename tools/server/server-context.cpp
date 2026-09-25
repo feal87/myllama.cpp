@@ -15,7 +15,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
-#include "src/llama-ext.h"
+#include "../../src/llama-ext.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 

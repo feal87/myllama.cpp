@@ -3,7 +3,7 @@
 #include "common.h"
 #include "log.h"
 #include "llama.h"
-#include "src/llama-ext.h"
+#include "../../src/llama-ext.h"
 #include "chat.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
