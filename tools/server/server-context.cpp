@@ -58,6 +58,68 @@ static float server_lazy_reset_frac() {
     return frac;
 }
 
+static uint64_t expert_counter_delta(uint64_t previous, uint64_t current) {
+    return current >= previous ? current - previous : current;
+}
+
+static void accumulate_expert_counters(llama_expert_stats & dst, const llama_expert_stats & previous, const llama_expert_stats & current) {
+    dst.routed_experts += expert_counter_delta(previous.routed_experts, current.routed_experts);
+    dst.decode_tokens  += expert_counter_delta(previous.decode_tokens,  current.decode_tokens);
+    dst.experts_seen   += expert_counter_delta(previous.experts_seen,   current.experts_seen);
+
+    dst.decode_cache.route_hits        += expert_counter_delta(previous.decode_cache.route_hits, current.decode_cache.route_hits);
+    dst.decode_cache.route_misses      += expert_counter_delta(previous.decode_cache.route_misses, current.decode_cache.route_misses);
+    dst.decode_cache.assigned_routes   += expert_counter_delta(previous.decode_cache.assigned_routes, current.decode_cache.assigned_routes);
+    dst.decode_cache.unassigned_routes += expert_counter_delta(previous.decode_cache.unassigned_routes, current.decode_cache.unassigned_routes);
+    dst.decode_cache.fills             += expert_counter_delta(previous.decode_cache.fills, current.decode_cache.fills);
+    dst.decode_cache.base_routes       += expert_counter_delta(previous.decode_cache.base_routes, current.decode_cache.base_routes);
+    dst.decode_cache.base_experts_used += expert_counter_delta(previous.decode_cache.base_experts_used, current.decode_cache.base_experts_used);
+    dst.decode_cache.resident_changes  += expert_counter_delta(previous.decode_cache.resident_changes, current.decode_cache.resident_changes);
+
+    dst.disk_l2.hits               += expert_counter_delta(previous.disk_l2.hits, current.disk_l2.hits);
+    dst.disk_l2.misses             += expert_counter_delta(previous.disk_l2.misses, current.disk_l2.misses);
+    dst.disk_l2.cold_lookups       += expert_counter_delta(previous.disk_l2.cold_lookups, current.disk_l2.cold_lookups);
+    dst.disk_l2.hit_bytes          += expert_counter_delta(previous.disk_l2.hit_bytes, current.disk_l2.hit_bytes);
+    dst.disk_l2.promotions         += expert_counter_delta(previous.disk_l2.promotions, current.disk_l2.promotions);
+    dst.disk_l2.promotion_bytes    += expert_counter_delta(previous.disk_l2.promotion_bytes, current.disk_l2.promotion_bytes);
+    dst.disk_l2.evictions          += expert_counter_delta(previous.disk_l2.evictions, current.disk_l2.evictions);
+    dst.disk_l2.demotions          += expert_counter_delta(previous.disk_l2.demotions, current.disk_l2.demotions);
+    dst.disk_l2.decode_fill_calls  += expert_counter_delta(previous.disk_l2.decode_fill_calls, current.disk_l2.decode_fill_calls);
+    dst.disk_l2.decode_fill_bytes  += expert_counter_delta(previous.disk_l2.decode_fill_bytes, current.disk_l2.decode_fill_bytes);
+    dst.disk_l2.decode_fill_microseconds += expert_counter_delta(previous.disk_l2.decode_fill_microseconds, current.disk_l2.decode_fill_microseconds);
+
+    dst.vram_cache.route_hits        += expert_counter_delta(previous.vram_cache.route_hits, current.vram_cache.route_hits);
+    dst.vram_cache.route_misses      += expert_counter_delta(previous.vram_cache.route_misses, current.vram_cache.route_misses);
+    dst.vram_cache.resident_changes  += expert_counter_delta(previous.vram_cache.resident_changes, current.vram_cache.resident_changes);
+    dst.vram_cache.uploads_queued    += expert_counter_delta(previous.vram_cache.uploads_queued, current.vram_cache.uploads_queued);
+    dst.vram_cache.uploads_succeeded += expert_counter_delta(previous.vram_cache.uploads_succeeded, current.vram_cache.uploads_succeeded);
+    dst.vram_cache.uploads_failed    += expert_counter_delta(previous.vram_cache.uploads_failed, current.vram_cache.uploads_failed);
+    dst.vram_cache.rebalances        += expert_counter_delta(previous.vram_cache.rebalances, current.vram_cache.rebalances);
+}
+
+static void set_expert_state(llama_expert_stats & dst, const llama_expert_stats & current) {
+    dst.dio_active = current.dio_active;
+
+    dst.decode_cache.enabled  = current.decode_cache.enabled;
+    dst.decode_cache.active   = current.decode_cache.active;
+    dst.decode_cache.residents = current.decode_cache.residents;
+    dst.decode_cache.capacity  = current.decode_cache.capacity;
+    dst.decode_cache.resident_bytes = current.decode_cache.resident_bytes;
+    dst.decode_cache.locked_bytes = current.decode_cache.locked_bytes;
+
+    dst.disk_l2.enabled  = current.disk_l2.enabled;
+    dst.disk_l2.warm     = current.disk_l2.warm;
+    dst.disk_l2.entries  = current.disk_l2.entries;
+    dst.disk_l2.capacity = current.disk_l2.capacity;
+
+    dst.vram_cache.enabled      = current.vram_cache.enabled;
+    dst.vram_cache.active       = current.vram_cache.active;
+    dst.vram_cache.residents    = current.vram_cache.residents;
+    dst.vram_cache.capacity     = current.vram_cache.capacity;
+    dst.vram_cache.pool_bytes   = current.vram_cache.pool_bytes;
+    dst.vram_cache.budget_bytes = current.vram_cache.budget_bytes;
+}
+
 static void server_prompt_cache_key_add_file(
         std::ostringstream & key,
         const char * label,
@@ -975,7 +1037,8 @@ public:
         }
     }
 
-    server_metrics get_metrics() const {
+    server_metrics get_metrics() {
+        update_expert_metrics();
         return metrics;
     }
 
@@ -1036,6 +1099,28 @@ private:
     bool ckpt_attn = false;
 
     server_metrics metrics;
+    llama_expert_stats expert_baseline;
+    bool expert_baseline_valid = false;
+
+    void reset_expert_metrics_baseline() {
+        expert_baseline_valid = false;
+    }
+
+    void update_expert_metrics() {
+        if (ctx_tgt == nullptr) {
+            return;
+        }
+
+        const llama_expert_stats current = llama_get_expert_stats(ctx_tgt);
+        if (expert_baseline_valid) {
+            accumulate_expert_counters(metrics.expert_stats, expert_baseline, current);
+        } else {
+            accumulate_expert_counters(metrics.expert_stats, {}, current);
+        }
+        set_expert_state(metrics.expert_stats, current);
+        expert_baseline = current;
+        expert_baseline_valid = true;
+    }
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
     // note: kept out of server_metrics, which is copied as-is into the task result
@@ -1057,6 +1142,7 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        update_expert_metrics();
         spec.reset();
         spec_init.reset();
 
@@ -1072,6 +1158,7 @@ private:
         mctx = nullptr;
         mtmd_free(mctx_hot);
         mctx_hot = nullptr;
+        reset_expert_metrics_baseline();
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -1132,6 +1219,11 @@ private:
         load_progress_data load_progress_spec  (this, "spec_model");
 
         const bool is_resume = sleeping;
+
+        if (ctx_tgt != nullptr) {
+            update_expert_metrics();
+        }
+        reset_expert_metrics_baseline();
 
         params_base = params;
         const auto output_limits = server_output_limits(params_base);
@@ -3041,6 +3133,7 @@ private:
                     res->id                  = task.id;
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
+                    update_expert_metrics();
                     res->metrics             = metrics;
 
                     if (task.metrics_reset_bucket) {

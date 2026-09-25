@@ -1620,6 +1620,34 @@ void llama_hot_expert_cache::vram_stats_snapshot(std::vector<uint64_t> & vram_hi
     route_miss = n_route_miss;
 }
 
+void llama_hot_expert_cache::stats_snapshot(llama_expert_stats & out) const {
+    std::lock_guard<std::mutex> lock(mu);
+
+    out.routed_experts = n_route_total;
+    out.decode_tokens  = n_content_tokens;
+    out.experts_seen   = n_distinct;
+
+    out.decode_cache.enabled  = disk_stage != nullptr && n_pin > 0;
+    out.decode_cache.active   = out.decode_cache.enabled;
+    out.decode_cache.residents = (uint64_t) pinned.size();
+    out.decode_cache.capacity  = (uint64_t) std::max(n_pin_total, 0);
+    out.decode_cache.resident_bytes = n_bytes_locked;
+    out.decode_cache.assigned_routes   = n_route_hit;
+    out.decode_cache.unassigned_routes = n_route_miss;
+    out.decode_cache.base_routes       = n_route_base;
+
+    for (const auto & layer : layers) {
+        if (!layer.resolved_tensors) {
+            continue;
+        }
+        for (uint32_t id = 0; id < layer.n_experts; ++id) {
+            if ((layer.pin_state[id] & PIN_BASE) != 0 && layer.counts[id] > 0) {
+                out.decode_cache.base_experts_used++;
+            }
+        }
+    }
+}
+
 uint64_t llama_hot_expert_cache::content_tokens() const {
     std::lock_guard<std::mutex> lock(mu);
     return n_content_tokens;

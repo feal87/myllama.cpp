@@ -4024,6 +4024,22 @@ void llama_context::perf_reset() {
     n_reused    = 0;
 }
 
+llama_expert_stats llama_context::get_expert_stats() const {
+    llama_expert_stats out;
+
+    if (hot_experts) {
+        hot_experts->stats_snapshot(out);
+    }
+    if (disk_stage) {
+        disk_stage->stats_snapshot(out);
+    }
+    if (moe_cache) {
+        moe_cache->stats_snapshot(out);
+    }
+
+    return out;
+}
+
 llama_memory_breakdown llama_context::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
     for (const auto & [buft, size] : model.memory_breakdown()) {
@@ -5463,6 +5479,10 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+llama_expert_stats llama_get_expert_stats(const struct llama_context * ctx) {
+    return ctx ? ctx->get_expert_stats() : llama_expert_stats{};
 }
 
 bool llama_moe_cache_suspend(llama_context * ctx) {

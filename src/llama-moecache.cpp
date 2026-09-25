@@ -143,6 +143,11 @@ struct llama_moe_cache::impl {
     uint64_t n_content      = 0;
     uint64_t last_rebalance = 0;
     uint64_t n_ticks        = 0;
+    uint64_t n_rebalances   = 0;
+    uint64_t n_resident_changes = 0;
+    uint64_t n_uploads_queued   = 0;
+    uint64_t n_uploads_succeeded = 0;
+    uint64_t n_uploads_failed  = 0;
 
     // rebalance scratch, reused across calls so the periodic reconciliation does
     // not allocate (rank snapshot, per-layer top sets, O(1) membership marks)
@@ -388,6 +393,7 @@ void llama_moe_cache::fill_upload_queue(llama_moe_cache::impl * p) {
 
             ls.slot_target[slot] = e;
             p->todo.push_back({ li, e, slot, false, std::move(snap) });
+            p->n_uploads_queued++;
             pushed = true;
             if ((int32_t) p->todo.size() >= p->max_inserts) {
                 break;
@@ -730,6 +736,7 @@ void llama_moe_cache::activate(bool relayout) {
                     }
                     ls.slot_expert[s] = -1;
                     ls.resident[(size_t) e] = 0;
+                    p->n_resident_changes++;
                     evicted.emplace_back(ls.pub.il, e);
                 }
                 std::fill(ls.slot_target.begin(), ls.slot_target.end(), -1);
@@ -1032,6 +1039,7 @@ bool llama_moe_cache::suspend() {
                 }
                 ls.slot_expert[s] = -1;
                 ls.resident[(size_t) e] = 0;
+                p->n_resident_changes++;
                 evicted.emplace_back(ls.pub.il, e);
             }
             std::fill(ls.slot_target.begin(), ls.slot_target.end(), -1);
@@ -1190,6 +1198,11 @@ const llama_moe_cache_layer * llama_moe_cache::lookup(int il) const {
 void llama_moe_cache::rebalance() {
     auto * p = pimpl.get();
 
+    {
+        std::lock_guard<std::mutex> lock(p->mtx);
+        p->n_rebalances++;
+    }
+
     // walk the shared ranking ONCE for every cached layer: sort it by
     // (layer, count desc, expert) and group the runs, which gives each layer
     // its top n_slots without a per-layer query, a per-layer sort or a
@@ -1264,6 +1277,7 @@ void llama_moe_cache::rebalance() {
                 }
                 ls.slot_expert[s] = -1;
                 ls.resident[e]    = 0;
+                p->n_resident_changes++;
                 evicted.emplace_back(ls.pub.il, e);
                 changed = true;
             }
@@ -1326,10 +1340,13 @@ void llama_moe_cache::tick(int64_t n_content_tokens) {
                 auto & ls = p->layers[j.layer_idx];
                 ls.slot_target[j.slot] = -1;
                 if (j.failed) {
+                    p->n_uploads_failed++;
                     continue; // source was gone; retried by the next rebalance
                 }
                 ls.slot_expert[j.slot] = j.expert;
                 ls.resident[j.expert]  = 1;
+                p->n_resident_changes++;
+                p->n_uploads_succeeded++;
                 p->dirty[j.layer_idx]  = 1;
                 became_resident.emplace_back(ls.pub.il, j.expert);
             }
@@ -1468,4 +1485,48 @@ void llama_moe_cache::print_stats() {
     }
     LLAMA_LOG_CONT("%s", per_layer.c_str());
     LLAMA_LOG_CONT("}\n");
+}
+
+void llama_moe_cache::stats_snapshot(llama_expert_stats & out) const {
+    if (!pimpl) {
+        return;
+    }
+
+    auto * p = pimpl.get();
+    {
+        std::lock_guard<std::mutex> lock(p->mtx);
+        out.vram_cache.enabled  = !p->failed;
+        out.vram_cache.active   = p->activated;
+        out.vram_cache.budget_bytes = p->budget_bytes;
+        out.vram_cache.resident_changes = p->n_resident_changes;
+        out.vram_cache.uploads_queued   = p->n_uploads_queued;
+        out.vram_cache.uploads_succeeded = p->n_uploads_succeeded;
+        out.vram_cache.uploads_failed  = p->n_uploads_failed;
+        out.vram_cache.rebalances      = p->n_rebalances;
+        if (p->pool) {
+            out.vram_cache.pool_bytes = ggml_backend_buffer_get_size(p->pool);
+        }
+        for (const auto & ls : p->layers) {
+            out.vram_cache.capacity += (uint64_t) std::max(ls.pub.n_slots, 0);
+            for (int32_t e : ls.slot_expert) {
+                if (e >= 0) {
+                    out.vram_cache.residents++;
+                }
+            }
+        }
+    }
+
+    if (p->hot) {
+        std::vector<uint64_t> hits;
+        std::vector<uint64_t> misses;
+        uint64_t route_hit = 0;
+        uint64_t route_miss = 0;
+        p->hot->vram_stats_snapshot(hits, misses, route_hit, route_miss);
+        for (const uint64_t n : hits) {
+            out.vram_cache.route_hits += n;
+        }
+        for (const uint64_t n : misses) {
+            out.vram_cache.route_misses += n;
+        }
+    }
 }

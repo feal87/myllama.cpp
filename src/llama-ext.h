@@ -100,6 +100,60 @@ LLAMA_API bool         llama_moe_cache_resume       (struct llama_context * ctx)
 LLAMA_API uint64_t     llama_moe_cache_budget_bytes (const struct llama_context * ctx);
 LLAMA_API ggml_backend_dev_t llama_moe_cache_device (const struct llama_context * ctx);
 
+struct llama_expert_cache_stats {
+    bool     enabled = false;
+    bool     active  = false;
+    uint64_t residents        = 0;
+    uint64_t capacity         = 0;
+    uint64_t resident_bytes   = 0;
+    uint64_t locked_bytes     = 0;
+    uint64_t pool_bytes       = 0;
+    uint64_t budget_bytes     = 0;
+    uint64_t route_hits       = 0;
+    uint64_t route_misses     = 0;
+    uint64_t assigned_routes  = 0;
+    uint64_t unassigned_routes = 0;
+    uint64_t fills            = 0;
+    uint64_t base_routes      = 0;
+    uint64_t base_experts_used = 0;
+    uint64_t resident_changes = 0;
+    uint64_t uploads_queued   = 0;
+    uint64_t uploads_succeeded = 0;
+    uint64_t uploads_failed   = 0;
+    uint64_t rebalances       = 0;
+};
+
+struct llama_expert_l2_stats {
+    bool     enabled = false;
+    bool     warm    = false;
+    uint64_t entries          = 0;
+    uint64_t capacity         = 0;
+    uint64_t hits             = 0;
+    uint64_t misses           = 0;
+    uint64_t cold_lookups     = 0;
+    uint64_t hit_bytes        = 0;
+    uint64_t promotions       = 0;
+    uint64_t promotion_bytes  = 0;
+    uint64_t evictions        = 0;
+    uint64_t demotions        = 0;
+    uint64_t decode_fill_calls       = 0;
+    uint64_t decode_fill_bytes       = 0;
+    uint64_t decode_fill_microseconds = 0;
+};
+
+struct llama_expert_stats {
+    bool     dio_active = false;
+    uint64_t routed_experts = 0;
+    uint64_t decode_tokens  = 0;
+    uint64_t experts_seen   = 0;
+
+    llama_expert_cache_stats decode_cache;
+    llama_expert_l2_stats    disk_l2;
+    llama_expert_cache_stats vram_cache;
+};
+
+LLAMA_API llama_expert_stats llama_get_expert_stats(const struct llama_context * ctx);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits

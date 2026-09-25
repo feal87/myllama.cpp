@@ -352,7 +352,15 @@ struct llama_disk_stage::impl {
     uint64_t n_l2_demotions   = 0;
     uint64_t n_l2_hit_bytes   = 0;
     uint64_t n_l2_promo_bytes = 0; // resident fills served from the L2 instead of the disk
+    uint64_t n_l2_promotions  = 0;
+    uint64_t n_l2_all_hits    = 0;
+    uint64_t n_l2_all_misses  = 0;
     bool     l2_warm          = false; // latched when every resident pool is full
+
+    uint64_t n_decode_cache_hits            = 0;
+    uint64_t n_decode_cache_misses          = 0;
+    uint64_t n_decode_cache_fills           = 0;
+    uint64_t n_decode_cache_resident_changes = 0;
 
     // fill_cache() scratch: the decode fill runs once per layer per token on the
     // compute thread, so reuse these instead of reallocating per call
@@ -624,6 +632,37 @@ bool llama_disk_stage::supported() {
 
 bool llama_disk_stage::is_active() const {
     return pimpl->active;
+}
+
+void llama_disk_stage::stats_snapshot(llama_expert_stats & out) const {
+    impl & p = *pimpl;
+
+    out.dio_active = p.active;
+    out.decode_cache.locked_bytes = p.cache_lock ? p.cache_lock->size() : 0;
+
+    std::lock_guard<std::mutex> lock(p.cache_mu);
+    out.decode_cache.route_hits       = p.n_decode_cache_hits;
+    out.decode_cache.route_misses     = p.n_decode_cache_misses;
+    out.decode_cache.fills            = p.n_decode_cache_fills;
+    out.decode_cache.resident_changes = p.n_decode_cache_resident_changes;
+
+    out.disk_l2.enabled = !p.evict_pools.empty();
+    out.disk_l2.warm    = p.l2_warm;
+    for (const auto & pool : p.evict_pools) {
+        out.disk_l2.entries  += pool.slot_of.size();
+        out.disk_l2.capacity += (uint64_t) pool.cap;
+    }
+    out.disk_l2.hits               = p.n_l2_all_hits;
+    out.disk_l2.misses             = p.n_l2_all_misses;
+    out.disk_l2.cold_lookups       = p.n_l2_cold;
+    out.disk_l2.hit_bytes          = p.n_l2_hit_bytes;
+    out.disk_l2.promotions         = p.n_l2_promotions;
+    out.disk_l2.promotion_bytes    = p.n_l2_promo_bytes;
+    out.disk_l2.evictions          = p.n_l2_evictions;
+    out.disk_l2.demotions          = p.n_l2_demotions;
+    out.disk_l2.decode_fill_calls  = p.n_dec_fill_calls;
+    out.disk_l2.decode_fill_bytes  = p.n_dec_fill_bytes;
+    out.disk_l2.decode_fill_microseconds = p.n_dec_fill_us;
 }
 
 bool llama_disk_stage::sparse_ubatch(int64_t n_tokens) const {
@@ -2111,12 +2150,21 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
             if (slot >= 0) {
                 table[id] = slot;
                 n_res_ev++;
+                if (c.resident_filled[id] != 0) {
+                    p.n_decode_cache_hits++;
+                } else {
+                    p.n_decode_cache_misses++;
+                    p.n_decode_cache_fills++;
+                }
                 if (c.resident_filled[id] == 0) {
                     // a promoted expert may still sit in the L2 pool from its
                     // first route: copy it in instead of reading the disk again
                     const int64_t key = ((int64_t) il << 32) | (uint32_t) id;
                     const int32_t eslot = epid >= 0 ? p.evict_touch(epid, key) : -1;
                     if (eslot >= 0) {
+                        if (epid >= 0) {
+                            p.n_l2_all_hits++;
+                        }
                         impl::evict_pool & ep = p.evict_pools[(size_t) epid];
                         for (int r = 0; r < 3; ++r) {
                             const size_t len = regions[r].stride;
@@ -2127,9 +2175,13 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
                                                pool.data[r] + (size_t) slot * pool.slot_stride[r], len });
                             p.n_l2_promo_bytes += len;
                         }
+                        p.n_l2_promotions++;
                         p.evict_populated = true;
                         l2_consume.emplace_back(epid, key);
                     } else {
+                        if (epid >= 0) {
+                            p.n_l2_all_misses++;
+                        }
                         for (int r = 0; r < 3; ++r) {
                             const impl::region & sr = regions[r];
                             if (sr.file == nullptr || sr.stride == 0) {
@@ -2153,6 +2205,7 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
             }
             const int32_t use = transient++;
             n_cold_ev++;
+            p.n_decode_cache_misses++;
 
             if (epid >= 0) {
                 impl::evict_pool & ep = p.evict_pools[(size_t) epid];
@@ -2165,6 +2218,7 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
                 // served from residence next time, so those lookups cannot hit
                 const bool l2_warm = p.l2_warm;
                 if (hit < 0) {
+                    p.n_l2_all_misses++;
                     if (l2_warm) {
                         p.n_l2_misses++;
                         ep.misses++;
@@ -2181,6 +2235,7 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
                                          expert_read_len[r] });
                     }
                 } else {
+                    p.n_l2_all_hits++;
                     if (l2_warm) {
                         p.n_l2_hits++;
                         ep.hits++;
@@ -2283,9 +2338,12 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
     for (const disk_stage_job & j : jobs) {
         disk_bytes += j.len;
     }
-    p.n_dec_fill_calls++;
-    p.n_dec_fill_us    += (uint64_t) (t1 - t0);
-    p.n_dec_fill_bytes += disk_bytes;
+    {
+        std::lock_guard<std::mutex> lock(p.cache_mu);
+        p.n_dec_fill_calls++;
+        p.n_dec_fill_us    += (uint64_t) (t1 - t0);
+        p.n_dec_fill_bytes += disk_bytes;
+    }
 
     if (disk_stage_trace()) {
         const double fill_ms = (t1 - t0) / 1000.0;
@@ -2395,6 +2453,7 @@ bool llama_disk_stage::resident_add(int il, int32_t id) {
     pool.free_slots.pop_back();
     c.resident_slot[id]   = slot;
     c.resident_filled[id] = 0;
+    p.n_decode_cache_resident_changes++;
 
     // the RAM tier is full once no pool has a free slot: from then on the L2
     // stats describe steady state (see fill_cache)
@@ -2463,6 +2522,7 @@ void llama_disk_stage::resident_remove(int il, int32_t id) {
     c.resident_slot[id]   = -1;
     c.resident_filled[id] = 0;
     pool.free_slots.push_back(slot);
+    p.n_decode_cache_resident_changes++;
 #else
     GGML_UNUSED(il);
     GGML_UNUSED(id);
@@ -2564,6 +2624,7 @@ void llama_disk_stage::vram_commit(int il, int32_t id) {
         c.resident_slot[id]   = -1;
         c.resident_filled[id] = 0;
         pool.free_slots.push_back(slot);
+        p.n_decode_cache_resident_changes++;
     }
 #else
     GGML_UNUSED(il);

@@ -69,6 +69,23 @@ def test_metrics_prometheus_format():
         "llamacpp:requests_processing",
         "llamacpp:requests_deferred",
         "llamacpp:n_busy_slots_per_decode",
+        "llamacpp:moe_dio_active",
+        "llamacpp:moe_decode_cache_enabled",
+        "llamacpp:moe_decode_cache_active",
+        "llamacpp:moe_decode_cache_residents",
+        "llamacpp:moe_decode_cache_capacity",
+        "llamacpp:moe_decode_cache_resident_bytes",
+        "llamacpp:moe_decode_cache_locked_bytes",
+        "llamacpp:moe_disk_l2_enabled",
+        "llamacpp:moe_disk_l2_warm",
+        "llamacpp:moe_disk_l2_entries",
+        "llamacpp:moe_disk_l2_capacity",
+        "llamacpp:moe_vram_cache_enabled",
+        "llamacpp:moe_vram_cache_active",
+        "llamacpp:moe_vram_cache_residents",
+        "llamacpp:moe_vram_cache_capacity",
+        "llamacpp:moe_vram_cache_pool_bytes",
+        "llamacpp:moe_vram_cache_budget_bytes",
     ]
 
     for name in expected_counters:
@@ -82,6 +99,8 @@ def test_metrics_prometheus_format():
 
     assert metrics["llamacpp:n_decode_total"][1] > 0
     assert metrics["llamacpp:requests_processing"][1] == 0
+    assert metrics["llamacpp:moe_dio_active"][1] == 0
+    assert "llamacpp:moe_routed_experts_total" not in metrics
 
 
 def test_metrics_prompt_processed_and_cached():

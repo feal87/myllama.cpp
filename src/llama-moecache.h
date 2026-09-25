@@ -58,6 +58,7 @@
 //  - decode-only (n_tokens == 1); prefill/batch ubatches build the stock graph.
 
 #include "ggml-backend.h"
+#include "llama-ext.h"
 
 #include <cstdint>
 #include <memory>
@@ -205,6 +206,9 @@ class llama_moe_cache {
     // (verbosity 4). Called by llama_context at the shared
     // --experts-stats-interval cadence; also refreshes the churn snapshot.
     void print_stats();
+
+    // Aggregate counters and current state for the server metrics exporter.
+    void stats_snapshot(llama_expert_stats & out) const;
 
     // llama_hot_expert_cache::vram_query_fn-compatible: returns the layer's
     // per-expert 0/1 residency table (n_expert bytes), or null when the layer

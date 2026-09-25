@@ -3,6 +3,7 @@
 #include "common.h"
 #include "log.h"
 #include "llama.h"
+#include "src/llama-ext.h"
 #include "chat.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
@@ -483,6 +484,10 @@ struct server_metrics {
     uint64_t n_draft_accepted    = 0; // Draft tokens actually accepted
     uint64_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<uint64_t> n_accepted_per_pos; // Accepted tokens per draft position
+
+    // Process-lifetime MoE cache telemetry. The current context is sampled into
+    // this value; context reloads must not reset the counters.
+    llama_expert_stats expert_stats;
 
     void init() {
         t_start = ggml_time_us();

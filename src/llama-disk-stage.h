@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "llama-ext.h"
 
 #include <cstdint>
 #include <memory>
@@ -161,6 +162,9 @@ public:
     bool is_vram(int il, int32_t id) const;
 
     bool is_active() const;
+
+    // Aggregate DIO cache counters and current state for the server metrics exporter.
+    void stats_snapshot(llama_expert_stats & out) const;
 
     // print the L2 eviction-pool stats (warm hit rate, disk bytes saved, and the
     // per-interval delta). The pool reuses the prefill staging slabs during

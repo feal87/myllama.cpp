@@ -1611,6 +1611,94 @@ std::string server_task_result_metrics::to_metrics() {
         },
     };
 
+    const std::vector<metric_item> expert_state = {
+        {
+            "moe_dio_active",
+            "Whether the direct-I/O MoE disk stage is active",
+            (double) metrics.expert_stats.dio_active
+        },
+        {
+            "moe_decode_cache_enabled",
+            "Whether the DIO RAM decode cache is enabled",
+            (double) metrics.expert_stats.decode_cache.enabled
+        },
+        {
+            "moe_decode_cache_active",
+            "Whether the DIO RAM decode cache is active",
+            (double) metrics.expert_stats.decode_cache.active
+        },
+        {
+            "moe_decode_cache_residents",
+            "Current DIO RAM decode-cache residents",
+            (double) metrics.expert_stats.decode_cache.residents
+        },
+        {
+            "moe_decode_cache_capacity",
+            "Current DIO RAM decode-cache capacity",
+            (double) metrics.expert_stats.decode_cache.capacity
+        },
+        {
+            "moe_decode_cache_resident_bytes",
+            "Current DIO RAM decode-cache resident bytes",
+            (double) metrics.expert_stats.decode_cache.resident_bytes
+        },
+        {
+            "moe_decode_cache_locked_bytes",
+            "Bytes locked for the DIO RAM decode cache",
+            (double) metrics.expert_stats.decode_cache.locked_bytes
+        },
+        {
+            "moe_disk_l2_enabled",
+            "Whether the DIO disk-stage L2 eviction pool is enabled",
+            (double) metrics.expert_stats.disk_l2.enabled
+        },
+        {
+            "moe_disk_l2_warm",
+            "Whether the DIO RAM decode cache has reached full residency",
+            (double) metrics.expert_stats.disk_l2.warm
+        },
+        {
+            "moe_disk_l2_entries",
+            "Current entries in the DIO disk-stage L2 pool",
+            (double) metrics.expert_stats.disk_l2.entries
+        },
+        {
+            "moe_disk_l2_capacity",
+            "Current capacity of the DIO disk-stage L2 pool",
+            (double) metrics.expert_stats.disk_l2.capacity
+        },
+        {
+            "moe_vram_cache_enabled",
+            "Whether the MoE VRAM cache is enabled",
+            (double) metrics.expert_stats.vram_cache.enabled
+        },
+        {
+            "moe_vram_cache_active",
+            "Whether the MoE VRAM cache has an active layout",
+            (double) metrics.expert_stats.vram_cache.active
+        },
+        {
+            "moe_vram_cache_residents",
+            "Current MoE VRAM cache residents",
+            (double) metrics.expert_stats.vram_cache.residents
+        },
+        {
+            "moe_vram_cache_capacity",
+            "Current MoE VRAM cache capacity",
+            (double) metrics.expert_stats.vram_cache.capacity
+        },
+        {
+            "moe_vram_cache_pool_bytes",
+            "Current MoE VRAM cache pool bytes",
+            (double) metrics.expert_stats.vram_cache.pool_bytes
+        },
+        {
+            "moe_vram_cache_budget_bytes",
+            "Current MoE VRAM cache budget bytes",
+            (double) metrics.expert_stats.vram_cache.budget_bytes
+        },
+    };
+
     std::stringstream prometheus;
 
     auto add_items = [&prometheus](const char * type, const std::vector<metric_item> & items) {
@@ -1623,6 +1711,171 @@ std::string server_task_result_metrics::to_metrics() {
 
     add_items("counter", counters);
     add_items("gauge",   gauges);
+    add_items("gauge",   expert_state);
+
+    const auto & expert = metrics.expert_stats;
+    if (expert.dio_active) {
+        const std::vector<metric_item> expert_counters = {
+            {
+                "moe_routed_experts_total",
+                "Total routed expert selections observed during decode",
+                (double) expert.routed_experts
+            },
+            {
+                "moe_decode_tokens_total",
+                "Single-token decode ubatches observed by the expert system",
+                (double) expert.decode_tokens
+            },
+            {
+                "moe_experts_seen_total",
+                "Distinct expert identities seen by the expert system",
+                (double) expert.experts_seen
+            },
+            {
+                "moe_decode_cache_hits_total",
+                "DIO decode routes that found filled RAM cache data",
+                (double) expert.decode_cache.route_hits
+            },
+            {
+                "moe_decode_cache_misses_total",
+                "DIO decode routes that did not find filled RAM cache data",
+                (double) expert.decode_cache.route_misses
+            },
+            {
+                "moe_decode_cache_fills_total",
+                "DIO RAM decode-cache resident fills",
+                (double) expert.decode_cache.fills
+            },
+            {
+                "moe_decode_cache_resident_changes_total",
+                "DIO RAM decode-cache resident membership changes",
+                (double) expert.decode_cache.resident_changes
+            },
+            {
+                "moe_decode_cache_assigned_routes_total",
+                "DIO routes that found an assigned RAM cache slot",
+                (double) expert.decode_cache.assigned_routes
+            },
+            {
+                "moe_decode_cache_unassigned_routes_total",
+                "DIO routes that found no assigned RAM cache slot",
+                (double) expert.decode_cache.unassigned_routes
+            },
+            {
+                "moe_decode_cache_base_routes_total",
+                "DIO routes whose expert belongs to the base set",
+                (double) expert.decode_cache.base_routes
+            },
+            {
+                "moe_decode_cache_base_experts_used_total",
+                "Base experts that have been routed at least once",
+                (double) expert.decode_cache.base_experts_used
+            },
+        };
+        add_items("counter", expert_counters);
+
+        if (expert.disk_l2.enabled) {
+            const std::vector<metric_item> l2_counters = {
+                {
+                    "moe_disk_l2_hits_total",
+                    "All DIO disk-stage L2 lookup hits",
+                    (double) expert.disk_l2.hits
+                },
+                {
+                    "moe_disk_l2_misses_total",
+                    "All DIO disk-stage L2 lookup misses",
+                    (double) expert.disk_l2.misses
+                },
+                {
+                    "moe_disk_l2_cold_lookups_total",
+                    "DIO disk-stage L2 lookups before RAM cache warm-up completed",
+                    (double) expert.disk_l2.cold_lookups
+                },
+                {
+                    "moe_disk_l2_hit_bytes_total",
+                    "Bytes served by transient DIO disk-stage L2 hits",
+                    (double) expert.disk_l2.hit_bytes
+                },
+                {
+                    "moe_disk_l2_promotions_total",
+                    "DIO RAM cache fills served by the disk-stage L2 pool",
+                    (double) expert.disk_l2.promotions
+                },
+                {
+                    "moe_disk_l2_promotion_bytes_total",
+                    "Bytes copied from the DIO disk-stage L2 pool into RAM cache slots",
+                    (double) expert.disk_l2.promotion_bytes
+                },
+                {
+                    "moe_disk_l2_evictions_total",
+                    "Entries evicted from the DIO disk-stage L2 pool",
+                    (double) expert.disk_l2.evictions
+                },
+                {
+                    "moe_disk_l2_demotions_total",
+                    "RAM cache entries copied into the DIO disk-stage L2 pool",
+                    (double) expert.disk_l2.demotions
+                },
+                {
+                    "moe_disk_decode_fill_calls_total",
+                    "DIO decode-cache fill calls",
+                    (double) expert.disk_l2.decode_fill_calls
+                },
+                {
+                    "moe_disk_decode_fill_bytes_total",
+                    "Direct-read bytes submitted by DIO decode-cache fills",
+                    (double) expert.disk_l2.decode_fill_bytes
+                },
+                {
+                    "moe_disk_decode_fill_microseconds_total",
+                    "Cumulative blocking time in DIO decode-cache fills",
+                    (double) expert.disk_l2.decode_fill_microseconds
+                },
+            };
+            add_items("counter", l2_counters);
+        }
+    }
+
+    if (expert.vram_cache.enabled) {
+        const std::vector<metric_item> vram_counters = {
+            {
+                "moe_vram_cache_route_hits_total",
+                "Expert selections served from the MoE VRAM cache",
+                (double) expert.vram_cache.route_hits
+            },
+            {
+                "moe_vram_cache_route_misses_total",
+                "Host-path selections while the MoE VRAM cache was active",
+                (double) expert.vram_cache.route_misses
+            },
+            {
+                "moe_vram_cache_resident_changes_total",
+                "MoE VRAM cache resident membership changes",
+                (double) expert.vram_cache.resident_changes
+            },
+            {
+                "moe_vram_cache_uploads_queued_total",
+                "Expert uploads queued to the MoE VRAM cache worker",
+                (double) expert.vram_cache.uploads_queued
+            },
+            {
+                "moe_vram_cache_uploads_succeeded_total",
+                "Expert uploads published successfully by the MoE VRAM cache",
+                (double) expert.vram_cache.uploads_succeeded
+            },
+            {
+                "moe_vram_cache_uploads_failed_total",
+                "Expert uploads that failed in the MoE VRAM cache",
+                (double) expert.vram_cache.uploads_failed
+            },
+            {
+                "moe_vram_cache_rebalances_total",
+                "MoE VRAM cache rebalances",
+                (double) expert.vram_cache.rebalances
+            },
+        };
+        add_items("counter", vram_counters);
+    }
 
     // labeled counter: one time series per draft position
     if (!metrics.n_accepted_per_pos.empty()) {

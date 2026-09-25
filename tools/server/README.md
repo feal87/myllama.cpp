@@ -1147,6 +1147,59 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 | `llamacpp:spec_decode_num_drafts_total` | Counter | Total speculative decoding verification steps (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_accepted_tokens_per_pos_total` | Counter | Accepted tokens per draft position (labeled `position="N"`; absent when spec-decode is off or before the first completed speculative request). |
 
+#### MoE DIO cache metrics
+
+These metrics are for the direct-I/O MoE path (`--load-mode dio` on supported systems). The state gauges are always present. Detailed counters are emitted when the corresponding cache tier is active. Counters are cumulative for the lifetime of the `llama-server` process, including context reloads.
+
+| Metric | Type | Description |
+| ------ | ---------------------- | ----------- |
+| `llamacpp:moe_dio_active` | Gauge | Whether the direct-I/O MoE disk stage is active. |
+| `llamacpp:moe_decode_cache_enabled` | Gauge | Whether the RAM decode cache is enabled. |
+| `llamacpp:moe_decode_cache_active` | Gauge | Whether the RAM decode cache is active. |
+| `llamacpp:moe_decode_cache_residents` | Gauge | Current RAM decode-cache residents. |
+| `llamacpp:moe_decode_cache_capacity` | Gauge | Current RAM decode-cache capacity. |
+| `llamacpp:moe_decode_cache_resident_bytes` | Gauge | Current resident bytes in the RAM decode cache. |
+| `llamacpp:moe_decode_cache_locked_bytes` | Gauge | Bytes locked for the RAM decode cache. |
+| `llamacpp:moe_disk_l2_enabled` | Gauge | Whether the disk-stage L2 eviction pool is enabled. |
+| `llamacpp:moe_disk_l2_warm` | Gauge | Whether the RAM decode cache has reached full residency. |
+| `llamacpp:moe_disk_l2_entries` | Gauge | Current entries in the disk-stage L2 pool. |
+| `llamacpp:moe_disk_l2_capacity` | Gauge | Current capacity of the disk-stage L2 pool. |
+| `llamacpp:moe_vram_cache_enabled` | Gauge | Whether the VRAM MoE cache is enabled. |
+| `llamacpp:moe_vram_cache_active` | Gauge | Whether the VRAM MoE cache has an active layout. |
+| `llamacpp:moe_vram_cache_residents` | Gauge | Current VRAM MoE-cache residents. |
+| `llamacpp:moe_vram_cache_capacity` | Gauge | Current VRAM MoE-cache capacity. |
+| `llamacpp:moe_vram_cache_pool_bytes` | Gauge | Current VRAM MoE-cache pool size. |
+| `llamacpp:moe_vram_cache_budget_bytes` | Gauge | Current VRAM MoE-cache budget. |
+| `llamacpp:moe_routed_experts_total` | Counter | Routed expert selections observed during decode. |
+| `llamacpp:moe_decode_tokens_total` | Counter | Single-token decode ubatches observed by the expert system. |
+| `llamacpp:moe_experts_seen_total` | Counter | Distinct expert identities seen. |
+| `llamacpp:moe_decode_cache_hits_total` | Counter | Decode routes that found filled RAM-cache data. |
+| `llamacpp:moe_decode_cache_misses_total` | Counter | Decode routes that did not find filled RAM-cache data. |
+| `llamacpp:moe_decode_cache_fills_total` | Counter | RAM decode-cache resident fills. |
+| `llamacpp:moe_decode_cache_resident_changes_total` | Counter | RAM decode-cache resident membership changes. |
+| `llamacpp:moe_decode_cache_assigned_routes_total` | Counter | Decode routes that found an assigned RAM-cache slot. |
+| `llamacpp:moe_decode_cache_unassigned_routes_total` | Counter | Decode routes that found no assigned RAM-cache slot. |
+| `llamacpp:moe_decode_cache_base_routes_total` | Counter | Decode routes whose expert belongs to the base set. |
+| `llamacpp:moe_decode_cache_base_experts_used_total` | Counter | Base experts that have been routed at least once. |
+| `llamacpp:moe_disk_l2_hits_total` | Counter | All disk-stage L2 lookup hits. |
+| `llamacpp:moe_disk_l2_misses_total` | Counter | All disk-stage L2 lookup misses. |
+| `llamacpp:moe_disk_l2_cold_lookups_total` | Counter | L2 lookups before RAM-cache warm-up completed. |
+| `llamacpp:moe_disk_l2_hit_bytes_total` | Counter | Bytes served by transient L2 hits. |
+| `llamacpp:moe_disk_l2_promotions_total` | Counter | RAM-cache fills served by the L2 pool. |
+| `llamacpp:moe_disk_l2_promotion_bytes_total` | Counter | Bytes copied from L2 into RAM-cache slots. |
+| `llamacpp:moe_disk_l2_evictions_total` | Counter | Entries evicted from the L2 pool. |
+| `llamacpp:moe_disk_l2_demotions_total` | Counter | RAM-cache entries copied into the L2 pool. |
+| `llamacpp:moe_disk_decode_fill_calls_total` | Counter | Decode-cache fill calls. |
+| `llamacpp:moe_disk_decode_fill_bytes_total` | Counter | Direct-read bytes submitted by decode fills. |
+| `llamacpp:moe_disk_decode_fill_microseconds_total` | Counter | Blocking time spent in decode-cache fills. |
+| `llamacpp:moe_vram_cache_route_hits_total` | Counter | Expert selections served from the VRAM cache. |
+| `llamacpp:moe_vram_cache_route_misses_total` | Counter | Host-path selections while the VRAM cache was active. |
+| `llamacpp:moe_vram_cache_resident_changes_total` | Counter | VRAM-cache resident membership changes. |
+| `llamacpp:moe_vram_cache_uploads_queued_total` | Counter | Expert uploads queued to the VRAM worker. |
+| `llamacpp:moe_vram_cache_uploads_succeeded_total` | Counter | Expert uploads published successfully. |
+| `llamacpp:moe_vram_cache_uploads_failed_total` | Counter | Failed expert uploads. |
+| `llamacpp:moe_vram_cache_rebalances_total` | Counter | VRAM-cache rebalances. |
+
 ### POST `/slots/{id_slot}?action=save`: Save the prompt cache of the specified slot to a file.
 
 *Options:*

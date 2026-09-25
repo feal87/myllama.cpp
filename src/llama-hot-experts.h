@@ -69,6 +69,7 @@
 
 #include "ggml-backend.h"
 #include "ggml.h"
+#include "llama-ext.h"
 #include "llama-mmap.h"
 
 #include <condition_variable>
@@ -201,6 +202,9 @@ class llama_hot_expert_cache {
     void vram_stats_snapshot(std::vector<uint64_t> & vram_hit,
                              std::vector<uint64_t> & vram_miss,
                              uint64_t & route_hit, uint64_t & route_miss) const;
+
+    // Aggregate counters and current state for the server metrics exporter.
+    void stats_snapshot(llama_expert_stats & out) const;
 
     // an expert just became VRAM-resident: drop its RAM mlock (the VRAM copy
     // serves it; the mlock would only waste a RAM slot for a deeper expert)
