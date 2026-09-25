@@ -415,6 +415,10 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
         cur = build_hc_pre(inpL, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, &post, &comb, il);
         cb(cur, "hc_ffn_pre", il);
 
+        ggml_build_forward_expand(gf, residual);
+        ggml_build_forward_expand(gf, post);
+        ggml_build_forward_expand(gf, comb);
+
         cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
@@ -426,6 +430,19 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
                     nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
         } else {
+            // build the shared expert inside build_moe_ffn so it is emitted
+            // between the host expert chain and the VRAM cache chain: the GPU
+            // can launch it while the host experts (and their disk reads) run
+            llm_graph_build_shexp_fn build_shexp = [this, il](ggml_tensor * inp) -> ggml_tensor * {
+                ggml_tensor * ffn_shexp = build_ffn(inp,
+                        this->model.layers[il].ffn_up_shexp,   nullptr, nullptr,
+                        this->model.layers[il].ffn_gate_shexp, nullptr, nullptr,
+                        this->model.layers[il].ffn_down_shexp, nullptr, nullptr,
+                        nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+                cb(ffn_shexp, "ffn_shexp", il);
+                return ffn_shexp;
+            };
+
             ggml_tensor * moe_out = build_moe_ffn(cur,
                     layer.ffn_gate_inp,
                     layer.ffn_up_exps,
@@ -436,23 +453,15 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
                     LLM_FFN_SILU, hparams.expert_weights_norm,
                     hparams.expert_weights_scale,
                     (llama_expert_gating_func_type) hparams.expert_gating_func,
-                    il);
-            cb(moe_out, "ffn_moe_out", il);
-
-            ggml_tensor * ffn_shexp = build_ffn(cur,
-                    layer.ffn_up_shexp,   nullptr, nullptr,
-                    layer.ffn_gate_shexp, nullptr, nullptr,
-                    layer.ffn_down_shexp, nullptr, nullptr,
-                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
-            cb(ffn_shexp, "ffn_shexp", il);
-
-            cur = ggml_add(ctx0, moe_out, ffn_shexp);
+                    il,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, build_shexp);
+            cur = moe_out;
             cb(cur, "ffn_out", il);
         }
 
         inpL = build_hc_post(cur, residual, post, comb, il);
         inpL = build_cvec(inpL, il);
-        cb(inpL, "l_out", il);
+        cb(inpL, "l_last", il);
     }
 
     // narrow to the output tokens, then collapse the streams
