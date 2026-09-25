@@ -2987,6 +2987,7 @@ llm_graph_params llama_context::graph_params(
         /*.moe_cache   =*/ (moe_cache && moe_cache->is_active()) ? moe_cache.get() : nullptr,
         /*.disk_stage  =*/ disk_stage.get(),
         /*.moe_cache_gen =*/ (moe_cache && moe_cache->is_active()) ? moe_cache->layout_generation() : 0,
+        /*.prec_policy =*/ &model.prec_policy,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),

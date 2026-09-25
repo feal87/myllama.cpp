@@ -19,6 +19,7 @@ struct ggml_tensor;
 
 struct llama_cparams;
 struct llama_layer;
+struct llama_prec_policy;
 
 struct llama_memory_context_i;
 
@@ -796,6 +797,8 @@ struct llm_graph_params {
     // pointer itself is unchanged
     uint32_t moe_cache_gen = 0;
 
+    const llama_prec_policy * prec_policy = nullptr;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -1048,6 +1051,8 @@ struct llm_graph_context {
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache = nullptr; // GPU MoE expert cache (null when disabled)
     const llama_disk_stage       * disk_stage = nullptr; // direct-read staging of MoE experts (null when disabled)
+
+    const llama_prec_policy * prec_policy;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
