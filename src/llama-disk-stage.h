@@ -111,14 +111,14 @@ public:
 
     // split-hot variant: fill_cache_begin() sets the tables and hands the disk
     // batch to a worker, then returns so the hot pass computes; fill_cache_wait()
-    // joins the worker. Only used when split_hot() is on, i.e. Windows +
-    // LLAMA_DISK_STAGE_SPLIT_HOT=1. The cache then carries two static skip
-    // tables that split its resident slots from the transient ones, so the
-    // decoder can run the hot (resident) experts and the cold (disk) experts as
-    // two host passes: the disk read overlaps the hot compute. A promoted but
-    // unread resident is served from the L2 pool into its slot, or, on an L2
-    // miss, from a transient slot, so no read ever targets a slot the hot pass
-    // reads concurrently.
+    // waits for the read phase, which the cold pass needs. Only used when
+    // split_hot() is on, i.e. Windows + LLAMA_DISK_STAGE_SPLIT_HOT=1. The cache
+    // then carries two static skip tables that split its resident slots from the
+    // transient ones, so the decoder can run the hot (resident) experts and the
+    // cold (disk) experts as two host passes: the disk read overlaps the hot
+    // compute. The worker keeps storing the transient slots into the L2 pool
+    // while the cold pass computes, and the next fill drains it before the
+    // window is reused.
     void fill_cache_begin(int il, const int32_t * ids, int64_t n_ids);
     void fill_cache_wait(int il);
 
@@ -242,8 +242,12 @@ private:
     // the miss copies. false when the layer has no cache or no routed ids
     bool fill_cache_plan(int il, const int32_t * ids, int64_t n_ids);
 
+    // wait out the decode I/O worker and publish the L2 slots its stores
+    // filled, so the next plan can hit them. Also called before a prefill
+    // clobbers the staging slabs the L2 pool lives on
+    void dec_io_drain();
+
     // split-hot trace hooks, called from the node-prepare callback
-    void split_drain();     // wait out a batch whose wait never ran
     void split_cold_end();  // the cold pass of the pending layer computed
     void split_report();    // print and account the pending layer
 };

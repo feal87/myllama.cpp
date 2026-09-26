@@ -336,8 +336,9 @@ struct llama_disk_stage::impl {
 
     // second-level (L2) expert pool. During decode the two prefill staging
     // slabs are idle, so they hold the experts the resident cache missed. A miss
-    // is read into a pool slot and copied to the transient slot the graph
-    // executes from; a later hit copies from the pool instead of reading the
+    // is read straight into the transient slot the graph executes from and the
+    // worker stores that slot into the pool while the layer computes; a later
+    // hit copies from the pool into the transient slot instead of reading the
     // disk. One pool per expert-bundle type on one staging slab (a slot stride
     // is fixed per tensor); spare slabs split a type's layers, so every idle
     // slab holds slots even for a model with a single layout.
@@ -393,32 +394,47 @@ struct llama_disk_stage::impl {
     };
     std::vector<disk_stage_job>          fs_jobs;
     std::vector<int32_t>                 fs_newly_filled;
-    std::vector<pool_copy>               fs_copies;       // copies independent of the disk batch
-    std::vector<pool_copy>               fs_copies_after; // miss copies, run after the disk batch
+    std::vector<pool_copy>               fs_copies;       // L2 hit -> transient, independent of the disk batch
+    std::vector<pool_copy>               fs_copies_pre;   // L2 hit -> resident, before the disk batch
+    std::vector<pool_copy>               fs_stores;       // transient -> L2, after the disk batch
+    std::vector<pool_copy>               fs_res_fills;    // transient -> resident, after the disk batch
     std::vector<std::pair<int, int64_t>> fs_l2_consume;
+    // L2 slots the worker's stores will fill, and residents they will fill: only
+    // published once the bytes have landed
+    struct l2_pending  { int pid; int64_t key; int32_t slot; };
+    struct res_pending { int il; int32_t id; };
+    std::vector<l2_pending>              fs_l2_pending;
+    std::vector<res_pending>             fs_res_pending;
 
-    // split-hot decode: fill_cache_begin() hands the layer's disk batch to this
-    // worker and returns so the hot pass computes; fill_cache_wait() joins it.
-    // One batch in flight, since layers are sequential
+    // decode I/O worker: the decode fill reads the disk straight into the
+    // transient slot the graph computes from, then stores that slot into the L2
+    // pool (and a promoted resident slot) on the worker while the layer
+    // computes. fill_cache()/fill_cache_wait() wait only for the read phase; the
+    // next plan drains the stores. One batch in flight, since layers are
+    // sequential
     bool split_hot_active = false;
     std::thread             dec_io;
     std::mutex              dec_io_mu;
     std::condition_variable dec_io_cv;
     std::condition_variable dec_io_done_cv;
-    bool                    dec_io_ready   = false; // begin() handed a batch over
-    bool                    dec_io_running = false; // worker is running it
-    bool                    dec_io_stop    = false;
-    bool                    dec_io_error   = false;
+    std::condition_variable dec_io_reads_cv;
+    bool                    dec_io_active     = false; // worker started
+    bool                    dec_io_ready      = false; // a batch was handed over
+    bool                    dec_io_running    = false; // worker is running it
+    bool                    dec_io_reads_done = false; // the read phase is over
+    bool                    dec_io_stop       = false;
+    bool                    dec_io_error      = false;
     // the decode reads run on their own completion port, so a batch never
     // queues behind the prefetch reader on io_mu
     std::mutex dec_io_disk_mu;
-    // one batch handed to the worker: the reads plus the copies that only write
-    // transient slots, which the hot pass skips and can therefore overlap
+    // one batch handed to the worker. The copies write transient slots the hot
+    // pass skips and overlap the reads; the stores run after the reads, since
+    // they read the bytes the reads just landed
     struct dec_batch {
         std::vector<disk_stage_job> jobs;
-        std::vector<pool_copy>     copies;       // L2 hit -> transient slot, before the reads
-        std::vector<pool_copy>     copies_after; // L2 miss -> transient slot, after the reads
-        std::vector<pool_copy>     copies_pre;   // L2 hit -> resident slot, run inline in begin()
+        std::vector<pool_copy>     copies;     // L2 hit -> transient slot, before the reads
+        std::vector<pool_copy>     stores;     // transient slot -> L2 slot, after the reads
+        std::vector<pool_copy>     res_fills;  // transient slot -> resident slot, after the reads
     };
     dec_batch dec_io_batch;
     // begin()/wait() handoff state, compute thread only
@@ -437,7 +453,7 @@ struct llama_disk_stage::impl {
         int64_t t_plan  = 0; // the tables and the disk batch are planned
         int64_t t_hot   = 0; // the batch is with the worker, the hot pass starts
         int64_t t_cold  = 0; // the cold split was reached, the read must be done
-        int64_t t_join  = 0; // the worker joined and its copies landed
+        int64_t t_join  = 0; // the read landed; the worker may still be storing
         int64_t rd0     = 0; // worker entered the read
         int64_t rd1     = 0; // worker left it, 0 when the batch had no read
         bool    started = false;
@@ -514,17 +530,21 @@ struct llama_disk_stage::impl {
         }
     }
 
-    // a free slot, or the probation LRU's slot. Probation is non-empty whenever
-    // the cache is full and the free list is empty
+    // a free slot, or the probation LRU's slot; protected is the fallback when
+    // probation is empty. -1 when every slot is reserved by a pending store
     int32_t evict_take_slot(evict_pool & ep) {
         if (!ep.free_slots.empty()) {
             const int32_t s = ep.free_slots.back();
             ep.free_slots.pop_back();
             return s;
         }
-        const int64_t key = ep.prob.back();
+        std::list<int64_t> & l = !ep.prob.empty() ? ep.prob : ep.prot;
+        if (l.empty()) {
+            return -1; // every slot is reserved by a pending store
+        }
+        const int64_t key = l.back();
         const int32_t slot = ep.slot_of.at(key);
-        ep.prob.pop_back();
+        l.pop_back();
         ep.slot_of.erase(key);
         ep.slot_key[(size_t) slot] = -1;
         n_l2_evictions++;
@@ -552,22 +572,30 @@ struct llama_disk_stage::impl {
         return slot;
     }
 
-    // a miss: insert into probation
-    int32_t evict_alloc(int pool, int64_t key) {
-        evict_pool & ep = evict_pools[(size_t) pool];
-        const int32_t slot = evict_take_slot(ep);
-        evict_push(ep, key, slot, 0);
-        evict_trim(ep);
-        return slot;
-    }
-
     // a demotion (recently resident expert): insert into protected
     int32_t evict_alloc_prot(int pool, int64_t key) {
         evict_pool & ep = evict_pools[(size_t) pool];
         const int32_t slot = evict_take_slot(ep);
+        if (slot < 0) {
+            return -1;
+        }
         evict_push(ep, key, slot, 1);
         evict_trim(ep);
         return slot;
+    }
+
+    // reserve a slot for an expert the worker will store into: the slot leaves
+    // the free list but is not published, so no hit can read it and no eviction
+    // can reuse it before the store lands. -1 when the pool has no slot to spare
+    int32_t evict_reserve(int pool) {
+        return evict_take_slot(evict_pools[(size_t) pool]);
+    }
+
+    // publish a reserved slot once its store has landed
+    void evict_finalize(int pool, int64_t key, int32_t slot) {
+        evict_pool & ep = evict_pools[(size_t) pool];
+        evict_push(ep, key, slot, 0);
+        evict_trim(ep);
     }
 
     int32_t evict_put(int pool, int64_t key) {
@@ -955,12 +983,12 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
         return;
     }
 
-    if (p.split_hot_active) {
-        p.iocp_dec = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
-        if (p.iocp_dec == nullptr) {
-            LLAMA_LOG_WARN("%s: failed to create the decode I/O completion port, split-hot disabled\n", __func__);
-            p.split_hot_active = false;
-        }
+    // the decode worker reads on its own completion port, so its reads never
+    // queue behind the prefill reader on io_mu
+    p.iocp_dec = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
+    if (p.iocp_dec == nullptr) {
+        LLAMA_LOG_WARN("%s: failed to create the decode I/O completion port, the decode fill runs inline\n", __func__);
+        p.split_hot_active = false;
     }
 
     // stages the separate gate/up/down layout only
@@ -1774,7 +1802,8 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
         });
     }
 
-    if (p.split_hot_active) {
+    if (p.iocp_dec != nullptr && !p.cache.empty()) {
+        p.dec_io_active = true;
         p.dec_io = std::thread([&p]() {
             for (;;) {
                 impl::dec_batch batch;
@@ -1785,16 +1814,30 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                         return;
                     }
                     batch = std::move(p.dec_io_batch);
-                    p.dec_io_ready   = false;
-                    p.dec_io_running = true;
+                    p.dec_io_ready      = false;
+                    p.dec_io_running    = true;
+                    p.dec_io_reads_done = false;
                 }
 
                 bool err = false;
+                // the hit copies land in transient slots the hot pass skips, so
+                // they run on a helper while the drive is busy
+                std::thread copier;
                 try {
-                    // these land in transient slots, which the hot pass skips, so
-                    // they overlap both the read below and the hot compute
+                    size_t copy_bytes = 0;
                     for (const impl::pool_copy & cp : batch.copies) {
-                        std::memcpy(cp.dst, cp.src, cp.len);
+                        copy_bytes += cp.len;
+                    }
+                    if (copy_bytes >= disk_stage_copy_thread_min) {
+                        try {
+                            copier = std::thread([&batch]() {
+                                for (const impl::pool_copy & cp : batch.copies) {
+                                    std::memcpy(cp.dst, cp.src, cp.len);
+                                }
+                            });
+                        } catch (...) {
+                            // no thread: the copies run inline below
+                        }
                     }
                     if (!batch.jobs.empty()) {
                         std::lock_guard<std::mutex> io(p.dec_io_disk_mu);
@@ -1802,23 +1845,47 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                         disk_stage_run_jobs(batch.jobs, 32, p.iocp_dec);
                         p.trace_split.rd1 = ggml_time_us();
                     }
-                    // a miss reads into the L2 pool, so this needs the read done
-                    for (const impl::pool_copy & cp : batch.copies_after) {
-                        std::memcpy(cp.dst, cp.src, cp.len);
-                    }
                 } catch (...) {
                     err = true;
+                }
+                // join before the batch's descriptors go away, even on a read
+                // failure, so a stray helper cannot write the next batch's slots
+                if (copier.joinable()) {
+                    copier.join();
+                } else {
+                    for (const impl::pool_copy & cp : batch.copies) {
+                        std::memcpy(cp.dst, cp.src, cp.len);
+                    }
+                }
+
+                // the read phase is over: the graph may compute the transient
+                // slots while the stores keep filling the L2 pool. The next fill
+                // drains them before it reuses the window
+                {
+                    std::lock_guard<std::mutex> lk(p.dec_io_mu);
+                    p.dec_io_error      = err;
+                    p.dec_io_reads_done = true;
+                }
+                p.dec_io_reads_cv.notify_all();
+
+                if (!err) {
+                    for (const impl::pool_copy & cp : batch.stores) {
+                        std::memcpy(cp.dst, cp.src, cp.len);
+                    }
+                    for (const impl::pool_copy & cp : batch.res_fills) {
+                        std::memcpy(cp.dst, cp.src, cp.len);
+                    }
                 }
 
                 {
                     std::lock_guard<std::mutex> lk(p.dec_io_mu);
-                    p.dec_io_error   = err;
                     p.dec_io_running = false;
                 }
                 p.dec_io_done_cv.notify_all();
             }
         });
-        LLAMA_LOG_INFO("%s: split-hot decode enabled, separate read queue\n", __func__);
+        LLAMA_LOG_INFO("%s: decode I/O worker enabled, separate read queue, split-hot %s\n",
+                       __func__, p.split_hot_active ? "on" : "off");
     }
 
     p.active = true;
@@ -1988,6 +2055,8 @@ llama_disk_stage::~llama_disk_stage() {
             pimpl->dec_io_stop = true;
         }
         pimpl->dec_io_cv.notify_all();
+        pimpl->dec_io_done_cv.notify_all();
+        pimpl->dec_io_reads_cv.notify_all();
         if (pimpl->dec_io.joinable()) {
             pimpl->dec_io.join();
         }
@@ -2050,6 +2119,9 @@ void llama_disk_stage::fill(int il) {
 
 #if defined(_WIN32)
     if (p.evict_populated) {
+        // the staging slabs hold the L2 pool, so wait out any decode store still
+        // writing them before the prefill clears the pool
+        dec_io_drain();
         std::lock_guard<std::mutex> lock(p.cache_mu);
         p.evict_clear();
         p.evict_populated = false;
@@ -2324,6 +2396,7 @@ void llama_disk_stage::fill_selected(int il, const int32_t * ids, int64_t n_ids)
 
     // a prefill clobbers the L2 pool decode reuses the staging slabs for
     if (p.evict_populated) {
+        dec_io_drain();
         std::lock_guard<std::mutex> lock(p.cache_mu);
         p.evict_clear();
         p.evict_populated = false;
@@ -2354,23 +2427,32 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
     std::vector<disk_stage_job> & jobs            = p.fs_jobs;
     std::vector<int32_t>        & newly_filled    = p.fs_newly_filled;
     std::vector<impl::pool_copy>& copies          = p.fs_copies;
-    std::vector<impl::pool_copy>& copies_after    = p.fs_copies_after;
+    std::vector<impl::pool_copy>& copies_pre      = p.fs_copies_pre;
+    std::vector<impl::pool_copy>& stores          = p.fs_stores;
+    std::vector<impl::pool_copy>& res_fills       = p.fs_res_fills;
+    std::vector<impl::l2_pending>  & l2_pending   = p.fs_l2_pending;
+    std::vector<impl::res_pending> & res_pending  = p.fs_res_pending;
     std::vector<std::pair<int, int64_t>> & l2_consume = p.fs_l2_consume;
     jobs.clear();
     newly_filled.clear();
     copies.clear();
-    copies_after.clear();
+    copies_pre.clear();
+    stores.clear();
+    res_fills.clear();
+    l2_pending.clear();
+    res_pending.clear();
     l2_consume.clear();
 
     const std::vector<impl::region> & regions = p.layer_regions[il];
     const int epid = p.evict_pool_for(il);
 
-    // the split hands its batch to the worker, which owns the decode read queue
+    // the decode worker owns its own read queue, so it reads through the decode
+    // handle when one exists
     const auto job_handle = [&p](const impl::region & r) {
         if (r.file == nullptr) {
             return INVALID_HANDLE_VALUE;
         }
-        return p.split_hot_active ? r.file->h_dec : r.file->h;
+        return r.file->h_dec != INVALID_HANDLE_VALUE ? r.file->h_dec : r.file->h;
     };
 
     // per-expert aligned read length per role (region.read_len is the whole-slab
@@ -2381,6 +2463,21 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
             expert_read_len[r] = align_up(regions[r].head + regions[r].stride, disk_stage_align);
         }
     }
+
+    // read the rows of expert id into transient slot use: source starts `head`
+    // bytes before the expert data so the aligned read lands the row where the
+    // tensor expects it, and the length is rounded up to the sector size the
+    // unbuffered read requires (the extra bytes fall in the per-tensor slack)
+    const auto read_to_transient = [&](int32_t id, int32_t use) {
+        for (int r = 0; r < 3; ++r) {
+            const impl::region & sr = regions[r];
+            if (sr.file == nullptr || sr.stride == 0) {
+                continue;
+            }
+            char * dst = pool.data[r] + (size_t) use * pool.slot_stride[r] - sr.head;
+            jobs.push_back({ job_handle(sr), dst, sr.file_off + (size_t) id * sr.stride, expert_read_len[r] });
+        }
+    };
 
     // the pool keeps one transient window: only the layer being computed holds
     // routed-but-not-resident experts
@@ -2413,8 +2510,7 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
             }
 
             // a resident slot is only valid once this expert's bytes have been
-            // read into it; that first read happens here, in the same batch as
-            // the transients
+            // read into it
             const int32_t slot = c.resident_slot[id];
             if (slot >= 0 && c.resident_filled[id] != 0) {
                 table[id] = slot;
@@ -2424,11 +2520,9 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
             }
 
             if (slot >= 0) {
-                // promoted but not read yet. A copy out of the L2 pool completes
-                // before the hot pass reads the slot, so it is safe. A disk read
-                // into the slot would race the hot pass, so that case falls
-                // through to the transient window and leaves the slot unfilled
-                // for the next route to fill.
+                // promoted but not read yet. The L2 pool may already hold the
+                // bytes: copy them into the resident slot the hot pass reads, so
+                // that copy runs before the batch is handed over.
                 const int64_t key = ((int64_t) il << 32) | (uint32_t) id;
                 const int32_t eslot = epid >= 0 ? p.evict_touch(epid, key) : -1;
                 if (eslot >= 0) {
@@ -2436,17 +2530,15 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                     p.trace_n_res++;
                     p.n_decode_cache_misses++;
                     p.n_decode_cache_fills++;
-                    if (epid >= 0) {
-                        p.n_l2_all_hits++;
-                    }
+                    p.n_l2_all_hits++;
                     impl::evict_pool & ep = p.evict_pools[(size_t) epid];
                     for (int r = 0; r < 3; ++r) {
                         const size_t len = regions[r].stride;
                         if (len == 0) {
                             continue;
                         }
-                        copies.push_back({ ep.data[r] + (size_t) eslot * ep.stride[r],
-                                           pool.data[r] + (size_t) slot * pool.slot_stride[r], len, true });
+                        copies_pre.push_back({ ep.data[r] + (size_t) eslot * ep.stride[r],
+                                               pool.data[r] + (size_t) slot * pool.slot_stride[r], len, true });
                         p.n_l2_promo_bytes += len;
                     }
                     p.n_l2_promotions++;
@@ -2455,94 +2547,100 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                     newly_filled.push_back(id);
                     continue;
                 }
+
+                // no L2 entry: read straight into a transient slot, then fill
+                // the resident slot from it on the worker. The hot pass skips
+                // this id (its table entry is the transient), so the resident is
+                // not read until the next route, after the store has landed
+                if (transient >= trans_end) {
+                    transient = trans_begin;
+                }
+                const int32_t use = transient++;
+                p.trace_n_cold++;
+                p.n_decode_cache_misses++;
+                read_to_transient(id, use);
+                for (int r = 0; r < 3; ++r) {
+                    const size_t len = regions[r].stride;
+                    if (len == 0) {
+                        continue;
+                    }
+                    res_fills.push_back({ pool.data[r] + (size_t) use * pool.slot_stride[r],
+                                          pool.data[r] + (size_t) slot * pool.slot_stride[r], len, true });
+                }
+                res_pending.push_back({ il, id });
+                table[id] = use;
+                continue;
             }
 
-            // not resident: serve it from this layer's transient window. When
-            // the L2 pool holds it, copy the rows in instead of reading the
-            // disk; otherwise read the disk into a pool slot, which fills the
-            // pool, and copy from there
+            // not resident: serve it from this layer's transient window. The L2
+            // pool hit copies the rows in; a miss reads the disk straight into
+            // the transient slot the graph computes from and queues the store
+            // into the pool for the worker to run while the layer computes.
             if (transient >= trans_end) {
                 transient = trans_begin;
             }
             const int32_t use = transient++;
             p.trace_n_cold++;
             p.n_decode_cache_misses++;
+            table[id] = use;
 
             if (epid >= 0) {
                 impl::evict_pool & ep = p.evict_pools[(size_t) epid];
                 const int64_t      key = ((int64_t) il << 32) | (uint32_t) id;
                 const int32_t      hit = p.evict_touch(epid, key);
-                const int32_t      eslot = hit >= 0 ? hit : p.evict_alloc(epid, key);
-
-                p.evict_populated = true;
-                // the cold prefix is the RAM tier fill: a promoted expert is
-                // served from residence next time, so those lookups cannot hit
-                const bool l2_warm = p.l2_warm;
-                if (hit < 0) {
-                    p.n_l2_all_misses++;
-                    if (l2_warm) {
-                        p.n_l2_misses++;
-                        ep.misses++;
-                    } else {
-                        p.n_l2_cold++;
-                    }
-                    for (int r = 0; r < 3; ++r) {
-                        const impl::region & sr = regions[r];
-                        if (sr.file == nullptr || sr.stride == 0) {
-                            continue;
-                        }
-                        char * dst = ep.data[r] + (size_t) eslot * ep.stride[r] - sr.head;
-                        jobs.push_back({ job_handle(sr), dst, sr.file_off + (size_t) id * sr.stride,
-                                         expert_read_len[r] });
-                    }
-                } else {
+                if (hit >= 0) {
                     p.n_l2_all_hits++;
-                    if (l2_warm) {
+                    if (p.l2_warm) {
                         p.n_l2_hits++;
                         ep.hits++;
                     } else {
                         p.n_l2_cold++;
                     }
                     for (int r = 0; r < 3; ++r) {
-                        p.n_l2_hit_bytes += regions[r].stride;
+                        const size_t len = regions[r].stride;
+                        if (len == 0) {
+                            continue;
+                        }
+                        copies.push_back({ ep.data[r] + (size_t) hit * ep.stride[r],
+                                           pool.data[r] + (size_t) use * pool.slot_stride[r], len, false });
+                        p.n_l2_hit_bytes += len;
                     }
+                    continue;
                 }
 
-                // the graph reads the transient slot: copy the pool rows there. A
-                // miss must copy after the read above lands in its pool slot; a
-                // hit can copy while the drive is busy with other experts
-                std::vector<impl::pool_copy> & tc = hit < 0 ? copies_after : copies;
-                for (int r = 0; r < 3; ++r) {
-                    const size_t len = regions[r].stride;
-                    if (len == 0) {
-                        continue;
-                    }
-                    tc.push_back({ ep.data[r] + (size_t) eslot * ep.stride[r],
-                                   pool.data[r] + (size_t) use * pool.slot_stride[r], len, false });
+                // miss: reserve a pool slot, kept out of the LRU until the store
+                // below lands, and read the disk into the transient slot
+                const int32_t eslot = p.evict_reserve(epid);
+                p.n_l2_all_misses++;
+                if (p.l2_warm) {
+                    p.n_l2_misses++;
+                    ep.misses++;
+                } else {
+                    p.n_l2_cold++;
                 }
-                table[id] = use;
+                p.evict_populated = true;
+                read_to_transient(id, use);
+                if (eslot >= 0) {
+                    for (int r = 0; r < 3; ++r) {
+                        const size_t len = regions[r].stride;
+                        if (len == 0) {
+                            continue;
+                        }
+                        stores.push_back({ pool.data[r] + (size_t) use * pool.slot_stride[r],
+                                           ep.data[r] + (size_t) eslot * ep.stride[r], len, false });
+                    }
+                    l2_pending.push_back({ epid, key, eslot });
+                }
                 continue;
             }
 
-            // no L2 pool: read the expert into its slot: source starts `head`
-            // bytes before the expert data so the aligned read lands the row
-            // where the tensor expects it, and the length is rounded up to the
-            // sector size the unbuffered read requires (the extra bytes fall in
-            // the per-tensor slack)
-            for (int r = 0; r < 3; ++r) {
-                const impl::region & sr = regions[r];
-                if (sr.file == nullptr || sr.stride == 0) {
-                    continue;
-                }
-                char * dst = pool.data[r] + (size_t) use * pool.slot_stride[r] - sr.head;
-                jobs.push_back({ job_handle(sr), dst, sr.file_off + (size_t) id * sr.stride, expert_read_len[r] });
-            }
-            table[id] = use;
+            // no L2 pool: read straight into the transient slot
+            read_to_transient(id, use);
         }
     }
 
-    // the caller runs the copies: the ones flagged pre before any compute, the
-    // rest together with the disk batch
+    // fill_cache()/fill_cache_begin() run the copies and hand the disk batch to
+    // the worker; dec_io_drain() publishes the stores once they land
     return true;
 #else
     GGML_UNUSED(il);
@@ -2556,74 +2654,98 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
 #if defined(_WIN32)
     impl & p = *pimpl;
     const int64_t t0 = ggml_time_us();
+
+    // join the previous layer's L2 stores and publish their slots before the
+    // new plan reads or writes the pool
+    dec_io_drain();
+
     if (!fill_cache_plan(il, ids, n_ids)) {
         return;
     }
-    impl::cache_layer & c = p.cache[il];
     std::vector<disk_stage_job> & jobs = p.fs_jobs;
-    std::vector<impl::pool_copy>& copies = p.fs_copies;
-    std::vector<impl::pool_copy>& copies_after = p.fs_copies_after;
-    std::vector<int32_t> & newly_filled = p.fs_newly_filled;
-    std::vector<std::pair<int, int64_t>> & l2_consume = p.fs_l2_consume;
+    std::vector<impl::pool_copy>& copies_pre = p.fs_copies_pre;
+    std::vector<impl::pool_copy>& stores = p.fs_stores;
+    std::vector<impl::pool_copy>& res_fills = p.fs_res_fills;
 
-    // the copies that do not depend on the reads run on a second thread while
-    // the drive is busy (same as fill_run); the miss copies below run after the
-    // join, so they read the bytes the disk batch just landed
-    size_t copy_bytes = 0;
-    for (const impl::pool_copy & cp : copies) {
-        copy_bytes += cp.len;
+    size_t       disk_bytes = 0;
+    const size_t n_jobs     = jobs.size();
+    for (const disk_stage_job & j : jobs) {
+        disk_bytes += j.len;
     }
 
-    std::thread copier;
-    if (copy_bytes >= disk_stage_copy_thread_min) {
-        try {
-            copier = std::thread([&copies]() {
-                for (const impl::pool_copy & cp : copies) {
-                    std::memcpy(cp.dst, cp.src, cp.len);
-                }
-            });
-        } catch (...) {
-            // no thread: the copies run inline below
-        }
-    }
-
-    if (!jobs.empty()) {
-        std::lock_guard<std::mutex> io(p.io_mu);
-        disk_stage_run_jobs(jobs, 32, p.iocp);
-    }
-
-    if (copier.joinable()) {
-        copier.join();
-    } else {
-        for (const impl::pool_copy & cp : copies) {
-            std::memcpy(cp.dst, cp.src, cp.len);
-        }
-    }
-
-    for (const impl::pool_copy & cp : copies_after) {
+    // a copy into a resident slot must land before the hot pass reads it
+    for (const impl::pool_copy & cp : copies_pre) {
         std::memcpy(cp.dst, cp.src, cp.len);
     }
 
-    // resident fills that consumed an L2 entry: drop the now-redundant copy so
-    // it does not hold a slot. The entry was touched to the MRU above, so it is
-    // still present (evict_remove is a no-op otherwise)
-    if (!l2_consume.empty() || !newly_filled.empty()) {
+    // resident fills that consumed an L2 entry: drop the now-redundant copy. The
+    // entry was touched to the MRU above, so it is still present
+    if (!p.fs_l2_consume.empty() || !p.fs_newly_filled.empty()) {
         std::lock_guard<std::mutex> lock(p.cache_mu);
-        for (const auto & [e, key] : l2_consume) {
+        for (const auto & [e, key] : p.fs_l2_consume) {
             p.evict_remove(e, key);
         }
-        for (const int32_t id : newly_filled) {
-            c.resident_filled[id] = 1;
+        for (const int32_t id : p.fs_newly_filled) {
+            p.cache[il].resident_filled[id] = 1;
+        }
+    }
+
+    impl::dec_batch & batch = p.dec_io_batch;
+    batch.copies    = p.fs_copies;
+    batch.jobs      = std::move(jobs);
+    batch.stores    = stores;
+    batch.res_fills = res_fills;
+
+    if (!p.dec_io_active) {
+        // no decode completion port: run the batch inline, stores included, so
+        // the fill still works without the worker
+        for (const impl::pool_copy & cp : batch.copies) {
+            std::memcpy(cp.dst, cp.src, cp.len);
+        }
+        if (!batch.jobs.empty()) {
+            std::lock_guard<std::mutex> io(p.io_mu);
+            disk_stage_run_jobs(batch.jobs, 32, p.iocp);
+        }
+        for (const impl::pool_copy & cp : batch.stores) {
+            std::memcpy(cp.dst, cp.src, cp.len);
+        }
+        for (const impl::pool_copy & cp : batch.res_fills) {
+            std::memcpy(cp.dst, cp.src, cp.len);
+        }
+        std::lock_guard<std::mutex> lock(p.cache_mu);
+        for (const impl::l2_pending & m : p.fs_l2_pending) {
+            p.evict_finalize(m.pid, m.key, m.slot);
+        }
+        for (const impl::res_pending & m : p.fs_res_pending) {
+            p.cache[(size_t) m.il].resident_filled[(size_t) m.id] = 1;
+        }
+        p.fs_l2_pending.clear();
+        p.fs_res_pending.clear();
+    } else {
+        bool handoff = false;
+        {
+            std::lock_guard<std::mutex> lk(p.dec_io_mu);
+            p.dec_io_error      = false;
+            p.dec_io_reads_done = false;
+            handoff = !batch.jobs.empty() || !batch.copies.empty() ||
+                      !batch.stores.empty() || !batch.res_fills.empty();
+            p.dec_io_ready = handoff;
+        }
+        if (handoff) {
+            p.dec_io_cv.notify_one();
+            // wait for the read phase only: the stores that fill the L2 pool keep
+            // running while the layer computes, and the next fill drains them
+            std::unique_lock<std::mutex> lk(p.dec_io_mu);
+            p.dec_io_reads_cv.wait(lk, [&p] { return p.dec_io_reads_done; });
+            if (p.dec_io_error) {
+                throw std::runtime_error("disk stage: unbuffered read failed");
+            }
         }
     }
 
     // decode fill timing: how much of a decode step is the blocking read, and
     // (trace) the gap to the previous layer's fill, i.e. the compute in between
     const int64_t t1 = ggml_time_us();
-    size_t disk_bytes = 0;
-    for (const disk_stage_job & j : jobs) {
-        disk_bytes += j.len;
-    }
     {
         std::lock_guard<std::mutex> lock(p.cache_mu);
         p.n_dec_fill_calls++;
@@ -2658,7 +2780,7 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
         }
         LLAMA_LOG_INFO("[disk-stage] decode L%d: fill=%.2f ms jobs=%zu (%.2f MiB) res=%" PRId64 " cold=%" PRId64
                        " vram=%" PRId64 " gap=%.2f ms\n",
-                       il, fill_ms, jobs.size(), disk_bytes / (1024.0 * 1024.0),
+                       il, fill_ms, n_jobs, disk_bytes / (1024.0 * 1024.0),
                        p.trace_n_res, p.trace_n_cold, p.trace_n_vram, gap_us / 1000.0);
         p.trace_prev_il = il;
         p.trace_prev_us = t1;
@@ -2670,12 +2792,13 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
 #endif
 }
 
-// wait out a batch whose wait never ran (an aborted graph) so its slot bytes
-// are not overwritten under the worker
-void llama_disk_stage::split_drain() {
+// wait out the decode I/O worker and publish the L2 slots its stores filled, so
+// the next plan can hit them. Also called before a prefill clobbers the staging
+// slabs the L2 pool lives on
+void llama_disk_stage::dec_io_drain() {
 #if defined(_WIN32)
     impl & p = *pimpl;
-    if (p.dec_wait_il < 0) {
+    if (!p.dec_io_active) {
         return;
     }
     {
@@ -2684,6 +2807,21 @@ void llama_disk_stage::split_drain() {
     }
     p.dec_wait_il = -1;
     p.trace_split = {};
+
+    std::lock_guard<std::mutex> lock(p.cache_mu);
+    if (!p.dec_io_error) {
+        for (const impl::l2_pending & m : p.fs_l2_pending) {
+            p.evict_finalize(m.pid, m.key, m.slot);
+        }
+        for (const impl::res_pending & m : p.fs_res_pending) {
+            impl::cache_layer & c = p.cache[(size_t) m.il];
+            if (c.table != nullptr && m.id >= 0 && m.id < (int32_t) c.resident_filled.size()) {
+                c.resident_filled[(size_t) m.id] = 1;
+            }
+        }
+    }
+    p.fs_l2_pending.clear();
+    p.fs_res_pending.clear();
 #endif
 }
 
@@ -2696,7 +2834,7 @@ void llama_disk_stage::fill_cache_begin(int il, const int32_t * ids, int64_t n_i
         return;
     }
     // a batch left in flight by an aborted graph would be overwritten below
-    split_drain();
+    dec_io_drain();
     if (il < 0 || il >= (int) p.cache.size() || p.cache[il].table == nullptr || n_ids <= 0) {
         p.dec_wait_il = -1;
         return;
@@ -2715,7 +2853,9 @@ void llama_disk_stage::fill_cache_begin(int il, const int32_t * ids, int64_t n_i
     }
 
     std::vector<disk_stage_job> & jobs = p.fs_jobs;
-    std::vector<impl::pool_copy>& copies = p.fs_copies;
+    std::vector<impl::pool_copy>& copies_pre = p.fs_copies_pre;
+    std::vector<impl::pool_copy>& stores = p.fs_stores;
+    std::vector<impl::pool_copy>& res_fills = p.fs_res_fills;
     impl::dec_batch & batch = p.dec_io_batch;
 
     p.dec_bytes = 0;
@@ -2726,15 +2866,19 @@ void llama_disk_stage::fill_cache_begin(int il, const int32_t * ids, int64_t n_i
     // a copy into a resident slot must land before the hot pass reads it, so it
     // runs here; the copies into transient slots are skipped by the hot pass, so
     // they go to the worker and overlap both the read and the hot compute
-    batch.copies_pre.clear();
-    batch.copies.clear();
-    for (const impl::pool_copy & cp : copies) {
-        (cp.pre ? batch.copies_pre : batch.copies).push_back(cp);
-    }
-    batch.copies_after = p.fs_copies_after;
-
-    for (const impl::pool_copy & cp : batch.copies_pre) {
+    for (const impl::pool_copy & cp : copies_pre) {
         std::memcpy(cp.dst, cp.src, cp.len);
+    }
+
+    // resident fills that consumed an L2 entry: drop the now-redundant copy
+    if (!p.fs_l2_consume.empty() || !p.fs_newly_filled.empty()) {
+        std::lock_guard<std::mutex> lock(p.cache_mu);
+        for (const auto & [e, key] : p.fs_l2_consume) {
+            p.evict_remove(e, key);
+        }
+        for (const int32_t id : p.fs_newly_filled) {
+            p.cache[il].resident_filled[id] = 1;
+        }
     }
 
     // hand the batch over, so the drive works while the hot pass computes. The
@@ -2746,19 +2890,24 @@ void llama_disk_stage::fill_cache_begin(int il, const int32_t * ids, int64_t n_i
     p.trace_split.t_plan  = t_plan;
     p.trace_split.t_hot   = ggml_time_us();
 
-    batch.jobs = std::move(jobs);
+    batch.copies    = p.fs_copies;
+    batch.jobs      = std::move(jobs);
+    batch.stores    = stores;
+    batch.res_fills = res_fills;
     bool handoff = false;
     {
         std::lock_guard<std::mutex> lk(p.dec_io_mu);
-        p.dec_io_error = false;
-        handoff = !batch.jobs.empty() || !batch.copies.empty() || !batch.copies_after.empty();
+        p.dec_io_error      = false;
+        p.dec_io_reads_done = false;
+        handoff = !batch.jobs.empty() || !batch.copies.empty() ||
+                  !batch.stores.empty() || !batch.res_fills.empty();
         p.dec_io_ready = handoff;
     }
     if (handoff) {
         p.dec_io_cv.notify_one();
     }
 
-    p.dec_wait_il = il;
+    p.dec_wait_il = handoff ? il : -1;
 #else
     GGML_UNUSED(il);
     GGML_UNUSED(ids);
@@ -2775,9 +2924,11 @@ void llama_disk_stage::fill_cache_wait(int il) {
     p.dec_wait_il = -1;
 
     const int64_t tw = ggml_time_us();
+    // wait for the read phase only: the L2 stores keep running while the cold
+    // pass computes, and the next fill drains them
     {
         std::unique_lock<std::mutex> lk(p.dec_io_mu);
-        p.dec_io_done_cv.wait(lk, [&p] { return !p.dec_io_running && !p.dec_io_ready; });
+        p.dec_io_reads_cv.wait(lk, [&p] { return p.dec_io_reads_done; });
     }
 
     bool failed = false;
@@ -2790,22 +2941,6 @@ void llama_disk_stage::fill_cache_wait(int il) {
     p.trace_split.t_cold  = tw;
     p.trace_split.t_join  = t_join;
     p.trace_split.started = true;
-
-    // the worker owns the copies now: the hits ran before its reads, the misses
-    // after them
-    impl::cache_layer & c = p.cache[il];
-    std::vector<int32_t> & newly_filled = p.fs_newly_filled;
-    std::vector<std::pair<int, int64_t>> & l2_consume = p.fs_l2_consume;
-
-    if (!l2_consume.empty() || !newly_filled.empty()) {
-        std::lock_guard<std::mutex> lock(p.cache_mu);
-        for (const auto & [e, key] : l2_consume) {
-            p.evict_remove(e, key);
-        }
-        for (const int32_t id : newly_filled) {
-            c.resident_filled[id] = 1;
-        }
-    }
 
     {
         std::lock_guard<std::mutex> lock(p.cache_mu);
@@ -3029,16 +3164,18 @@ void llama_disk_stage::resident_remove(int il, int32_t id) {
         impl::evict_pool & ep = p.evict_pools[(size_t) epid];
         const int64_t      key = ((int64_t) il << 32) | (uint32_t) id;
         const int32_t      eslot = p.evict_put(epid, key);
-        for (int r = 0; r < 3; ++r) {
-            const size_t len = p.layer_regions[il][r].stride;
-            if (len == 0) {
-                continue;
+        if (eslot >= 0) {
+            for (int r = 0; r < 3; ++r) {
+                const size_t len = p.layer_regions[il][r].stride;
+                if (len == 0) {
+                    continue;
+                }
+                std::memcpy(ep.data[r] + (size_t) eslot * ep.stride[r],
+                            pool.data[r] + (size_t) slot * pool.slot_stride[r], len);
             }
-            std::memcpy(ep.data[r] + (size_t) eslot * ep.stride[r],
-                        pool.data[r] + (size_t) slot * pool.slot_stride[r], len);
+            p.n_l2_demotions++;
+            p.evict_populated = true;
         }
-        p.n_l2_demotions++;
-        p.evict_populated = true;
     }
 
     c.resident_slot[id]   = -1;
