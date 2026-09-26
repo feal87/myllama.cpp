@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <list>
 #include <map>
@@ -23,6 +24,12 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+// streaming stores for the L2 copy: the destination is not read again until a
+// hit, so keeping its lines out of the CPU cache saves the RFO traffic
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+#include <emmintrin.h>
+#endif
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -362,10 +369,21 @@ struct llama_disk_stage::impl {
         uint64_t hits      = 0; // counted only once the RAM tier is warm
         uint64_t misses    = 0;
         uint64_t evictions = 0;
+        // admission filter: a key enters the ghost unseen and is only admitted
+        // to the pool on a second sight, so a one-shot miss neither evicts a
+        // re-read nor pays a store. The queue is bounded; a stale entry is
+        // skipped when popped because its key was removed or re-stamped
+        std::deque<std::pair<uint64_t, int64_t>> ghost_q;     // stamp, key (FIFO)
+        std::unordered_map<int64_t, uint64_t>    ghost_stamp; // key -> stamp
+        uint64_t                                  ghost_next = 1;
+        size_t                                    ghost_cap  = 0;
     };
     std::vector<evict_pool> evict_pools;
     std::vector<int>        evict_pool_id;    // layer -> pool, -1 when not pooled
     bool                    evict_populated = false; // pools hold entries a prefill would clobber
+    bool                    ghost_enabled   = true;  // admit an L2 entry only on a second sight
+    bool                    nt_stores       = true;  // streaming stores for the L2 copy
+    uint64_t                n_l2_filtered   = 0;     // misses the ghost turned away
 
     uint64_t n_l2_hits        = 0;
     uint64_t n_l2_misses      = 0;
@@ -392,6 +410,40 @@ struct llama_disk_stage::impl {
         size_t       len;
         bool         pre = false; // lands in a resident slot, so it must complete before the hot pass
     };
+
+    // store a frozen bundle into the L2 pool. The destination is not read again
+    // until a hit, so a streaming store keeps it out of the CPU cache and skips
+    // the read-for-ownership; the transient source is read right after by the
+    // matmul, so it is loaded normally
+    void store_l2(const pool_copy & cp) const {
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+        if (nt_stores && cp.len >= 256) {
+            char *       d = cp.dst;
+            const char * s = cp.src;
+            size_t       i = 0;
+            for (; i + 64 <= cp.len; i += 64) {
+                const __m128i a = _mm_loadu_si128((const __m128i *) (s + i));
+                const __m128i b = _mm_loadu_si128((const __m128i *) (s + i + 16));
+                const __m128i c = _mm_loadu_si128((const __m128i *) (s + i + 32));
+                const __m128i e = _mm_loadu_si128((const __m128i *) (s + i + 48));
+                _mm_stream_si128((__m128i *) (d + i),      a);
+                _mm_stream_si128((__m128i *) (d + i + 16), b);
+                _mm_stream_si128((__m128i *) (d + i + 32), c);
+                _mm_stream_si128((__m128i *) (d + i + 48), e);
+            }
+            for (; i + 16 <= cp.len; i += 16) {
+                _mm_stream_si128((__m128i *) (d + i), _mm_loadu_si128((const __m128i *) (s + i)));
+            }
+            _mm_sfence();
+            if (i < cp.len) {
+                std::memcpy(d + i, s + i, cp.len - i);
+            }
+            return;
+        }
+#endif
+        std::memcpy(cp.dst, cp.src, cp.len);
+    }
+
     std::vector<disk_stage_job>          fs_jobs;
     std::vector<int32_t>                 fs_newly_filled;
     std::vector<pool_copy>               fs_copies;       // L2 hit -> transient, independent of the disk batch
@@ -479,6 +531,7 @@ struct llama_disk_stage::impl {
     uint64_t prev_l2_demotions   = 0;
     uint64_t prev_l2_hit_bytes   = 0;
     uint64_t prev_l2_promo_bytes = 0;
+    uint64_t prev_l2_filtered    = 0;
 
     // decode fill timing: the blocking read share of a decode step, so it can be
     // compared with the compute. Summed over every fill_cache() call
@@ -530,6 +583,32 @@ struct llama_disk_stage::impl {
         }
     }
 
+    static bool ghost_has(const evict_pool & ep, int64_t key) {
+        return ep.ghost_stamp.find(key) != ep.ghost_stamp.end();
+    }
+
+    // remember a key that was not admitted; the oldest beyond the cap is dropped
+    static void ghost_add(evict_pool & ep, int64_t key) {
+        if (ep.ghost_cap == 0 || ghost_has(ep, key)) {
+            return;
+        }
+        const uint64_t stamp = ep.ghost_next++;
+        ep.ghost_stamp[key] = stamp;
+        ep.ghost_q.emplace_back(stamp, key);
+        while (ep.ghost_q.size() > ep.ghost_cap) {
+            const auto oldest = ep.ghost_q.front();
+            ep.ghost_q.pop_front();
+            const auto it = ep.ghost_stamp.find(oldest.second);
+            if (it != ep.ghost_stamp.end() && it->second == oldest.first) {
+                ep.ghost_stamp.erase(it);
+            }
+        }
+    }
+
+    static void ghost_remove(evict_pool & ep, int64_t key) {
+        ep.ghost_stamp.erase(key); // the queued entry is skipped when popped
+    }
+
     // a free slot, or the probation LRU's slot; protected is the fallback when
     // probation is empty. -1 when every slot is reserved by a pending store
     int32_t evict_take_slot(evict_pool & ep) {
@@ -549,6 +628,7 @@ struct llama_disk_stage::impl {
         ep.slot_key[(size_t) slot] = -1;
         n_l2_evictions++;
         ep.evictions++;
+        ghost_add(ep, key); // a re-route of the victim admits it again
         return slot;
     }
 
@@ -630,6 +710,9 @@ struct llama_disk_stage::impl {
                 ep.free_slots[(size_t) s] = s;
             }
             std::fill(ep.slot_key.begin(), ep.slot_key.end(), (int64_t) -1);
+            ep.ghost_q.clear();
+            ep.ghost_stamp.clear();
+            ep.ghost_next = 1;
         }
     }
 
@@ -890,17 +973,20 @@ void llama_disk_stage::print_stats() {
     const uint64_t d_promo  = p.n_l2_promo_bytes - p.prev_l2_promo_bytes;
     const uint64_t d_evict  = p.n_l2_evictions - p.prev_l2_evictions;
     const uint64_t d_demote = p.n_l2_demotions - p.prev_l2_demotions;
+    const uint64_t d_filter = p.n_l2_filtered - p.prev_l2_filtered;
 
     LLAMA_LOG_INFO("[disk-stage] L2 pool: hit=%.1f%% (%" PRIu64 "/%" PRIu64 " warm routed, %" PRIu64 " cold fill skipped)"
-                   " | disk avoided=%.2f MiB (promo %.2f MiB) | evictions=%" PRIu64 " | demotions=%" PRIu64 "\n",
+                   " | disk avoided=%.2f MiB (promo %.2f MiB) | evictions=%" PRIu64 " | demotions=%" PRIu64
+                   " | filtered=%" PRIu64 "\n",
                    lookups ? 100.0 * p.n_l2_hits / lookups : 0.0, p.n_l2_hits, lookups, p.n_l2_cold,
                    p.n_l2_hit_bytes / (1024.0 * 1024.0), p.n_l2_promo_bytes / (1024.0 * 1024.0),
-                   p.n_l2_evictions, p.n_l2_demotions);
+                   p.n_l2_evictions, p.n_l2_demotions, p.n_l2_filtered);
 
     LLAMA_LOG_INFO("[disk-stage] L2 pool: delta hit=%.1f%% (%" PRIu64 "/%" PRIu64 ")"
-                   " | disk avoided=%.2f MiB (promo %.2f MiB) | evictions=%" PRIu64 " | demotions=%" PRIu64 "\n",
+                   " | disk avoided=%.2f MiB (promo %.2f MiB) | evictions=%" PRIu64 " | demotions=%" PRIu64
+                   " | filtered=%" PRIu64 "\n",
                    d_look ? 100.0 * d_hits / d_look : 0.0, d_hits, d_look,
-                   d_bytes / (1024.0 * 1024.0), d_promo / (1024.0 * 1024.0), d_evict, d_demote);
+                   d_bytes / (1024.0 * 1024.0), d_promo / (1024.0 * 1024.0), d_evict, d_demote, d_filter);
 
     std::string pools;
     for (size_t k = 0; k < p.evict_pools.size(); ++k) {
@@ -920,6 +1006,7 @@ void llama_disk_stage::print_stats() {
     p.prev_l2_demotions   = p.n_l2_demotions;
     p.prev_l2_hit_bytes   = p.n_l2_hit_bytes;
     p.prev_l2_promo_bytes = p.n_l2_promo_bytes;
+    p.prev_l2_filtered    = p.n_l2_filtered;
 }
 
 const llama_disk_stage_layer * llama_disk_stage::layer(int il) const {
@@ -975,6 +1062,17 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     p.split_hot_active = [] {
         const char * v = std::getenv("LLAMA_DISK_STAGE_SPLIT_HOT");
         return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    // L2 admission filter: only store an expert the ghost has seen before, so a
+    // one-shot miss does not evict a re-read or pay a store
+    p.ghost_enabled = [] {
+        const char * v = std::getenv("LLAMA_DISK_STAGE_GHOST");
+        return v == nullptr || (v[0] != '\0' && v[0] != '0');
+    }();
+    // streaming stores for the L2 copy (the destination is cold)
+    p.nt_stores = [] {
+        const char * v = std::getenv("LLAMA_DISK_STAGE_NT");
+        return v == nullptr || (v[0] != '\0' && v[0] != '0');
     }();
 
     p.iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
@@ -1680,6 +1778,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                 // protected gets three quarters: one-shot misses
                                 // enter probation and cannot displace a re-read
                                 ep.prot_cap = cap - std::max(1, cap / 4);
+                                ep.ghost_cap = p.ghost_enabled ? (size_t) std::max(16, cap * 2) : 0;
                                 size_t off = 0;
                                 for (const auto & role : roles) {
                                     const size_t stride = src[il].r[role.slot].stride;
@@ -1725,6 +1824,9 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                                    p.evict_pools[k].stride[0], p.evict_pools[k].stride[1],
                                                    p.evict_pools[k].stride[2]);
                                 }
+                                LLAMA_LOG_INFO("%s: L2 admission filter %s (ghost %zu slots/pool), streaming stores %s\n",
+                                               __func__, p.ghost_enabled ? "on" : "off",
+                                               p.evict_pools[0].ghost_cap, p.nt_stores ? "on" : "off");
                             }
                         }
                     }
@@ -1870,7 +1972,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
 
                 if (!err) {
                     for (const impl::pool_copy & cp : batch.stores) {
-                        std::memcpy(cp.dst, cp.src, cp.len);
+                        p.store_l2(cp);
                     }
                     for (const impl::pool_copy & cp : batch.res_fills) {
                         std::memcpy(cp.dst, cp.src, cp.len);
@@ -2608,9 +2710,9 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                     continue;
                 }
 
-                // miss: reserve a pool slot, kept out of the LRU until the store
-                // below lands, and read the disk into the transient slot
-                const int32_t eslot = p.evict_reserve(epid);
+                // miss: admit the expert only when the ghost saw it before, so a
+                // one-shot miss neither evicts a re-read nor pays a store. The
+                // disk read goes into the transient slot either way.
                 p.n_l2_all_misses++;
                 if (p.l2_warm) {
                     p.n_l2_misses++;
@@ -2619,6 +2721,25 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                     p.n_l2_cold++;
                 }
                 p.evict_populated = true;
+                int32_t eslot = -1;
+                if (!p.ghost_enabled || !ep.free_slots.empty()) {
+                    // the filter is off, or the pool still has room: admit without
+                    // waiting for a second sight, so the pool fills to capacity and
+                    // the ghost only governs admission once it is full
+                    if (p.ghost_enabled) {
+                        impl::ghost_remove(ep, key);
+                    }
+                    eslot = p.evict_reserve(epid);
+                } else if (impl::ghost_has(ep, key)) {
+                    impl::ghost_remove(ep, key);
+                    eslot = p.evict_reserve(epid);
+                    if (eslot < 0) {
+                        impl::ghost_add(ep, key); // no slot: keep the candidate
+                    }
+                } else {
+                    impl::ghost_add(ep, key);
+                    p.n_l2_filtered++;
+                }
                 read_to_transient(id, use);
                 if (eslot >= 0) {
                     for (int r = 0; r < 3; ++r) {
@@ -2707,7 +2828,7 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
             disk_stage_run_jobs(batch.jobs, 32, p.iocp);
         }
         for (const impl::pool_copy & cp : batch.stores) {
-            std::memcpy(cp.dst, cp.src, cp.len);
+            p.store_l2(cp);
         }
         for (const impl::pool_copy & cp : batch.res_fills) {
             std::memcpy(cp.dst, cp.src, cp.len);
