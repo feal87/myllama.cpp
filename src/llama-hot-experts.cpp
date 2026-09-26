@@ -1558,7 +1558,7 @@ void llama_hot_expert_cache::on_prompt_begin() {
     }
 
     // A new prompt defines new routing priorities (its decode ubatches start
-    // feeding the ranking right after this): divide every usage count by two
+    // feeding the ranking right after this): divide every usage count by four
     // immediately (same floor-at-1 rounding as the periodic halving), so the
     // pin/VRAM sets can re-converge on the new prompt's expert mix instead of
     // letting the previous prompt's lifetime leaders hold their slots.
@@ -1568,7 +1568,7 @@ void llama_hot_expert_cache::on_prompt_begin() {
             continue;
         }
         for (uint64_t & c : ls.counts) {
-            const uint64_t new_count = (c + 1) / 2;  // divide by 2, floor at 1
+            const uint64_t new_count = (c + 3) / 4;  // divide by 4, floor at 1
             if (new_count != c) {
                 c = new_count;
             }
