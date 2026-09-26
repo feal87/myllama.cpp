@@ -52,6 +52,13 @@ struct llama_disk_stage_cache_layer {
     ggml_tensor * down  = nullptr;
     ggml_tensor * table = nullptr; // I32 [n_expert], expert id -> slot
     ggml_tensor * slot_skip = nullptr; // I32 [n_slots + 1], 1 at the sentinel
+    // split-hot: two static slot-indexed tables that partition the slots, so the
+    // host MoE can run a hot pass (residents) and a cold pass (transients) that
+    // overlap the read of the cold experts with the compute of the hot ones.
+    // skip_hot is 1 on transient + sentinel slots, skip_cold is 1 on resident +
+    // sentinel slots. Null when the split is off
+    ggml_tensor * slot_skip_hot  = nullptr;
+    ggml_tensor * slot_skip_cold = nullptr;
 };
 
 class llama_disk_stage {
@@ -101,6 +108,36 @@ public:
     // ensure the routed experts of layer il are in the cache and update the
     // layer's id table; reads the non-resident ones into transient slots
     void fill_cache(int il, const int32_t * ids, int64_t n_ids);
+
+    // split-hot variant: fill_cache_begin() sets the tables and hands the disk
+    // batch to a worker, then returns so the hot pass computes; fill_cache_wait()
+    // joins the worker. Only used when split_hot() is on, i.e. Windows +
+    // LLAMA_DISK_STAGE_SPLIT_HOT=1. The cache then carries two static skip
+    // tables that split its resident slots from the transient ones, so the
+    // decoder can run the hot (resident) experts and the cold (disk) experts as
+    // two host passes: the disk read overlaps the hot compute. A promoted but
+    // unread resident is served from the L2 pool into its slot, or, on an L2
+    // miss, from a transient slot, so no read ever targets a slot the hot pass
+    // reads concurrently.
+    void fill_cache_begin(int il, const int32_t * ids, int64_t n_ids);
+    void fill_cache_wait(int il);
+
+    // end of a decode step, from the graph compute: closes the layer whose cold
+    // pass no later split reported and prints the token totals
+    void split_token_end();
+
+    // true when the split-hot decode path is active (Windows + env opt-in)
+    bool split_hot() const;
+
+    // the graph records, per layer, whether it emitted a cold pass for it. The
+    // decode fill consults this to pick the split or the synchronous path, so a
+    // layer without a cold pass never hands a batch to the worker
+    void set_split_cold(int il, bool cold) const;
+    bool split_cold(int il) const;
+
+    // true once per process, and only with LLAMA_DISK_STAGE_TRACE, so the graph
+    // can report why a layer got no cold pass without flooding the log
+    static bool split_trace_once();
 
     // number of independent decode-cache pools (0 when the cache is off)
     int n_pools() const;
@@ -199,4 +236,14 @@ private:
     // read warm experts into the slots left free by the base set, spread as
     // evenly as possible across the layers of each pool
     void preload_warm();
+
+    // slot assignment shared by fill_cache() and the split-hot pair: writes the
+    // layer's id table and collects the disk jobs, the independent copies and
+    // the miss copies. false when the layer has no cache or no routed ids
+    bool fill_cache_plan(int il, const int32_t * ids, int64_t n_ids);
+
+    // split-hot trace hooks, called from the node-prepare callback
+    void split_drain();     // wait out a batch whose wait never ran
+    void split_cold_end();  // the cold pass of the pending layer computed
+    void split_report();    // print and account the pending layer
 };

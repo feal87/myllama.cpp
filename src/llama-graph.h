@@ -784,6 +784,9 @@ struct llm_graph_params {
 
     ggml_backend_sched_t sched;
     ggml_backend_t backend_cpu;
+    // split-hot: second CPU backend that hosts the cold expert pass, so the
+    // scheduler runs it in its own split after the hot pass. Null when off
+    ggml_backend_t backend_cpu_split = nullptr;
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
@@ -1044,6 +1047,7 @@ struct llm_graph_context {
     ggml_backend_sched_t sched;
 
     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
+    ggml_backend_t backend_cpu_split; // split-hot cold pass backend (null when off)
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;

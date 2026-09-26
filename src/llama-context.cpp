@@ -503,6 +503,21 @@ llama_context::llama_context(
         if (backend_cpu == nullptr) {
             throw std::runtime_error("failed to initialize CPU backend");
         }
+
+        // split-hot: a second CPU backend hosts the cold MoE pass. The scheduler
+        // starts a new split when the backend changes, so the hot pass runs and
+        // completes before the cold split prepares, i.e. the cold read overlaps
+        // the hot compute. Registered BEFORE the main CPU backend so the latter
+        // stays the scheduler's last backend: the prefill VRAM/host overlap is an
+        // early launch gated on the last backend
+        if (disk_stage != nullptr && disk_stage->split_hot()) {
+            backend_cpu_split = ggml_backend_cpu_init();
+            if (backend_cpu_split == nullptr) {
+                throw std::runtime_error("failed to initialize the split CPU backend");
+            }
+            backends.emplace_back(backend_cpu_split);
+        }
+
         backends.emplace_back(backend_cpu);
 
         // create a list of the set_n_threads functions in the backends
@@ -2980,6 +2995,7 @@ llm_graph_params llama_context::graph_params(
         /*.gtype       =*/ gtype,
         /*.sched       =*/ sched.get(),
         /*.backend_cpu =*/ backend_cpu,
+        /*.backend_cpu_split =*/ backend_cpu_split,
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
@@ -3006,6 +3022,12 @@ ggml_status llama_context::graph_compute(
         auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
         if (set_threadpool_fn) {
             set_threadpool_fn(backend_cpu, tp);
+            // the split backend computes the cold pass in its own split. CPU
+            // splits never run concurrently, so it can share the pool; without
+            // this it has no pool and ggml creates a disposable one per call
+            if (backend_cpu_split != nullptr) {
+                set_threadpool_fn(backend_cpu_split, tp);
+            }
         }
     }
 
@@ -3017,6 +3039,10 @@ ggml_status llama_context::graph_compute(
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+    }
+
+    if (disk_stage) {
+        disk_stage->split_token_end();
     }
 
     // the first decode grew the CUDA scratch pools to their decode peak: keep
