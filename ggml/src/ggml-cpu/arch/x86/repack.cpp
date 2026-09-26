@@ -517,6 +517,15 @@ void ggml_quantize_mat_q8_K_4x8(const float * GGML_RESTRICT x, void * GGML_RESTR
 
 #if defined(__AVX2__) || defined(__AVX512F__)
 
+// E8M0 exponent byte -> fp32 scale, the vector form of ggml_e8m0_to_fp32_half() (2^(e-128)).
+// e < 2 are the two denormal patterns, anything above is the raw exponent field.
+static inline __m256 e8m0_to_fp32x8(__m128i e) {
+    const __m256i e32  = _mm256_cvtepu8_epi32(e);
+    const __m256i bits = _mm256_slli_epi32(_mm256_sub_epi32(e32, _mm256_set1_epi32(1)), 23);
+    const __m256i spec = _mm256_sllv_epi32(_mm256_set1_epi32(0x00200000), e32);
+    return _mm256_castsi256_ps(_mm256_blendv_epi8(bits, spec, _mm256_cmpgt_epi32(_mm256_set1_epi32(2), e32)));
+}
+
 // GEMV for 8x blocks of 32 4-bit quants with a single scale factor per block
 template<typename block_tx8>
 static void gemv_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc, __m256i signextendlut) {
@@ -582,17 +591,10 @@ static void gemv_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t 
                     const __m128i changemask = _mm_set_epi8(15, 14, 7, 6, 13, 12, 5, 4, 11, 10, 3, 2, 9, 8, 1, 0);
                     col_scale_f32 = GGML_F32Cx8_REARRANGE_LOAD(b_ptr[b].d, changemask);
                 } else if constexpr (std::is_same_v<block_tx8, block_mxfp4x8>) {
-                    // Load 8 E8M0 exponents and convert to float via LUT
-                    // Rearranged to match changemask order: 0,4,1,5,2,6,3,7
-                    col_scale_f32 = _mm256_set_ps(
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[7]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[3]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[6]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[2]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[5]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[1]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[4]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[0]));
+                    // permuted into the accumulator order, see finalpermutemask below
+                    col_scale_f32 = _mm256_permutevar8x32_ps(
+                        e8m0_to_fp32x8(_mm_loadl_epi64((const __m128i *) b_ptr[b].e)),
+                        _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
                 }
 
                 // Load and convert to FP32 scale from block_q8_0
