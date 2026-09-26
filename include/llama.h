@@ -469,6 +469,9 @@ extern "C" {
         int32_t  n_moe_cache_inserts;      // max expert uploads queued to the upload worker at once, across all
                                            // cached layers (0 = auto: 2). The worker uploads continuously while
                                            // experts are pending, so this caps queue depth, not the per-step rate
+        float    n_moe_cache_drift_percent;// rebuild the per-layer layout when its slot counts drift more than
+                                           // this percent from the ideal composition for the current ranking
+                                           // (0 = keep the layout fixed between prompt boundaries)
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]

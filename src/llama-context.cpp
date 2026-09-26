@@ -157,6 +157,7 @@ llama_context::llama_context(
 
     cparams.n_moe_cache_budget_bytes = params.n_moe_cache_budget_bytes;
     cparams.n_moe_cache_inserts      = params.n_moe_cache_inserts;
+    cparams.n_moe_cache_drift_percent = params.n_moe_cache_drift_percent;
     cparams.hot_experts_prefetch     = params.hot_experts_prefetch;
     cparams.disk_stage_split_hot     = params.disk_stage_split_hot;
 
@@ -276,7 +277,7 @@ llama_context::llama_context(
             // (maybe_activate).
             moe_cache = std::make_unique<llama_moe_cache>(
                 model, hot_experts.get(), cparams.n_moe_cache_budget_bytes,
-                cparams.n_moe_cache_inserts);
+                cparams.n_moe_cache_inserts, cparams.n_moe_cache_drift_percent);
             if (moe_cache && disk_stage != nullptr) {
                 moe_cache->set_disk_stage(disk_stage.get());
             }
@@ -4763,6 +4764,7 @@ llama_context_params llama_context_default_params() {
         /*.warm_experts_from_profile_path=*/ nullptr,
         /*.n_moe_cache_budget_bytes    =*/ 0,
         /*.n_moe_cache_inserts         =*/ 2,
+        /*.n_moe_cache_drift_percent   =*/ 0.0f,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,

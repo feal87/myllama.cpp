@@ -528,6 +528,7 @@ struct common_params {
     // off too: the shared routing ranking is then observed but nothing is mlock'd.
     uint64_t n_moe_cache_budget_mib = 0;   // total device memory to reserve up-front for the cache, in MiB (0 = no cap)
     int32_t  n_moe_cache_inserts    = 2;   // max expert uploads queued to the upload worker at once, across all cached layers
+    float    n_moe_cache_drift_percent = 0.0f; // rebuild the layout when it drifts more than this percent from the ideal composition (0 = disabled)
 
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading

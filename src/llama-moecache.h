@@ -34,6 +34,13 @@
 //    pin tier, per-layer slot counts are re-derived from the new ranking, and
 //    the decode graphs are rebuilt via the layout generation), so a prompt with
 //    a different topic can re-shape which layers/experts get VRAM slots.
+//  - between prompt rebuilds the layout is re-checked at each content rebalance
+//    boundary (--moe-expert-cache-drift-percent): when its per-layer slot counts
+//    drift past the threshold from the ideal composition of the current ranking,
+//    the layout is rebuilt exactly like a prompt rebuild (residents return to
+//    the RAM tier, the pool is re-carved and the experts re-uploaded) so a
+//    shifted routing mix can re-shape the cache mid-prompt. 0 = never rebuild
+//    mid-prompt (the default keeps the per-prompt once-at-100-tokens rebuild)
 //
 // Memory accounting: budget_bytes is the exact total device footprint of the
 // cache (expert slots + the per-layer dummy slot + the device tables). The
@@ -106,8 +113,11 @@ class llama_moe_cache {
     //           GLOBAL across all cached layers (0 = default 2). The worker
     //           uploads continuously while experts are pending, so this caps
     //           the queue depth, not the per-step upload rate
+    // drift_percent: rebuild the per-layer layout when its slot counts differ
+    //           from the ideal composition for the current ranking by more than
+    //           this percent (0 = disabled: keep the layout fixed between prompts)
     llama_moe_cache(const llama_model & model, llama_hot_expert_cache * hot,
-                    uint64_t budget_bytes, int32_t max_inserts);
+                    uint64_t budget_bytes, int32_t max_inserts, float drift_percent);
     ~llama_moe_cache();
 
     llama_moe_cache(const llama_moe_cache &) = delete;
@@ -230,6 +240,16 @@ class llama_moe_cache {
 
     // reconcile the residents with the current ranking (see llama-moecache.cpp)
     void rebalance();
+
+    // size the per-layer slot counts the current ranking would carve from the
+    // pool. Shared by activate() and the periodic drift check so both compare
+    // against the same ideal. Returns false when the ranking gives no layer a slot
+    bool compute_layout_caps(std::vector<int32_t> & caps) const;
+
+    // fraction of the layout's slots that differ from the ideal composition for
+    // the current ranking, or -1 when there is nothing to compare. 0 = the
+    // current layout matches the ideal, 1 = no slot overlaps
+    float layout_drift() const;
 
     // move up to `max_inserts` pending experts to the upload worker's queue, one
     // per layer per pass; the worker keeps its queue topped up between calls.

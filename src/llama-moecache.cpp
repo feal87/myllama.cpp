@@ -101,6 +101,7 @@ struct llama_moe_cache::impl {
     uint64_t budget_base;            // prefill-safe budget; shaved when the device is short (see alloc_pool_reducing)
     uint64_t budget_extra = 0;       // prefill compute bytes reclaimed for decode (VRAM swap)
     const int32_t  max_inserts;
+    const float    drift_percent;    // 0 = keep the layout fixed between prompt rebuilds
     bool activated = false;
     bool activated_once = false; // a layout was built at least once (survives suspend)
     bool failed    = false;
@@ -229,9 +230,9 @@ struct llama_moe_cache::impl {
     }
 
     impl(const llama_model & model_, llama_hot_expert_cache * hot_,
-         uint64_t budget_, int32_t inserts_) :
+         uint64_t budget_, int32_t inserts_, float drift_percent_) :
         model(model_), hot(hot_), budget_bytes(budget_), budget_base(budget_),
-        max_inserts(inserts_), layer_idx(model_.layers.size(), -1) {}
+        max_inserts(inserts_), drift_percent(drift_percent_), layer_idx(model_.layers.size(), -1) {}
 
     // allocate the device pool for the current budget. On failure shave 25 MiB
     // off the base budget and retry, so a busy device both keeps the cache
@@ -406,7 +407,7 @@ void llama_moe_cache::fill_upload_queue(llama_moe_cache::impl * p) {
 }
 
 llama_moe_cache::llama_moe_cache(const llama_model & model, llama_hot_expert_cache * hot,
-                                 uint64_t budget_bytes, int32_t max_inserts) {
+                                 uint64_t budget_bytes, int32_t max_inserts, float drift_percent) {
     if (hot == nullptr || budget_bytes == 0) {
         return; // disabled (missing ranking source or no capacity requested)
     }
@@ -414,7 +415,7 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, llama_hot_expert_cac
         max_inserts = 2;
     }
 
-    pimpl = std::make_unique<impl>(model, hot, budget_bytes, max_inserts);
+    pimpl = std::make_unique<impl>(model, hot, budget_bytes, max_inserts, drift_percent);
 }
 
 llama_moe_cache::~llama_moe_cache() {
@@ -630,6 +631,84 @@ void llama_moe_cache::maybe_activate() {
     activate(p->activated);
 }
 
+// size the per-layer slot counts the current ranking would carve from the pool.
+// Shared by activate() and the periodic drift check so both compare against the
+// same ideal. Returns false when the ranking gives no layer a slot
+bool llama_moe_cache::compute_layout_caps(std::vector<int32_t> & caps) const {
+    auto * p = pimpl.get();
+    if (!p || !p->pool) {
+        return false;
+    }
+
+    const size_t align     = ggml_backend_buffer_get_alignment(p->pool);
+    const size_t pool_size = ggml_backend_buffer_get_size(p->pool);
+    const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(p->pool);
+    caps.assign(p->model.layers.size(), 0);
+    std::vector<size_t> bytes_per_layer(p->model.layers.size(), 0);
+    std::vector<size_t> fixed_bytes(p->model.layers.size(), 0);
+    for (const auto & c : p->cands) {
+        bytes_per_layer[c.il] = c.nbytes_1slot;
+        // the dummy slot, the device table, the per-tensor alignment padding,
+        // plus whatever the backend adds on top of the tensor data
+        size_t overhead = expert_fixed_overhead(buft, c.gate_src);
+        if (!c.fused) {
+            overhead += expert_fixed_overhead(buft, c.up_src);
+        }
+        overhead += expert_fixed_overhead(buft, c.d_src);
+        fixed_bytes[c.il] = c.nbytes_1slot + (size_t) c.n_expert*sizeof(int32_t) + 4*align + overhead;
+    }
+    if (p->hot->assign_global_capacity(pool_size, bytes_per_layer, fixed_bytes, caps) <= 0) {
+        return false;
+    }
+
+    // dio: the VRAM residents are a subset of the disk decode cache's RAM
+    // residents, so a layer cannot hold more VRAM slots than the RAM tier can
+    // supply (the RAM set is uniform across layers)
+    if (p->disk_mode) {
+        for (int il = 0; il < (int) caps.size(); ++il) {
+            const int32_t cap = p->disk->resident_capacity(il);
+            if (caps[il] > cap) {
+                caps[il] = cap;
+            }
+        }
+    }
+    return true;
+}
+
+// fraction of the layout's slots that differ from the ideal composition for the
+// current ranking, or -1 when there is nothing to compare. Defined as the
+// symmetric difference over the sum of both slot counts, so 0 = the current
+// layout already matches the ideal and 1 = no slot overlaps
+float llama_moe_cache::layout_drift() const {
+    auto * p = pimpl.get();
+    if (!p || !p->activated) {
+        return -1.0f;
+    }
+    std::vector<int32_t> ideal;
+    if (!compute_layout_caps(ideal)) {
+        return -1.0f; // no slot from the current ranking: keep the serving layout
+    }
+
+    uint64_t total_cur   = 0;
+    uint64_t total_ideal = 0;
+    uint64_t delta       = 0;
+    for (const auto & c : p->cands) {
+        if (c.il < 0 || (size_t) c.il >= ideal.size()) {
+            continue;
+        }
+        const auto * ls  = p->find_layer(c.il);
+        const uint64_t cur = ls ? (uint64_t) std::max(ls->pub.n_slots, 0) : 0;
+        const uint64_t idl = (uint64_t) std::max(ideal[c.il], 0);
+        total_cur   += cur;
+        total_ideal += idl;
+        delta += cur > idl ? cur - idl : idl - cur;
+    }
+    if (total_cur + total_ideal == 0) {
+        return -1.0f;
+    }
+    return (float) delta / (float) (total_cur + total_ideal);
+}
+
 // size the per-layer capacities from the current ranking and carve the layout
 // into the reserved pool. Called after enough routing was observed (initial
 // activation, per-prompt rebuild) or directly by resume(), which rebuilds from
@@ -655,21 +734,8 @@ void llama_moe_cache::activate(bool relayout) {
     const size_t align     = ggml_backend_buffer_get_alignment(p->pool);
     const size_t pool_size = ggml_backend_buffer_get_size(p->pool);
     const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(p->pool);
-    std::vector<int32_t> caps(p->model.layers.size(), 0);
-    std::vector<size_t> bytes_per_layer(p->model.layers.size(), 0);
-    std::vector<size_t> fixed_bytes(p->model.layers.size(), 0);
-    for (const auto & c : p->cands) {
-        bytes_per_layer[c.il] = c.nbytes_1slot;
-        // the dummy slot, the device table, the per-tensor alignment padding,
-        // plus whatever the backend adds on top of the tensor data
-        size_t overhead = expert_fixed_overhead(buft, c.gate_src);
-        if (!c.fused) {
-            overhead += expert_fixed_overhead(buft, c.up_src);
-        }
-        overhead += expert_fixed_overhead(buft, c.d_src);
-        fixed_bytes[c.il] = c.nbytes_1slot + (size_t) c.n_expert*sizeof(int32_t) + 4*align + overhead;
-    }
-    if (p->hot->assign_global_capacity(pool_size, bytes_per_layer, fixed_bytes, caps) <= 0) {
+    std::vector<int32_t> caps;
+    if (!compute_layout_caps(caps)) {
         if (relayout) {
             // keep the old layout serving rather than tearing it down for a
             // profile that gives no layer any slot
@@ -680,18 +746,6 @@ void llama_moe_cache::activate(bool relayout) {
             p->failed = true;
         }
         return;
-    }
-
-    // dio: the VRAM residents are a subset of the disk decode cache's RAM
-    // residents, so a layer cannot hold more VRAM slots than the RAM tier can
-    // supply (the RAM set is uniform across layers)
-    if (p->disk_mode) {
-        for (int il = 0; il < (int) caps.size(); ++il) {
-            const int32_t cap = p->disk->resident_capacity(il);
-            if (caps[il] > cap) {
-                caps[il] = cap;
-            }
-        }
     }
 
     // full per-prompt layout rebuild: pull every published VRAM resident back
@@ -987,7 +1041,7 @@ void llama_moe_cache::activate(bool relayout) {
             layers_str += "L" + std::to_string(ls.pub.il) + "=" + std::to_string(ls.pub.n_slots);
         }
         LLAMA_LOG_INFO("%s: MoE expert cache %s: %d layer(s), %zu VRAM slots total (%.1f of the reserved %.1f MiB pool used), up to %d uploads queued (global); profile: %s\n",
-                __func__, relayout ? "layout rebuilt for the new prompt" : "enabled",
+                __func__, relayout ? "layout rebuilt" : "enabled",
                 n_cached, n_slots_total, off/(1024.0*1024.0), pool_size/(1024.0*1024.0), p->max_inserts, layers_str.c_str());
     }
 
@@ -1370,10 +1424,31 @@ void llama_moe_cache::tick(int64_t n_content_tokens) {
         p->hot->vram_takeover(il, e);
     }
 
-    // 2) periodic content rebalance against the shared ranking
+    // 2) periodic content rebalance against the shared ranking. The rebalance
+    //    boundary is also the layout drift check: when the current per-layer
+    //    slot counts drifted too far from the ideal composition of the current
+    //    ranking, rebuild the whole layout (activate() evicts the residents and
+    //    rebalances internally) instead of just realigning the content, so the
+    //    two do not upload twice
     if (p->n_content - p->last_rebalance >= kRebalanceContentTokens) {
         p->last_rebalance = p->n_content;
-        rebalance();
+        if (p->drift_percent > 0.0f && p->epoch_rebuilt) {
+            const float drift = layout_drift();
+            if (drift < 0.0f) {
+                LLAMA_LOG_INFO("%s: MoE expert cache layout drift unavailable - keeping the layout\n", __func__);
+                rebalance();
+            } else if (drift * 100.0f > p->drift_percent) {
+                LLAMA_LOG_INFO("%s: MoE expert cache layout drift %.1f%% > %.1f%% - rebuilding the layout\n",
+                        __func__, drift * 100.0f, p->drift_percent);
+                activate(/*relayout =*/ true);
+            } else {
+                LLAMA_LOG_INFO("%s: MoE expert cache layout drift %.1f%% <= %.1f%% - keeping the layout\n",
+                        __func__, drift * 100.0f, p->drift_percent);
+                rebalance();
+            }
+        } else {
+            rebalance();
+        }
     }
 
     // 3) top the upload queue up again: the worker keeps its own queue full from
