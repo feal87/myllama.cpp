@@ -500,6 +500,12 @@ extern "C" {
         // See llama-hot-experts.h.
         bool hot_experts_prefetch;
 
+        // with --load-mode dio, split the host decode MoE into a hot (resident)
+        // and a cold (disk) pass on a second CPU backend, so the cold read
+        // overlaps the hot compute (default: false). Only the plain separate
+        // gate/up Silu layout is split; other layers use the single pass.
+        bool disk_stage_split_hot;
+
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)

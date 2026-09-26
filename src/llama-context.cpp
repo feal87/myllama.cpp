@@ -158,6 +158,7 @@ llama_context::llama_context(
     cparams.n_moe_cache_budget_bytes = params.n_moe_cache_budget_bytes;
     cparams.n_moe_cache_inserts      = params.n_moe_cache_inserts;
     cparams.hot_experts_prefetch     = params.hot_experts_prefetch;
+    cparams.disk_stage_split_hot     = params.disk_stage_split_hot;
 
     // The hot-expert cache is the shared router-observation engine: it maintains
     // the global decayed ranking behind the RAM pinning tier (--pin-hot-experts
@@ -188,7 +189,8 @@ llama_context::llama_context(
         auto stage = std::make_unique<llama_disk_stage>(model, stage_dev,
                 cparams.n_pin_hot_experts, cparams.n_pin_hot_experts_budget_bytes,
                 cparams.n_pin_hot_experts_pool_layers,
-                cparams.pin_experts_from_profile_path, cparams.warm_experts_from_profile_path);
+                cparams.pin_experts_from_profile_path, cparams.warm_experts_from_profile_path,
+                cparams.disk_stage_split_hot);
         if (stage->is_active()) {
             disk_stage = std::move(stage);
         }
@@ -206,6 +208,11 @@ llama_context::llama_context(
     require_disk(cparams.warm_experts_from_profile_path, "--warm-experts-from-profile");
 
     const bool disk_active = disk_stage != nullptr;
+
+    if (cparams.disk_stage_split_hot && !disk_active) {
+        LLAMA_LOG_WARN("%s: --disk-stage-split-hot has no effect without the disk decode cache "
+                       "(--load-mode dio on Windows)\n", __func__);
+    }
 
     // decode ubatches feed the hot-expert ranking whenever pinning, the VRAM MoE
     // tier or the disk decode cache can consume it (matches the track_rank the
@@ -1792,16 +1799,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // node-prepare hook instead: the expert fill runs at the CPU get_rows that
     // remaps the ids, so the graph is not chunked at every layer. Applied every
     // ubatch (also on graph reuse).
-    //
-    // LLAMA_DISK_STAGE_OLD_DECODE_CB=1 forces the old mid-graph decode callback
-    // (A/B, same output)
-    static const bool force_old_cb = [] {
-        const char * v = std::getenv("LLAMA_DISK_STAGE_OLD_DECODE_CB");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-
-    const bool disk_internal = disk_stage != nullptr && !force_old_cb;
-    if (disk_internal) {
+    if (disk_stage != nullptr) {
         ggml_backend_sched_set_node_prepare_callback(sched.get(),
                 llama_disk_stage::node_prepare_callback, disk_stage.get());
     } else {
@@ -1809,7 +1807,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     if (hot_experts) {
-        const bool decode_internal = ubatch.n_tokens == 1 && disk_internal &&
+        // single-token decode fills through the node-prepare hook when the
+        // decode cache is active, so it needs no eval callback; batch/prefill
+        // always uses the eval callback for the fill / prefetch read-ahead
+        const bool decode_internal = ubatch.n_tokens == 1 && disk_stage != nullptr &&
                                      disk_stage->internal_decode_fill();
         const bool need_eval_cb = (ubatch.n_tokens > 1 && (cparams.hot_experts_prefetch || disk_stage != nullptr)) ||
                                   (ubatch.n_tokens == 1 && disk_stage != nullptr && !decode_internal);
@@ -4773,6 +4774,7 @@ llama_context_params llama_context_default_params() {
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.hot_experts_prefetch        =*/ false,
+        /*.disk_stage_split_hot        =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

@@ -1727,6 +1727,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_moe_cache_budget_bytes = params.n_moe_cache_budget_mib * 1024ull * 1024ull;
     cparams.n_moe_cache_inserts      = params.n_moe_cache_inserts;
     cparams.hot_experts_prefetch     = params.hot_experts_prefetch;
+    cparams.disk_stage_split_hot     = params.disk_stage_split_hot;
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;

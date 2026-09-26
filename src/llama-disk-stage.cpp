@@ -381,8 +381,6 @@ struct llama_disk_stage::impl {
     std::vector<evict_pool> evict_pools;
     std::vector<int>        evict_pool_id;    // layer -> pool, -1 when not pooled
     bool                    evict_populated = false; // pools hold entries a prefill would clobber
-    bool                    ghost_enabled   = true;  // admit an L2 entry only on a second sight
-    bool                    nt_stores       = true;  // streaming stores for the L2 copy
     uint64_t                n_l2_filtered   = 0;     // misses the ghost turned away
 
     uint64_t n_l2_hits        = 0;
@@ -417,7 +415,7 @@ struct llama_disk_stage::impl {
     // matmul, so it is loaded normally
     void store_l2(const pool_copy & cp) const {
 #if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
-        if (nt_stores && cp.len >= 256) {
+        if (cp.len >= 256) {
             char *       d = cp.dst;
             const char * s = cp.src;
             size_t       i = 0;
@@ -1038,7 +1036,7 @@ int llama_disk_stage::pool_id(int il) const {
 llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t dev,
                                    int32_t n_pin_experts, uint64_t cache_budget_bytes,
                                    int32_t pool_layers_max, const char * base_experts_path,
-                                   const char * warm_experts_path) :
+                                   const char * warm_experts_path, bool split_hot) :
     pimpl(std::make_unique<impl>(model)) {
     impl & p = *pimpl;
 
@@ -1051,29 +1049,16 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     GGML_UNUSED(pool_layers_max);
     GGML_UNUSED(base_experts_path);
     GGML_UNUSED(warm_experts_path);
+    GGML_UNUSED(split_hot);
     return;
 #else
     if (!model.has_disk_weights()) {
         return;
     }
 
-    // experimental: split the host decode MoE into a hot and a cold pass so the
-    // cold disk read overlaps the hot compute. Opt-in via env
-    p.split_hot_active = [] {
-        const char * v = std::getenv("LLAMA_DISK_STAGE_SPLIT_HOT");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    // L2 admission filter: only store an expert the ghost has seen before, so a
-    // one-shot miss does not evict a re-read or pay a store
-    p.ghost_enabled = [] {
-        const char * v = std::getenv("LLAMA_DISK_STAGE_GHOST");
-        return v == nullptr || (v[0] != '\0' && v[0] != '0');
-    }();
-    // streaming stores for the L2 copy (the destination is cold)
-    p.nt_stores = [] {
-        const char * v = std::getenv("LLAMA_DISK_STAGE_NT");
-        return v == nullptr || (v[0] != '\0' && v[0] != '0');
-    }();
+    // split the host decode MoE into a hot and a cold pass so the cold disk read
+    // overlaps the hot compute
+    p.split_hot_active = split_hot;
 
     p.iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
     if (p.iocp == nullptr) {
@@ -1679,11 +1664,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                         // instead of following the prefill regions, so a bundle
                         // with cheaper experts than the region budget fits more
                         // slots
-                        const char * l2_env = std::getenv("LLAMA_DISK_STAGE_L2");
-                        const bool   l2_on  = l2_env == nullptr || (l2_env[0] != '\0' && l2_env[0] != '0');
-                        if (!l2_on) {
-                            LLAMA_LOG_INFO("%s: L2 eviction pool disabled by LLAMA_DISK_STAGE_L2\n", __func__);
-                        } else if (all_aligned && p.n_buf >= 2) {
+                        if (all_aligned && p.n_buf >= 2) {
                             // group the stageable layers by expert-bundle type: a
                             // slot stride is fixed per tensor, so only identical
                             // tensors can share one pool. Start with one pool per
@@ -1778,7 +1759,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                 // protected gets three quarters: one-shot misses
                                 // enter probation and cannot displace a re-read
                                 ep.prot_cap = cap - std::max(1, cap / 4);
-                                ep.ghost_cap = p.ghost_enabled ? (size_t) std::max(16, cap * 2) : 0;
+                                ep.ghost_cap = (size_t) std::max(16, cap * 2);
                                 size_t off = 0;
                                 for (const auto & role : roles) {
                                     const size_t stride = src[il].r[role.slot].stride;
@@ -1824,9 +1805,8 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                                    p.evict_pools[k].stride[0], p.evict_pools[k].stride[1],
                                                    p.evict_pools[k].stride[2]);
                                 }
-                                LLAMA_LOG_INFO("%s: L2 admission filter %s (ghost %zu slots/pool), streaming stores %s\n",
-                                               __func__, p.ghost_enabled ? "on" : "off",
-                                               p.evict_pools[0].ghost_cap, p.nt_stores ? "on" : "off");
+                                LLAMA_LOG_INFO("%s: L2 admission filter on (ghost %zu slots/pool)\n",
+                                               __func__, p.evict_pools[0].ghost_cap);
                             }
                         }
                     }
@@ -2722,13 +2702,11 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                 }
                 p.evict_populated = true;
                 int32_t eslot = -1;
-                if (!p.ghost_enabled || !ep.free_slots.empty()) {
-                    // the filter is off, or the pool still has room: admit without
-                    // waiting for a second sight, so the pool fills to capacity and
-                    // the ghost only governs admission once it is full
-                    if (p.ghost_enabled) {
-                        impl::ghost_remove(ep, key);
-                    }
+                if (!ep.free_slots.empty()) {
+                    // the pool still has room: admit without waiting for a second
+                    // sight, so it fills to capacity and the ghost only governs
+                    // admission once it is full
+                    impl::ghost_remove(ep, key);
                     eslot = p.evict_reserve(epid);
                 } else if (impl::ghost_has(ep, key)) {
                     impl::ghost_remove(ep, key);

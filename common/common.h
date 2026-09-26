@@ -518,6 +518,10 @@ struct common_params {
     // toggle: off by default; on its own (no pinning, no MoE cache) it still
     // starts the hot-expert ranking engine. See --hot-experts-prefetch.
     bool     hot_experts_prefetch  =    false;
+    // disk stage: split the host decode MoE into a hot (resident) and a cold
+    // (disk) pass on a second CPU backend, so the cold read overlaps the hot
+    // compute. Requires --load-mode dio. See --disk-stage-split-hot.
+    bool     disk_stage_split_hot  =    false;
 
     // GPU-resident cache for host-offloaded MoE experts, served from VRAM on
     // decode (0 = disabled). See --moe-expert-cache*. Works with --pin-hot-experts

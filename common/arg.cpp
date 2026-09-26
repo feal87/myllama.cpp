@@ -2996,6 +2996,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--disk-stage-split-hot"},
+        {"--no-disk-stage-split-hot"},
+        string_format(
+            "with --load-mode dio, run the host decode MoE as two passes on two\n"
+            "CPU backends: the resident (hot) experts compute first, then the\n"
+            "disk-backed (cold) experts, so the cold read overlaps the hot\n"
+            "compute (default: %s). Only the plain separate gate/up\n"
+            "Silu expert layout is split; the others fall back to one pass",
+            params.disk_stage_split_hot ? "enabled" : "disabled"
+        ),
+        [](common_params & params, bool value) {
+            params.disk_stage_split_hot = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--hot-experts-prefetch"},
         {"--no-hot-experts-prefetch"},
         string_format(

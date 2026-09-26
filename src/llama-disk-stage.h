@@ -79,10 +79,13 @@ public:
     // warm_experts_path: optional set in the same format, read into the slots
     // left free by the base set. These are evictable count-0 residents; base
     // experts are skipped. Best effort: it fills up to capacity
+    // split_hot: split the host decode MoE into a hot (resident) and a cold
+    // (disk) pass on a second CPU backend, so the cold read overlaps the hot
+    // compute
     llama_disk_stage(const llama_model & model, ggml_backend_dev_t dev,
                      int32_t n_pin_experts, uint64_t cache_budget_bytes,
                      int32_t pool_layers_max, const char * base_experts_path,
-                     const char * warm_experts_path);
+                     const char * warm_experts_path, bool split_hot);
     ~llama_disk_stage();
 
     // staging tensors of MoE layer il, or null when the layer is not stageable
@@ -112,7 +115,7 @@ public:
     // split-hot variant: fill_cache_begin() sets the tables and hands the disk
     // batch to a worker, then returns so the hot pass computes; fill_cache_wait()
     // waits for the read phase, which the cold pass needs. Only used when
-    // split_hot() is on, i.e. Windows + LLAMA_DISK_STAGE_SPLIT_HOT=1. The cache
+    // split_hot() is on (--disk-stage-split-hot, Windows). The cache
     // then carries two static skip tables that split its resident slots from the
     // transient ones, so the decoder can run the hot (resident) experts and the
     // cold (disk) experts as two host passes: the disk read overlaps the hot
