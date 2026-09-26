@@ -244,6 +244,10 @@ struct llama_moe_cache::impl {
         for (;;) {
             ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, budget_bytes);
             if (buf != nullptr) {
+                // the scheduler places a node on its weight's backend only when the
+                // weight buffer is tagged WEIGHTS; without this the cache chain is
+                // assigned by expansion and can land on a CPU backend (wrong result)
+                ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
                 if (budget_base < base_before) {
                     LLAMA_LOG_WARN("%s: MoE expert cache base budget reduced by %.1f MiB (from %.1f to %.1f MiB) to fit the free device memory\n",
                             __func__, (base_before - budget_base)/(1024.0*1024.0),
