@@ -660,6 +660,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         use_peer_access = true;
 #endif // defined(GGML_USE_NCCL)
 
+        CUresult access_err = CUDA_SUCCESS;
         if (use_peer_access) {
             // NCCL implicitly enables peer access (cudaDeviceEnablePeerAccess), and
             // GGML_CUDA_P2P enables it explicitly. Unlike cudaMalloc buffers, VMM
@@ -689,15 +690,24 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
                 access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
                 access_descs.push_back(access);
             }
-            CU_CHECK(cuMemSetAccess(start_ptr, reserve_size, access_descs.data(), access_descs.size()));
+            access_err = cuMemSetAccess(start_ptr, reserve_size, access_descs.data(), access_descs.size());
         } else {
             // set access for non P2P
             CUmemAccessDesc access = {};
             access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             access.location.id = physical_device;
             access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-            CU_CHECK(cuMemSetAccess(start_ptr, reserve_size, &access, 1));
+            access_err = cuMemSetAccess(start_ptr, reserve_size, &access, 1);
         }
+
+        if (access_err == CUDA_ERROR_OUT_OF_MEMORY) {
+            // the driver took the physical allocation but cannot map it: undo and
+            // report so the caller can free device memory and retry
+            cuMemUnmap(start_ptr, reserve_size);
+            mappings.pop_back();
+            return false;
+        }
+        CU_CHECK(access_err);
 
         pool_size += reserve_size;
 

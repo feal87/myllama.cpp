@@ -677,6 +677,14 @@ llama_context::llama_context(
         }
     }
 
+    // the prefill graph needs the CUDA scratch headroom, which lives outside the
+    // scheduler buffers: reserve it now, with the MoE pool released (prefill and
+    // the cache never run at the same time), so a configuration that cannot hold
+    // it fails here instead of aborting in the middle of a prefill
+    if (moe_cache && !moe_reserve_scratch(moe_scratch_target_bytes())) {
+        throw std::runtime_error("failed to reserve the CUDA scratch - reduce n_ubatch or n_ctx");
+    }
+
     memory_report("startup");
 }
 
@@ -892,6 +900,100 @@ void llama_context::sched_reserve() {
         backend_buf_tg_size.assign(backend_ptrs.size(), 0);
         graph_reserve(n_tokens_max, n_seqs, std::min(n_tokens_max, cparams.n_outputs_max), mctx.get(), true, backend_buf_pp_size.data());
         graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), true, backend_buf_tg_size.data());
+
+        // the synthetic init_full() reserve is not always the real worst case:
+        // graph tensors that grow with the compressed cache can exceed it. Build
+        // the real prefill graph through the normal batch path at every prefill
+        // position and reserve its buffers. The allocator then computes the true
+        // number and a configuration that cannot prefill at full context fails
+        // here instead of OOMing mid-run. Skipped while a lazy ladder is in
+        // flight: the tail positions would address rows past the current rung,
+        // which the graph rejects
+        if (!model.hparams.no_alloc && memory != nullptr && !memory->get_has_lazy_quant()) {
+            const uint32_t n_probe_seqs    = std::max<uint32_t>(1, cparams.n_seq_max);
+            const uint32_t n_probe_seq_tok = n_tokens_max / n_probe_seqs;
+
+            if (n_probe_seq_tok > 0) {
+                // sweep every ubatch-aligned start position: the allocator's
+                // max-split is not monotonic in the context position, so a coarse
+                // sample can miss the worst case
+                const uint32_t probe_last = cparams.n_ctx > n_probe_seq_tok ? cparams.n_ctx - n_probe_seq_tok : 0;
+
+                for (uint32_t start = 0; ; start = std::min(start + n_probe_seq_tok, probe_last)) {
+                    llama_batch_ext probe(this);
+                    for (uint32_t s = 0; s < n_probe_seqs; ++s) {
+                        for (uint32_t i = 0; i < n_probe_seq_tok; ++i) {
+                            const int32_t idx = probe.add_token((llama_seq_id) s);
+                            probe.set_token_id(idx, 0);
+                            const llama_pos pos = (llama_pos) (start + i);
+                            probe.set_token_pos(idx, &pos);
+                        }
+                    }
+
+                    llama_batch_allocr balloc_probe(model.hparams.n_pos_per_embd());
+                    llama_memory_context_ptr mctx_probe;
+                    if (balloc_probe.init(probe, model.vocab, false)) {
+                        mctx_probe = memory->init_batch(balloc_probe, cparams.n_ubatch, false);
+                    }
+
+                    if (mctx_probe && !llama_memory_status_is_fail(mctx_probe->get_status())) {
+                        const llama_ubatch & ub = mctx_probe->get_ubatch();
+
+                        auto * res = gf_res_reserve.get();
+
+                        // same n_outputs the runtime prefill would use
+                        const auto save_n_outputs = this->n_outputs;
+                        this->n_outputs = std::min(ub.n_tokens, cparams.n_outputs_max);
+
+                        const auto gparams = graph_params(res, ub, mctx_probe.get(), ctx_type_to_graph_type(cparams.ctx_type));
+
+                        this->n_outputs = save_n_outputs;
+
+                        res->reset();
+
+                        // mirror graph_reserve(): a scheduler reset invalidates the previous graphs
+                        ggml_backend_sched_reset(sched.get());
+                        for (auto & r : gf_res_prev) {
+                            if (r) {
+                                r->reset();
+                            }
+                        }
+                        gf_res_prev_active = nullptr;
+
+                        auto * gf = model.build_graph(gparams);
+
+                        // the allocator sizes the buffers from this real graph; a failure
+                        // is the fail-at-startup signal
+                        const bool fits = gf != nullptr && ggml_backend_sched_reserve(sched.get(), gf);
+
+                        if (!fits) {
+                            memory->clear(true);
+                            throw std::runtime_error("worst-case prefill graph does not fit the device - reduce n_ubatch or n_ctx");
+                        }
+
+                        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                            const size_t size = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+                            if (size > backend_buf_pp_size[i]) {
+                                backend_buf_pp_size[i] = size;
+                            }
+                        }
+                    }
+
+                    // undo the probe cells so the real context starts empty
+                    memory->clear(true);
+
+                    if (start >= probe_last) {
+                        break;
+                    }
+                }
+
+                for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                    LLAMA_LOG_INFO("%s: worst-case prefill: %s reserve = %8.2f MiB\n", __func__,
+                            ggml_backend_buft_name(backend_buft[i]),
+                            backend_buf_pp_size[i] / 1024.0 / 1024.0);
+                }
+            }
+        }
     }
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
@@ -4463,6 +4565,20 @@ void llama_context::vram_swap(bool to_prefill) {
     } else {
         // prefill -> decode: hand the VRAM back to the MoE cache. The pool may
         // still hold the prefill-safe base size (first decode after start-up)
+        //
+        // record the prefill compute buffers actually in use before releasing
+        // them: the start-up snapshot can understate the real graph (DeepSeek V4
+        // grows with context) and the cache budget must reclaim what is freed
+        for (size_t i = 0; i < backend_ptrs.size() && i < backend_buf_pp_size.size(); ++i) {
+            const size_t size = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+            if (size > backend_buf_pp_size[i]) {
+                LLAMA_LOG_INFO("%s: %s prefill compute buffer grew to %.1f MiB (start-up reserve was %.1f MiB) - the MoE cache reclaims the difference\n",
+                        __func__, ggml_backend_buft_name(backend_buft[i]),
+                        size/(1024.0*1024.0), backend_buf_pp_size[i]/(1024.0*1024.0));
+                backend_buf_pp_size[i] = size;
+                moe_cache_measured_gen = 0; // re-measure the decode extra with the larger prefill size
+            }
+        }
         moe_cache->suspend();
         ggml_backend_sched_release_buffers(sched.get());
         // drop the (large) prefill scratch peak and reserve the decode-phase
