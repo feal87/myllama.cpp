@@ -132,6 +132,7 @@ struct llama_moe_cache::impl {
     std::deque<upload_job>   todo;
     std::vector<upload_job>  done;
     bool                     stop = false;
+    bool                     wake_pending = false; // pending_q has new candidates
 
     // guards the bookkeeping above. All of it is mutated on the decode thread
     // (tick/rebalance/activate/suspend) and only the upload worker's own queue
@@ -150,10 +151,20 @@ struct llama_moe_cache::impl {
     uint64_t n_uploads_succeeded = 0;
     uint64_t n_uploads_failed  = 0;
 
+    // slot occupancy and ranking generation for the cheap apply_target early-out
+    // (n_total_slots/n_used_slots are guarded by mtx: fill_upload_queue runs on
+    // the worker thread; the rank generations only move on the decode thread)
+    int32_t  n_total_slots          = 0;
+    int32_t  n_used_slots           = 0; // published residents + uploads in flight
+    uint32_t rank_gen               = 0; // bumped on every refresh_ranking()
+    uint32_t last_applied_rank_gen  = 0;
+
     // rebalance scratch, reused across calls so the periodic reconciliation does
     // not allocate (rank snapshot, per-layer top sets, O(1) membership marks)
     std::vector<std::tuple<int, int32_t, uint64_t>> rank_scratch;
     std::vector<std::vector<int32_t>>               desired_scratch;
+    // per cached layer, its experts hottest-first, from the last refresh_ranking()
+    std::vector<std::vector<int32_t>>               layer_rank;
     std::vector<uint32_t>                           desired_mark;
     std::vector<uint32_t>                           inflight_mark;
     uint32_t                                        mark_stamp = 0;
@@ -341,19 +352,34 @@ static void sync_tables(llama_moe_cache_layer & pub, const std::vector<int32_t> 
     ggml_backend_tensor_set(pub.host_table, tbl.data(), 0, n_expert*sizeof(int32_t));
 }
 
-// move up to `max_inserts` pending experts to the upload worker's queue, one per
-// layer per pass so a hot layer cannot starve the others behind a long pending
-// list. The worker tops its own queue up whenever it runs dry (see below), so
-// this only matters right after a rebalance filled pending_q; the uploads then
-// proceed at the worker's pace instead of a fixed number per decode step, which
-// is what kept the cache from filling for many steps. Caller holds p->wmtx;
-// takes p->mtx (wmtx -> mtx is the lock order used everywhere).
-void llama_moe_cache::fill_upload_queue(llama_moe_cache::impl * p) {
-    std::lock_guard<std::mutex> lk(p->mtx);
+// move pending experts to the upload worker's queue, one per layer per pass, up
+// to max_inserts queued. Owns its locks: takes p->mtx for the slot reservation
+// and p->wmtx only for the queue push, so the dio snapshot copy below runs with
+// no lock held (resident_copy can move tens of MB and must not stall tick()).
+// Called by the upload worker only.
+bool llama_moe_cache::fill_upload_queue(llama_moe_cache::impl * p) {
+    int32_t room;
+    {
+        std::lock_guard<std::mutex> wlk(p->wmtx);
+        if (p->stop) {
+            return false;
+        }
+        room = p->max_inserts - (int32_t) p->todo.size();
+    }
+    if (room <= 0) {
+        return false;
+    }
 
-    while ((int32_t) p->todo.size() < p->max_inserts) {
-        bool pushed = false;
-        for (size_t li = 0; li < p->layers.size(); ++li) {
+    bool any = false;
+    for (size_t li = 0; li < p->layers.size() && room > 0; ++li) {
+        size_t  li_job   = 0;
+        int32_t e_job    = -1;
+        int32_t slot_job = -1;
+        std::shared_ptr<std::vector<char>> snap;
+
+        // reserve a free slot and take the next candidate under p->mtx
+        {
+            std::lock_guard<std::mutex> lk(p->mtx);
             auto & ls = p->layers[li];
             const int32_t n_slots = ls.pub.n_slots;
             if (ls.pending_q.empty()) {
@@ -377,37 +403,53 @@ void llama_moe_cache::fill_upload_queue(llama_moe_cache::impl * p) {
                 continue; // published meanwhile (or bad id)
             }
 
-            // dio: snapshot the disk cache's RAM rows now, under the cache lock
-            // (resident_copy), so the worker reads a private copy and the hot
-            // tier is free to evict/reuse the slot while the upload runs
-            std::shared_ptr<std::vector<char>> snap;
-            if (p->disk_mode) {
-                size_t sz[3] = { 0, 0, 0 };
-                size_t total = 0;
-                for (const auto & u : ls.uploads) {
-                    if (u.role >= 0 && u.role < 3) {
-                        sz[u.role] = u.src->nb[2];
-                        total    += u.src->nb[2];
-                    }
-                }
-                snap = std::make_shared<std::vector<char>>(total);
-                if (!p->disk->resident_copy(ls.pub.il, e, sz, snap->data(), total)) {
-                    continue; // no longer a filled RAM resident
-                }
-            }
-
             ls.slot_target[slot] = e;
-            p->todo.push_back({ li, e, slot, false, std::move(snap) });
-            p->n_uploads_queued++;
-            pushed = true;
-            if ((int32_t) p->todo.size() >= p->max_inserts) {
-                break;
+            p->n_used_slots++;
+            li_job   = li;
+            e_job    = e;
+            slot_job = slot;
+        }
+
+        // dio: snapshot the disk cache's RAM rows into a private copy, so the
+        // worker never reads a slot the hot tier may reuse (no locks held here)
+        if (p->disk_mode) {
+            auto & ls = p->layers[li_job];
+            size_t sz[3] = { 0, 0, 0 };
+            size_t total = 0;
+            for (const auto & u : ls.uploads) {
+                if (u.role >= 0 && u.role < 3) {
+                    sz[u.role] = u.src->nb[2];
+                    total    += u.src->nb[2];
+                }
+            }
+            snap = std::make_shared<std::vector<char>>(total);
+            if (!p->disk->resident_copy(ls.pub.il, e_job, sz, snap->data(), total)) {
+                // no longer a filled RAM resident: free the slot again
+                std::lock_guard<std::mutex> lk(p->mtx);
+                ls.slot_target[slot_job] = -1;
+                p->n_used_slots--;
+                continue;
             }
         }
-        if (!pushed) {
-            break; // nothing uploadable left in any layer
+
+        // publish to the worker's queue under p->wmtx (the worker waits on it)
+        {
+            std::lock_guard<std::mutex> wlk(p->wmtx);
+            if (p->stop) {
+                // torn down while we were copying: drop the reservation
+                std::lock_guard<std::mutex> lk(p->mtx);
+                p->layers[li_job].slot_target[slot_job] = -1;
+                p->n_used_slots--;
+                return any;
+            }
+            p->todo.push_back({ li_job, e_job, slot_job, false, std::move(snap) });
+            p->n_uploads_queued++;
         }
+        any = true;
+        room--;
     }
+
+    return any;
 }
 
 llama_moe_cache::llama_moe_cache(const llama_model & model, llama_hot_expert_cache * hot,
@@ -838,6 +880,8 @@ void llama_moe_cache::activate(bool relayout) {
 
     p->layers.reserve(p->cands.size());
     p->max_n_expert = 0;
+    p->n_total_slots = 0;
+    p->n_used_slots  = 0;
     int n_cached = 0;
 
     // bind every cached layer's device tensors into the reserved pool, one
@@ -915,6 +959,7 @@ void llama_moe_cache::activate(bool relayout) {
         ls.slot_target.assign(n_slots, -1);
         ls.resident.assign(c.n_expert, 0);
         p->max_n_expert = std::max(p->max_n_expert, (int32_t) c.n_expert);
+        p->n_total_slots += n_slots;
         n_cached++;
     }
 
@@ -963,25 +1008,38 @@ void llama_moe_cache::activate(bool relayout) {
     {
         std::lock_guard<std::mutex> wlk(p->wmtx);
         p->stop = false;
+        p->wake_pending = false;
     }
 
     // async upload worker
     p->worker = std::thread([p]() {
         for (;;) {
+            // refill outside wtx: the dio snapshot copy must not run under the
+            // lock tick() takes to publish, or a multi-MB memcpy would stall the
+            // decode thread. This also runs after a wake that only queued
+            // pending_q, so the worker never misses a new batch
+            llama_moe_cache::fill_upload_queue(p);
+
             impl::upload_job j;
             {
                 std::unique_lock<std::mutex> lk(p->wmtx);
-                // self-sustain: refill the queue from pending_q before waiting, so
-                // a burst of additions (activation, content rebalance) uploads at
-                // the worker's pace instead of one tick() batch per decode step
-                if (!p->stop && p->todo.empty()) {
-                    llama_moe_cache::fill_upload_queue(p);
-                }
-                p->wcv.wait(lk, [p]() { return p->stop || !p->todo.empty(); });
                 if (p->stop && p->todo.empty()) {
                     return;
                 }
-                j = p->todo.front();
+                if (p->todo.empty()) {
+                    // wait until new candidates are queued or the cache is torn
+                    // down. wake_pending is set under wmtx, so the flag and the
+                    // wait cannot race
+                    p->wcv.wait(lk, [p]() { return p->stop || p->wake_pending; });
+                    p->wake_pending = false;
+                    if (p->stop && p->todo.empty()) {
+                        return;
+                    }
+                    if (p->todo.empty()) {
+                        continue; // refill from the new pending_q batch
+                    }
+                }
+                j = std::move(p->todo.front());
                 p->todo.pop_front();
             }
 
@@ -1049,14 +1107,16 @@ void llama_moe_cache::activate(bool relayout) {
                 n_cached, n_slots_total, off/(1024.0*1024.0), pool_size/(1024.0*1024.0), p->max_inserts, layers_str.c_str());
     }
 
-    // seed the content from the current ranking immediately, then kick the
-    // upload worker (tick() keeps the queue topped up between graphs)
-    rebalance();
-    {
-        std::lock_guard<std::mutex> wlk(p->wmtx);
-        fill_upload_queue(p);
+    // seed the content from the current ranking immediately, then wake the
+    // upload worker: it owns the slot reservation and the dio snapshot, so
+    // decode only signals it here
+    if (rebalance()) {
+        {
+            std::lock_guard<std::mutex> wlk(p->wmtx);
+            p->wake_pending = true;
+        }
+        p->wcv.notify_one();
     }
-    p->wcv.notify_one();
 }
 
 // release the device pool and the layout so another consumer can use the VRAM.
@@ -1106,6 +1166,8 @@ bool llama_moe_cache::suspend() {
         p->clear_layer_index();
         p->layers.clear();
         p->retire_layout();
+        p->n_total_slots = 0;
+        p->n_used_slots  = 0;
     }
     for (const auto & [il, e] : evicted) {
         if (p->disk_mode) {
@@ -1249,22 +1311,14 @@ const llama_moe_cache_layer * llama_moe_cache::lookup(int il) const {
     return nullptr;
 }
 
-// rebalance the residents against the current ranking. No locks held when
-// entering (queries the hot cache, which locks its own mutex). Applies the
-// evictions/queues the additions under the local mutex, then re-admits the
-// evicted experts to the RAM tier.
-void llama_moe_cache::rebalance() {
+// rebuild the per-layer ranked expert list from the shared decayed ranking.
+// Called at each full rebalance; the list lets apply_target() keep the upload
+// queue topped up every decode token without re-scanning the whole ranking.
+void llama_moe_cache::refresh_ranking() {
     auto * p = pimpl.get();
 
-    {
-        std::lock_guard<std::mutex> lock(p->mtx);
-        p->n_rebalances++;
-    }
-
-    // walk the shared ranking ONCE for every cached layer: sort it by
-    // (layer, count desc, expert) and group the runs, which gives each layer
-    // its top n_slots without a per-layer query, a per-layer sort or a
-    // per-layer intermediate vector
+    // walk the shared ranking ONCE: sort it by (layer, count desc, expert), which
+    // groups each layer's experts with the hottest first
     auto & all = p->rank_scratch;
     p->hot->all_counts(all); // locks the hot cache's mutex
     std::sort(all.begin(), all.end(), [](const auto & a, const auto & b) {
@@ -1277,11 +1331,11 @@ void llama_moe_cache::rebalance() {
         return std::get<1>(a) < std::get<1>(b);
     });
 
-    // top n_slots of every cached layer, hottest first (reused scratch)
-    auto & desired = p->desired_scratch;
-    desired.resize(p->layers.size());
-    for (auto & d : desired) {
-        d.clear();
+    // split the sorted snapshot into one hottest-first list per cached layer
+    auto & rank = p->layer_rank;
+    rank.resize(p->layers.size());
+    for (auto & r : rank) {
+        r.clear();
     }
     for (const auto & [layer, expert, count] : all) {
         (void) count;
@@ -1289,23 +1343,60 @@ void llama_moe_cache::rebalance() {
         if (li < 0) {
             continue; // not a cached layer
         }
-        auto & d = desired[(size_t) li];
-        if ((int32_t) d.size() >= p->layers[(size_t) li].pub.n_slots) {
-            continue;
-        }
-        d.push_back(expert);
+        rank[(size_t) li].push_back(expert);
     }
 
-    // apply: evict residents that left the top set, queue additions. The
-    // membership tests use generation-stamped mark arrays (O(1) per slot and
-    // per candidate) instead of a linear scan of the desired list.
+    // let apply_target() know the target set may have moved
+    p->rank_gen++;
+}
+
+// Fill every empty VRAM slot with the hottest expert that can be uploaded right
+// now, and evict residents that fell out of the target. The target of a layer is
+// the hottest experts that are already served from VRAM or are a filled RAM
+// resident: an unavailable hot expert is skipped instead of blocking, so the
+// next available candidate takes the slot and no slot sits empty while the RAM
+// tier has a candidate. Runs every decode token, so a RAM resident that becomes
+// fillable is queued on the next step. No locks held when entering (queries the
+// disk, which locks its own mutex).
+bool llama_moe_cache::apply_target() {
+    auto * p = pimpl.get();
+    if (!p->activated) {
+        return false;
+    }
+
+    bool queued = false;
     std::vector<std::pair<int, int32_t>> evicted;
     {
         std::lock_guard<std::mutex> lock(p->mtx);
+
+        // every slot occupied and the ranking has not moved since the last apply:
+        // the target cannot have changed, so the scan below would do nothing
+        if (p->n_used_slots >= p->n_total_slots && p->last_applied_rank_gen == p->rank_gen) {
+            return false;
+        }
+
+        auto & desired = p->desired_scratch;
+        desired.resize(p->layers.size());
+
         for (size_t li = 0; li < p->layers.size(); ++li) {
             auto & ls = p->layers[li];
             auto & d  = desired[li];
             const int32_t n_slots = ls.pub.n_slots;
+            d.clear();
+
+            if (li < p->layer_rank.size()) {
+                for (int32_t e : p->layer_rank[li]) {
+                    if ((int32_t) d.size() >= n_slots) {
+                        break;
+                    }
+                    // keep it if VRAM already serves it, else it must be a filled
+                    // RAM resident to be uploadable now
+                    if (!ls.resident[e] && p->disk_mode && !p->disk->resident_filled(ls.pub.il, e)) {
+                        continue;
+                    }
+                    d.push_back(e);
+                }
+            }
 
             if (p->mark_stamp == UINT32_MAX) {
                 std::fill(p->desired_mark.begin(), p->desired_mark.end(), 0);
@@ -1323,7 +1414,7 @@ void llama_moe_cache::rebalance() {
                 }
             }
 
-            // evict published residents that are no longer in the top set
+            // evict published residents that are no longer in the target
             bool changed = false;
             for (int32_t s = 0; s < n_slots; ++s) {
                 const int32_t e = ls.slot_expert[s];
@@ -1335,6 +1426,7 @@ void llama_moe_cache::rebalance() {
                 }
                 ls.slot_expert[s] = -1;
                 ls.resident[e]    = 0;
+                p->n_used_slots--;
                 p->n_resident_changes++;
                 evicted.emplace_back(ls.pub.il, e);
                 changed = true;
@@ -1343,23 +1435,24 @@ void llama_moe_cache::rebalance() {
                 sync_tables(ls.pub, ls.slot_expert);
             }
 
-            // queue the additions (in ranking order) for the ticks to drain
+            // queue the additions (in ranking order) for the upload worker to drain
             ls.pending_q.clear();
             for (int32_t e : d) {
                 if (ls.resident[e]) {
                     continue;
                 }
-                // dio: the upload source is the disk decode cache's RAM slot,
-                // so only a filled RAM resident can be promoted to VRAM
-                if (p->disk_mode && !p->disk->resident_filled(ls.pub.il, e)) {
-                    continue;
-                }
                 if (p->inflight_mark[(size_t) e] == stamp) {
                     continue; // upload already in flight
                 }
+                if (p->disk_mode && !p->disk->resident_filled(ls.pub.il, e)) {
+                    continue; // lost its RAM slot since the target was built
+                }
                 ls.pending_q.push_back(e);
+                queued = true;
             }
         }
+
+        p->last_applied_rank_gen = p->rank_gen;
     }
 
     // the evicted experts are still recent-hot: hand them back to the RAM tier
@@ -1370,6 +1463,24 @@ void llama_moe_cache::rebalance() {
         }
         p->hot->promote_expert(il, e);
     }
+
+    return queued;
+}
+
+// full rebalance: refresh the ranking snapshot, then reconcile content with it.
+// apply_target() keeps the residents aligned with the same snapshot between
+// these, so this only adds the (expensive) ranking refresh.
+bool llama_moe_cache::rebalance() {
+    auto * p = pimpl.get();
+
+    {
+        std::lock_guard<std::mutex> lock(p->mtx);
+        p->n_rebalances++;
+    }
+
+    refresh_ranking();
+
+    return apply_target();
 }
 
 void llama_moe_cache::tick(int64_t n_content_tokens) {
@@ -1399,6 +1510,7 @@ void llama_moe_cache::tick(int64_t n_content_tokens) {
                 ls.slot_target[j.slot] = -1;
                 if (j.failed) {
                     p->n_uploads_failed++;
+                    p->n_used_slots--; // the slot is free again
                     continue; // source was gone; retried by the next rebalance
                 }
                 ls.slot_expert[j.slot] = j.expert;
@@ -1434,13 +1546,14 @@ void llama_moe_cache::tick(int64_t n_content_tokens) {
     //    ranking, rebuild the whole layout (activate() evicts the residents and
     //    rebalances internally) instead of just realigning the content, so the
     //    two do not upload twice
+    bool queued = false;
     if (p->n_content - p->last_rebalance >= kRebalanceContentTokens) {
         p->last_rebalance = p->n_content;
         if (p->drift_percent > 0.0f && p->epoch_rebuilt) {
             const float drift = layout_drift();
             if (drift < 0.0f) {
                 LLAMA_LOG_INFO("%s: MoE expert cache layout drift unavailable - keeping the layout\n", __func__);
-                rebalance();
+                queued = rebalance();
             } else if (drift * 100.0f > p->drift_percent) {
                 LLAMA_LOG_INFO("%s: MoE expert cache layout drift %.1f%% > %.1f%% - rebuilding the layout\n",
                         __func__, drift * 100.0f, p->drift_percent);
@@ -1448,21 +1561,26 @@ void llama_moe_cache::tick(int64_t n_content_tokens) {
             } else {
                 LLAMA_LOG_INFO("%s: MoE expert cache layout drift %.1f%% <= %.1f%% - keeping the layout\n",
                         __func__, drift * 100.0f, p->drift_percent);
-                rebalance();
+                queued = rebalance();
             }
         } else {
-            rebalance();
+            queued = rebalance();
         }
+    } else {
+        // not a rebalance tick: fill any free slot with the best RAM-available
+        // expert now; full and ranking unchanged? apply_target() early-outs
+        queued = apply_target();
     }
 
-    // 3) top the upload queue up again: the worker keeps its own queue full from
-    //    pending_q between calls, so this only matters right after a rebalance
-    //    filled pending_q (and it is what wakes the worker from idle)
-    {
-        std::lock_guard<std::mutex> wlk(p->wmtx);
-        fill_upload_queue(p);
+    // 3) wake the upload worker when new candidates were queued. The worker owns
+    //    the slot reservation and the dio snapshot, so decode never copies here
+    if (queued) {
+        {
+            std::lock_guard<std::mutex> wlk(p->wmtx);
+            p->wake_pending = true;
+        }
+        p->wcv.notify_one();
     }
-    p->wcv.notify_one();
 }
 
 // periodic stats report, driven by llama_context at the shared

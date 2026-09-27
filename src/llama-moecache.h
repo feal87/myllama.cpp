@@ -238,8 +238,21 @@ class llama_moe_cache {
     // profile gives no layer a slot; false is the initial activation
     void activate(bool relayout);
 
-    // reconcile the residents with the current ranking (see llama-moecache.cpp)
-    void rebalance();
+    // rebuild the per-layer ranked expert lists from the shared ranking. Called
+    // by rebalance() so apply_target() can top the upload queue up every tick
+    // without re-scanning and re-sorting the whole ranking
+    void refresh_ranking();
+
+    // fill every empty VRAM slot with the hottest expert that can be uploaded
+    // right now (already served from VRAM, or a filled RAM resident) and evict
+    // residents that fell out of the target. Runs every decode token while the
+    // cache is not full; returns true when it queued candidates, so the caller
+    // knows it must wake the upload worker
+    bool apply_target();
+
+    // full rebalance: refresh the ranking snapshot, then reconcile content with
+    // it. Returns true when the pass queued candidates
+    bool rebalance();
 
     // size the per-layer slot counts the current ranking would carve from the
     // pool. Shared by activate() and the periodic drift check so both compare
@@ -251,8 +264,9 @@ class llama_moe_cache {
     // current layout matches the ideal, 1 = no slot overlaps
     float layout_drift() const;
 
-    // move up to `max_inserts` pending experts to the upload worker's queue, one
-    // per layer per pass; the worker keeps its queue topped up between calls.
-    // Caller holds impl::wmtx; takes impl::mtx.
-    static void fill_upload_queue(impl * p);
+    // move pending experts to the upload worker's queue, one per layer per pass,
+    // up to max_inserts queued. Owns its locks: takes impl::mtx for the slot
+    // reservation and impl::wmtx only for the queue push, so the dio snapshot
+    // copy runs with no lock held. Called by the upload worker only.
+    static bool fill_upload_queue(impl * p);
 };
