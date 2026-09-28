@@ -257,6 +257,7 @@ class llama_hot_expert_cache {
     // disk stage resolves the template rules; the current set is unchanged when
     // the selected name is already active
     void set_base_set_for_tools(const std::vector<std::string> & tools);
+    bool set_base_set_for_fence();
 
     // Prints the periodic stats report via LLAMA_LOG_INFO (verbosity 4): a header
     // line plus one themed line each for the slots, hit rate, churn, memory, locks,
@@ -394,6 +395,7 @@ class llama_hot_expert_cache {
     void add_base_pin(int il, layer_state & ls, int32_t expert_id);
 
     // demote/admit one base expert while switching modes (caller holds mu)
+    bool set_base_set(const std::string & name);
     void demote_base_pin(int il, layer_state & ls, int32_t expert_id);
     bool admit_base_pin(int il, layer_state & ls, int32_t expert_id);
 

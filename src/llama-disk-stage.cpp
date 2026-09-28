@@ -3424,6 +3424,10 @@ std::string llama_disk_stage::select_base_set(const std::vector<std::string> & t
     return pimpl->have_base_template ? pimpl->base_template.select(tools) : std::string();
 }
 
+std::string llama_disk_stage::fence_base_set() const {
+    return pimpl->have_base_template ? pimpl->base_template.fence_set : std::string();
+}
+
 bool llama_disk_stage::set_base_target(const std::string & name) {
     impl & p = *pimpl;
     const auto it = p.base_targets.find(name);

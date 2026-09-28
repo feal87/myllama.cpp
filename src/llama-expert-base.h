@@ -12,6 +12,7 @@
 //   set    shellnav  shellnav.txt
 //   set    code      code.txt
 //   default prose                      # no tool matched
+//   fence  code                        # while inside a fenced code block
 //   tools  bash,shell,run,cmd   shellnav
 //   tools  edit,write,read      code
 //
@@ -36,6 +37,8 @@ struct llama_expert_base_template {
     std::string base_file;
     // set used when no rule matches the turn's tools (empty = base only)
     std::string default_set;
+    // optional set used while generating a Markdown fenced code block
+    std::string fence_set;
     // set name -> expert set file, relative to the template's directory
     std::map<std::string, std::string> set_files;
     // conditions in file order; the first match wins

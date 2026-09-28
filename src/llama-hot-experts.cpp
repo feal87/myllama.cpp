@@ -1319,19 +1319,32 @@ bool llama_hot_expert_cache::evict_coldest_for_base(int pool) {
 }
 
 void llama_hot_expert_cache::set_base_set_for_tools(const std::vector<std::string> & tools) {
-    if (disk_stage == nullptr) {
-        return;
+    if (disk_stage != nullptr) {
+        set_base_set(disk_stage->select_base_set(tools));
     }
-    const std::string name = disk_stage->select_base_set(tools);
+}
+
+bool llama_hot_expert_cache::set_base_set_for_fence() {
+    if (disk_stage == nullptr) {
+        return false;
+    }
+    const std::string name = disk_stage->fence_base_set();
+    return !name.empty() && set_base_set(name);
+}
+
+bool llama_hot_expert_cache::set_base_set(const std::string & name) {
+    if (disk_stage == nullptr) {
+        return false;
+    }
     const auto * target = disk_stage->base_set_by_name(name);
     if (target == nullptr) {
         LLAMA_LOG_WARN("%s: expert base template selected unknown set '%s'\n", __func__, name.c_str());
-        return;
+        return false;
     }
 
     std::lock_guard<std::mutex> lock(mu);
     if (disk_stage->active_base_set() == name) {
-        return;
+        return true;
     }
 
     // First demote experts no longer in the target. Their slots stay resident
@@ -1396,6 +1409,7 @@ void llama_hot_expert_cache::set_base_set_for_tools(const std::vector<std::strin
     rebuild_pinned_rank();
     LLAMA_LOG_INFO("%s: switched base expert set to '%s' (%d expert(s) permanent)\n",
                    __func__, name.empty() ? "<base>" : name.c_str(), n_base);
+    return true;
 }
 
 void llama_hot_expert_cache::complete_disk_pin(int il, layer_state & ls, int32_t expert_id, size_t bytes) {

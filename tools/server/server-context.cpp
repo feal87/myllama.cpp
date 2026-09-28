@@ -5333,6 +5333,18 @@ std::unique_ptr<server_res_generator> server_routes::create_response(bool bypass
             }
             llama_expert_base_set_tools(ctx, names.data(), names.size());
         };
+        res->rd.code_fence_cb = [ctx](bool active, const std::vector<std::string> & tools) {
+            if (active) {
+                return llama_expert_base_set_fence(ctx);
+            }
+            std::vector<const char *> names;
+            names.reserve(tools.size());
+            for (const std::string & tool : tools) {
+                names.push_back(tool.c_str());
+            }
+            llama_expert_base_set_tools(ctx, names.data(), names.size());
+            return true;
+        };
     }
     return res;
 }

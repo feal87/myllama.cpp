@@ -8,6 +8,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 #include <unordered_set>
@@ -199,6 +200,29 @@ public:
     void terminate();
 };
 
+struct server_markdown_fence_scanner {
+    enum class line_phase { leading, fence_run, fence_tail, other };
+
+    bool in_fence = false;
+    bool mode_active = false;
+    bool skip_lf = false;
+    char fence_char = 0;
+    size_t fence_length = 0;
+    line_phase phase = line_phase::leading;
+    size_t indent = 0;
+    char line_fence_char = 0;
+    size_t line_fence_length = 0;
+    bool opener_valid = true;
+    bool closer_valid = true;
+
+    void feed(std::string_view text, const std::function<bool()> & on_open, const std::function<void()> & on_close);
+    void finish(const std::function<bool()> & on_open, const std::function<void()> & on_close);
+
+  private:
+    void process_char(char c);
+    void end_line(const std::function<bool()> & on_open, const std::function<void()> & on_close);
+};
+
 // RAII wrapper to make working with server_queue and server_response easier
 // it provides a generator-like API for server responses
 // support pooling connection state and aggregating multiple results
@@ -214,7 +238,10 @@ struct server_response_reader {
     // only used by streaming completions
     std::vector<task_result_state> states;
     std::vector<std::vector<std::string>> reported_tool_names;
+    std::vector<std::vector<std::string>> base_tool_names;
+    std::vector<server_markdown_fence_scanner> markdown_fences;
     std::function<void(const std::vector<std::string> &)> tool_call_cb;
+    std::function<bool(bool, const std::vector<std::string> &)> code_fence_cb;
 
     // should_stop function will be called each polling_interval_seconds
     server_response_reader(server_queue & queue_tasks, server_response & queue_results, int polling_interval_seconds)

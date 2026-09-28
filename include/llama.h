@@ -1275,6 +1275,10 @@ extern "C" {
     // Call between llama_decode() calls, with no graph in flight.
     LLAMA_API void llama_expert_base_set_tools(struct llama_context * ctx, const char * const * tools, size_t n_tools);
 
+    // Select the expert set configured for Markdown fenced code blocks.
+    // Returns false when the template has no 'fence' set.
+    LLAMA_API bool llama_expert_base_set_fence(struct llama_context * ctx);
+
     // Token logits obtained from the last call to llama_decode()
     // The logits for which llama_batch.logits[i] != 0 are stored contiguously
     // in the order they have appeared in the batch.

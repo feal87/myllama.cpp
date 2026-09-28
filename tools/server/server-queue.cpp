@@ -509,6 +509,103 @@ void server_response::terminate() {
 }
 
 //
+// server_markdown_fence_scanner
+//
+
+void server_markdown_fence_scanner::process_char(char c) {
+    if (phase == line_phase::other) {
+        return;
+    }
+    if (phase == line_phase::leading) {
+        if (c == ' ' && indent < 3) {
+            indent++;
+            return;
+        }
+        if (c == '`' || c == '~') {
+            phase = line_phase::fence_run;
+            line_fence_char = c;
+            line_fence_length = 1;
+            return;
+        }
+        phase = line_phase::other;
+        return;
+    }
+    if (phase == line_phase::fence_run && c == line_fence_char) {
+        line_fence_length++;
+        return;
+    }
+    if (phase == line_phase::fence_run) {
+        phase = line_phase::fence_tail;
+        if (in_fence && (line_fence_char != fence_char || line_fence_length < fence_length || (c != ' ' && c != '\t'))) {
+            closer_valid = false;
+        }
+    }
+    if (phase == line_phase::fence_tail) {
+        if (!in_fence && line_fence_char == '`' && c == '`') {
+            opener_valid = false;
+        } else if (in_fence && c != ' ' && c != '\t') {
+            closer_valid = false;
+        }
+    }
+}
+
+void server_markdown_fence_scanner::end_line(
+        const std::function<bool()> & on_open,
+        const std::function<void()> & on_close) {
+    if (phase == line_phase::fence_run || phase == line_phase::fence_tail) {
+        if (!in_fence && line_fence_length >= 3 && opener_valid) {
+            in_fence = true;
+            fence_char = line_fence_char;
+            fence_length = line_fence_length;
+            mode_active = on_open && on_open();
+        } else if (in_fence && line_fence_char == fence_char && line_fence_length >= fence_length && closer_valid) {
+            in_fence = false;
+            fence_char = 0;
+            fence_length = 0;
+            if (mode_active && on_close) {
+                on_close();
+            }
+            mode_active = false;
+        }
+    }
+    phase = line_phase::leading;
+    indent = 0;
+    line_fence_char = 0;
+    line_fence_length = 0;
+    opener_valid = true;
+    closer_valid = true;
+}
+
+void server_markdown_fence_scanner::feed(
+        std::string_view text,
+        const std::function<bool()> & on_open,
+        const std::function<void()> & on_close) {
+    for (char c : text) {
+        if (skip_lf) {
+            skip_lf = false;
+            if (c == '\n') {
+                continue;
+            }
+        }
+        if (c == '\r') {
+            end_line(on_open, on_close);
+            skip_lf = true;
+        } else if (c == '\n') {
+            end_line(on_open, on_close);
+        } else {
+            process_char(c);
+        }
+    }
+}
+
+void server_markdown_fence_scanner::finish(
+        const std::function<bool()> & on_open,
+        const std::function<void()> & on_close) {
+    skip_lf = false;
+    end_line(on_open, on_close);
+}
+
+//
 // server_response_reader
 //
 
@@ -519,6 +616,8 @@ void server_response_reader::post_task(server_task && task, bool front) {
     id_tasks.insert(task.id);
     states.push_back(task.create_state());
     reported_tool_names.emplace_back();
+    base_tool_names.push_back(task.params.expert_base_tools);
+    markdown_fences.emplace_back();
     queue_results.add_waiting_task_id(task.id);
     queue_tasks.post(std::move(task), front);
 }
@@ -531,10 +630,14 @@ void server_response_reader::post_tasks(std::vector<server_task> && tasks, bool 
     for (auto & task : tasks) {
         task.index = index++;
         states.push_back(task.create_state());
+        base_tool_names.push_back(task.params.expert_base_tools);
+        markdown_fences.emplace_back();
         // for child tasks
         for (auto & child_task : task.child_tasks) {
             child_task.index = index++;
             states.push_back(child_task.create_state());
+            base_tool_names.push_back(child_task.params.expert_base_tools);
+            markdown_fences.emplace_back();
         }
     }
     reported_tool_names.resize(states.size());
@@ -568,6 +671,8 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
                 const size_t idx = result->index;
                 GGML_ASSERT(idx < states.size());
                 GGML_ASSERT(idx < reported_tool_names.size());
+                GGML_ASSERT(idx < base_tool_names.size());
+                GGML_ASSERT(idx < markdown_fences.size());
                 result->update(states[idx]);
                 if (tool_call_cb) {
                     const auto & calls = states[idx].chat_msg.tool_calls;
@@ -590,7 +695,33 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
                                 reported.push_back(call.name);
                             }
                         }
-                        tool_call_cb(reported);
+                        base_tool_names[idx] = reported;
+                        if (!markdown_fences[idx].mode_active) {
+                            tool_call_cb(base_tool_names[idx]);
+                        }
+                    }
+                }
+                if (code_fence_cb) {
+                    const std::vector<common_chat_msg_diff> * diffs = nullptr;
+                    if (const auto * partial = dynamic_cast<const server_task_result_cmpl_partial *>(result.get())) {
+                        diffs = &partial->oaicompat_msg_diffs;
+                    } else if (const auto * final = dynamic_cast<const server_task_result_cmpl_final *>(result.get())) {
+                        diffs = &final->oaicompat_msg_diffs;
+                    }
+                    const auto on_open = [this, idx]() {
+                        return code_fence_cb(true, base_tool_names[idx]);
+                    };
+                    const auto on_close = [this, idx]() {
+                        code_fence_cb(false, base_tool_names[idx]);
+                    };
+                    if (diffs != nullptr) {
+                        for (const common_chat_msg_diff & diff : *diffs) {
+                            markdown_fences[idx].feed(diff.reasoning_content_delta, on_open, on_close);
+                            markdown_fences[idx].feed(diff.content_delta, on_open, on_close);
+                        }
+                    }
+                    if (result->is_stop()) {
+                        markdown_fences[idx].finish(on_open, on_close);
                     }
                 }
             }

@@ -324,6 +324,7 @@ public:
 
     // select the expert base set for the current turn's tool names
     void set_expert_base_tools(const char * const * tools, size_t n_tools);
+    bool set_expert_base_fence();
 
 private:
     llm_graph_result * get_gf_res_prev();

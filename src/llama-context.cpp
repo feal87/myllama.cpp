@@ -1682,6 +1682,10 @@ void llama_context::set_expert_base_tools(const char * const * tools, size_t n_t
     hot_experts->set_base_set_for_tools(names);
 }
 
+bool llama_context::set_expert_base_fence() {
+    return hot_experts && hot_experts->set_base_set_for_fence();
+}
+
 void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
     LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
 
@@ -5135,6 +5139,10 @@ void llama_expert_profile_flush(llama_context * ctx) {
 
 void llama_expert_base_set_tools(llama_context * ctx, const char * const * tools, size_t n_tools) {
     ctx->set_expert_base_tools(tools, n_tools);
+}
+
+bool llama_expert_base_set_fence(llama_context * ctx) {
+    return ctx->set_expert_base_fence();
 }
 
 float * llama_get_logits(llama_context * ctx) {

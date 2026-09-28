@@ -160,6 +160,14 @@ void llama_expert_base_template_parse(const std::string & path, llama_expert_bas
                 fail("duplicate default set");
             }
             out.default_set = f[1];
+        } else if (key == "fence") {
+            if (f.size() != 2) {
+                fail("expected 'fence <set>'");
+            }
+            if (!out.fence_set.empty()) {
+                fail("duplicate fence set");
+            }
+            out.fence_set = f[1];
         } else if (key == "tools") {
             // the tool list may contain spaces after the commas, so everything
             // but the last field is the list
@@ -187,6 +195,9 @@ void llama_expert_base_template_parse(const std::string & path, llama_expert_bas
     }
     if (!out.default_set.empty() && out.set_files.count(out.default_set) == 0) {
         throw std::runtime_error("expert base template: '" + path + "': undeclared default set '" + out.default_set + "'");
+    }
+    if (!out.fence_set.empty() && out.set_files.count(out.fence_set) == 0) {
+        throw std::runtime_error("expert base template: '" + path + "': undeclared fence set '" + out.fence_set + "'");
     }
     for (const llama_expert_base_template::rule & r : out.rules) {
         if (r.tools.empty()) {

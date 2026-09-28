@@ -173,6 +173,7 @@ public:
     // The empty name is the base set alone and always resolves
     const std::vector<std::vector<int32_t>> * base_set_by_name(const std::string & name) const;
     std::string select_base_set(const std::vector<std::string> & tools) const;
+    std::string fence_base_set() const;
     bool set_base_target(const std::string & name);
 
     // make `id` of layer `il` a base resident: marks it unevictable and reserves
