@@ -1107,7 +1107,7 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
     // accumulators exist for the trace, which prints them per token
     if (split.layers > 0 && d_tokens > 0) {
         line("  split     : %.2f ms of read per decode token, %.0f%% hidden behind the hot pass,"
-             " %.0f%% still outstanding at the cold pass | %.2f MiB per token over %d layer(s)",
+             " %.0f%% still outstanding at the cold pass | %.2f MiB per token over %d layer split(s)",
              (double) split.read_us / 1000.0 / (double) d_tokens,
              split.read_us > 0 ? 100.0 * (double) split.ovl_us / (double) split.read_us : 0.0,
              split.read_us > 0 ? 100.0 * (double) split.stall_us / (double) split.read_us : 0.0,
@@ -1119,15 +1119,17 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
         for (size_t k = 0; k < p.evict_pools.size(); ++k) {
             const impl::evict_pool & ep = p.evict_pools[k];
             const uint64_t look = ep.hits + ep.misses;
-            if (row.size() > 110) {
-                out += row;
-                out += '\n';
-                row = "            ";
-            }
             snprintf(buf, sizeof(buf), " pool %zu: %zu/%d live, hit %.1f%% (%" PRIu64 "/%" PRIu64
                      " warm), evictions %" PRIu64, k, ep.slot_of.size(), ep.cap,
                      look ? 100.0 * (double) ep.hits / (double) look : 0.0, ep.hits, look, ep.evictions);
             row += buf;
+            // wrap after appending: checking first lets the last entry push the
+            // row well past the width
+            if (row.size() > 110 && k + 1 < p.evict_pools.size()) {
+                out += row;
+                out += '\n';
+                row = "            ";
+            }
         }
         out += row;
         out += '\n';
@@ -3248,7 +3250,6 @@ void llama_disk_stage::split_report() {
     a.stall_us += stall_us;
     a.span_us  += t_end - s.t_begin;
     a.bytes    += (int64_t) p.dec_bytes;
-    p.split_tot += a;
 
     p.trace_split = {};
 #else
@@ -3285,6 +3286,10 @@ void llama_disk_stage::split_token_end() {
                        a.read_us > 0 ? 100.0 * (double) a.ovl_us / (double) a.read_us : 0.0,
                        a.stall_us / 1000.0);
     }
+    // the token is over: fold it into the interval totals the report prints.
+    // This is the only place the token accumulator is whole, split_report() runs
+    // once per layer and would add the same partial token again and again
+    p.split_tot += a;
     p.trace_split_tok = {};
 #endif
 }

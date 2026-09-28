@@ -1770,6 +1770,7 @@ void llama_moe_cache::print_stats() {
 
     if (n_layers_cached > 0) {
         std::string row = "  layers   :";
+        bool wrapped = false;
         for (const auto & r : report) {
             if (r.n_slots <= 0) {
                 continue;
@@ -1777,13 +1778,16 @@ void llama_moe_cache::print_stats() {
             const uint64_t t = r.n_hit + r.n_miss;
             const int n_chars = snprintf(buf, sizeof(buf), " L%d %d/%d %.1f%%", r.il, r.n_res, r.n_slots,
                                          t ? 100.0 * r.n_hit / t : 0.0);
-            if (row.size() > 110) {
+            if (n_chars > 0) {
+                row.append(buf, (size_t) std::min((size_t) n_chars, sizeof(buf) - 1));
+            }
+            // wrap after appending: checking first lets the last entry push the
+            // row well past the width
+            if (row.size() > 110 && !wrapped) {
                 out += row;
                 out += '\n';
                 row = "            ";
-            }
-            if (n_chars > 0) {
-                row.append(buf, (size_t) std::min((size_t) n_chars, sizeof(buf) - 1));
+                wrapped = true;
             }
         }
         out += row;

@@ -363,16 +363,20 @@ void llama_hot_expert_cache::print_stats(bool final_report) {
 
     if (n_layers_used > 0) {
         std::string row = "  layers   :";
+        bool wrapped = false;
         for (size_t il = 0; il < per_layer.size(); ++il) {
             if (per_layer[il] == 0) {
                 continue;
             }
-            if (row.size() > 110) {
+            row += " L" + std::to_string(il) + "=" + std::to_string(per_layer[il]);
+            // wrap after appending: checking first lets the last entry push the
+            // row well past the width
+            if (row.size() > 110 && !wrapped) {
                 out += row;
                 out += '\n';
                 row = "            ";
+                wrapped = true;
             }
-            row += " L" + std::to_string(il) + "=" + std::to_string(per_layer[il]);
         }
         out += row;
         out += '\n';
