@@ -124,7 +124,7 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
 
 llama_hot_expert_cache::~llama_hot_expert_cache() {
     if (n_pin > 0 || prefetch_enabled) {
-        print_stats();
+        print_stats(/* final_report = */ true);
     }
     if (profile_file != nullptr) {
         std::lock_guard<std::mutex> lock(mu);
@@ -151,7 +151,7 @@ llama_hot_expert_cache::~llama_hot_expert_cache() {
     }
 }
 
-void llama_hot_expert_cache::print_stats() {
+void llama_hot_expert_cache::print_stats(bool final_report) {
     // gather everything under mu, then log after unlocking: console writes are
     // synchronous on Windows and must not stall the pin worker or a VRAM takeover
     size_t   total_distinct_seen = 0;
@@ -180,6 +180,15 @@ void llama_hot_expert_cache::print_stats() {
     uint64_t prev_base           = 0;
     uint64_t prev_total          = 0;
     size_t   n_base_used         = 0;
+    uint64_t prev_hit            = 0;
+    uint64_t prev_routed         = 0;
+    uint64_t n_reserved          = 0;
+    uint64_t n_prompt_decays     = 0;
+    size_t   n_inflight          = 0;
+    size_t   n_queued            = 0;
+    size_t   n_moe_layers        = 0;
+    uint32_t n_reports           = 0;
+    bool     prefetch_active     = false;
 
     // one slot per layer, filled under mu and read after
     std::vector<size_t> per_layer(layers.size(), 0);
@@ -207,6 +216,16 @@ void llama_hot_expert_cache::print_stats() {
         route_total         = n_route_total;
         prev_base           = prev_route_base;
         prev_total          = prev_route_total;
+        prev_hit            = prev_route_hit;
+        prev_routed         = prev_routed_total;
+        n_reserved          = n_bytes_reserved;
+        n_prompt_decays     = n_decays_prompt;
+        n_inflight          = pin_inflight.size();
+        n_queued            = pin_queue.size();
+        n_reports           = n_reports_total;
+        // the row prefetch needs the mmap'd model pages, which the disk decode
+        // cache bypasses: it is skipped entirely there, so it is not reported
+        prefetch_active     = prefetch_enabled && disk_stage == nullptr;
 
         // RAM occupancy: pinned holds every resident, base included. Base entries
         // are permanent (never churn), so churn and the count range cover the
@@ -243,6 +262,7 @@ void llama_hot_expert_cache::print_stats() {
             if (!ls.resolved_tensors) {
                 continue;
             }
+            n_moe_layers++;
             for (uint32_t id = 0; id < ls.n_experts; ++id) {
                 if ((ls.pin_state[(size_t) id] & PIN_BASE) != 0 && ls.counts[(size_t) id] > 0) {
                     n_base_used++;
@@ -252,68 +272,113 @@ void llama_hot_expert_cache::print_stats() {
 
         prev_route_base  = n_route_base;
         prev_route_total = n_route_total;
+        prev_route_hit   = n_route_hit;
+        prev_routed_total = n_route_hit + n_route_miss;
+        n_reports_total++;
         stats_stamp = next_stamp;
     }
 
-    const size_t n_dynamic = total_pinned - n_base_ram;
-
-    LLAMA_LOG_INFO("[pin-hot-experts] RAM tier: residents=%zu/%d slots (dynamic=%zu, base=%zu ram + %d vram, free=%d, %d pool(s))"
-                   " | hit=%.1f%% (%" PRIu64 "/%" PRIu64 " routed)"
-                   " | churn=%.1f%% (%zu/%zu dynamic changed since last report)"
-                   " | locked=%.2f MiB (lock calls=%" PRIu64 " slow=%" PRIu64 " fails=%" PRIu64 ")",
-                   total_pinned, n_pin_total, n_dynamic, n_base_ram,
-                   (int) ((int32_t) n_base - (int32_t) n_base_ram),
-                   (int) ((int32_t) n_pin_total - (int32_t) total_pinned), n_pools,
-                   routed_total ? 100.0 * routed_hit / routed_total : 0.0, routed_hit, routed_total,
-                   n_dynamic ? 100.0 * n_new / n_dynamic : 0.0, n_new, n_dynamic,
-                   bytes_locked / (1024.0 * 1024.0), lock_calls, lock_slow, pin_failures);
-
-    LLAMA_LOG_CONT(" | obs=%" PRIu64 " ub=%" PRIu64 " | distinct (layer,expert) seen=%zu"
-                   " | prefetch calls=%" PRIu64 " bytes=%.2f MiB failures=%" PRIu64
-                   " | decays=%" PRIu64 " takeover holds=%" PRIu64 " min-count holds=%" PRIu64,
-                   eval_calls, ubatches, total_distinct_seen, prefetch_calls,
-                   prefetch_bytes / (1024.0 * 1024.0), prefetch_failures, decays, hysteresis_holds,
-                   min_count_holds);
-
-    if (any_rank) {
-        LLAMA_LOG_CONT(" | pinned count range=[%" PRIu64 ", %" PRIu64 "]", min_count, max_count);
-    }
-
-    // base set feedback: how much of the decode routing the base experts serve and
-    // how many of them were ever routed (a large gap to n_base means dead weight)
-    if (n_base > 0) {
-        const uint64_t d_base  = route_base  - prev_base;
-        const uint64_t d_total = route_total - prev_total;
-        LLAMA_LOG_CONT(" | base: routed=%.1f%% (cum %" PRIu64 "/%" PRIu64 ")"
-                       " | interval=%.1f%% (%" PRIu64 "/%" PRIu64 ")"
-                       " | used=%zu/%d",
-                       route_total ? 100.0 * route_base / route_total : 0.0, route_base, route_total,
-                       d_total ? 100.0 * d_base / d_total : 0.0, d_base, d_total,
-                       n_base_used, (int) n_base);
-    }
+    const size_t n_dynamic   = total_pinned - n_base_ram;
+    const int    n_base_vram = (int) ((int32_t) n_base - (int32_t) n_base_ram);
+    const size_t n_free      = (size_t) std::max((int32_t) n_pin_total - (int32_t) total_pinned, 0);
+    const double mib         = 1024.0 * 1024.0;
 
     // per-layer breakdown, already in layer order
     size_t n_layers_used = 0;
     for (const size_t c : per_layer) {
         n_layers_used += c != 0 ? 1 : 0;
     }
+
+    // one themed line each, emitted as a single write: a console write per line
+    // was the only measurable cost of the report (Windows console writes are
+    // synchronous)
+    std::string out = "[pin-hot-experts] RAM tier report #";
+    out += std::to_string(n_reports + 1);
+    out += final_report ? " (final)\n" : "\n";
+
+    char buf[1024];
+    auto line = [&out, &buf](const char * fmt, auto... args) {
+        const int n_chars = snprintf(buf, sizeof(buf), fmt, args...);
+        if (n_chars > 0) {
+            out.append(buf, (size_t) std::min((size_t) n_chars, sizeof(buf) - 1));
+        }
+        out += '\n';
+    };
+
+    line("  slots    : %zu/%d residents (dynamic %zu, base %zu ram + %d vram) | free %zu"
+         " | pools %d | layers %zu/%zu | min-count %" PRIu64 " | in flight %zu, queued %zu",
+         total_pinned, n_pin_total, n_dynamic, n_base_ram, n_base_vram, n_free, n_pools,
+         n_layers_used, n_moe_layers ? n_moe_layers : per_layer.size(), min_pin_count, n_inflight,
+         n_queued);
+
+    line("  hit      : %.1f%% cumulative (%" PRIu64 "/%" PRIu64 " routed) | %.1f%% this interval (%" PRIu64 "/%" PRIu64 ")",
+         routed_total ? 100.0 * routed_hit / routed_total : 0.0, routed_hit, routed_total,
+         routed_total > prev_routed ? 100.0 * (routed_hit - prev_hit) / (routed_total - prev_routed) : 0.0,
+         routed_hit - prev_hit, routed_total - prev_routed);
+
+    line("  churn    : %.1f%% of the dynamic set changed (%" PRIu64 "/%zu) | takeovers held %" PRIu64
+         " | min-count holds %" PRIu64,
+         n_dynamic ? 100.0 * n_new / n_dynamic : 0.0, (uint64_t) n_new, n_dynamic,
+         hysteresis_holds, min_count_holds);
+
+    line("  memory   : %.2f MiB resident of a %.2f MiB budget (%.1f%%) | %.2f MiB reserved by in-flight pins",
+         bytes_locked / mib, budget_bytes / mib,
+         budget_bytes ? 100.0 * bytes_locked / (double) budget_bytes : 0.0, n_reserved / mib);
+
+    if (n_pin > 0 && disk_stage == nullptr) {
+        line("  locks    : %" PRIu64 " calls, %" PRIu64 " slow (over %" PRId64 " us), %" PRIu64 " failed",
+             lock_calls, lock_slow, lock_slow_us, pin_failures);
+    }
+
+    char range[64] = "n/a (no ranked resident)";
+    if (any_rank) {
+        snprintf(range, sizeof(range), "%" PRIu64 "..%" PRIu64, min_count, max_count);
+    }
+    line("  ranking  : %zu distinct (layer, expert) pairs seen | %" PRIu64 " observations in %" PRIu64 " ubatches"
+         " | pinned counts %s",
+         total_distinct_seen, eval_calls, ubatches, range);
+
+    const std::string window     = decay_interval > 0 ? "every " + std::to_string(decay_interval) + " tokens" : "off";
+    const std::string divisor    = prompt_decay > 1 ? std::to_string(prompt_decay) : "off (1)";
+    line("  decays   : %" PRIu64 " total, %" PRIu64 " periodic (%s), %" PRIu64 " at prompt start (divisor %s)",
+         decays, decays - n_prompt_decays, window.c_str(), n_prompt_decays, divisor.c_str());
+
+    // base set feedback: how much of the decode routing the base experts serve and
+    // how many of them were ever routed (a large gap to n_base means dead weight)
+    if (n_base > 0) {
+        const uint64_t d_base  = route_base  - prev_base;
+        const uint64_t d_total = route_total - prev_total;
+        line("  base set : %.1f%% of the routes (%" PRIu64 "/%" PRIu64 ") | %.1f%% this interval (%" PRIu64 "/%" PRIu64 ")"
+             " | %zu/%d ever routed",
+             route_total ? 100.0 * route_base / route_total : 0.0, route_base, route_total,
+             d_total ? 100.0 * d_base / d_total : 0.0, d_base, d_total, n_base_used, (int) n_base);
+    }
+
+    // the row prefetch works on the mmap'd model pages, which the disk decode
+    // cache bypasses: it is skipped there, so it is not reported either
+    if (prefetch_active) {
+        line("  prefetch : %" PRIu64 " calls | %.2f MiB read ahead | %" PRIu64 " failed",
+             prefetch_calls, prefetch_bytes / mib, prefetch_failures);
+    }
+
     if (n_layers_used > 0) {
-        // one write for the whole breakdown: a console write per layer was the
-        // only measurable cost of the report (Windows console writes are synchronous)
-        std::string str = " | per-layer: {";
-        size_t shown = 0;
+        std::string row = "  layers   :";
         for (size_t il = 0; il < per_layer.size(); ++il) {
             if (per_layer[il] == 0) {
                 continue;
             }
-            shown++;
-            str += "L" + std::to_string(il) + "=" + std::to_string(per_layer[il]);
-            str += shown < n_layers_used ? ", " : "";
+            if (row.size() > 110) {
+                out += row;
+                out += '\n';
+                row = "            ";
+            }
+            row += " L" + std::to_string(il) + "=" + std::to_string(per_layer[il]);
         }
-        str += "}";
-        LLAMA_LOG_CONT("%s", str.c_str());
+        out += row;
+        out += '\n';
     }
-    LLAMA_LOG_CONT("\n");
+
+    LLAMA_LOG_INFO("%s", out.c_str());
 }
 
 bool llama_hot_expert_cache::eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
@@ -1457,6 +1522,7 @@ void llama_hot_expert_cache::decay_counts() {
     rebuild_pinned_rank();
 
     n_decays++;
+    n_decays_prompt++;
 }
 
 // JSON string escaper for the profile writer. Byte tokens detokenize to valid
@@ -1590,6 +1656,7 @@ void llama_hot_expert_cache::on_prompt_begin() {
     rebuild_pinned_rank();
 
     n_decays++;
+    n_decays_prompt++;
 }
 
 bool llama_hot_expert_cache::is_pinned(int il, int32_t expert_id) const {

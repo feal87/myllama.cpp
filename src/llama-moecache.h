@@ -211,10 +211,11 @@ class llama_moe_cache {
     // uploads and periodically rebalances content against the current ranking
     void tick(int64_t n_content_tokens);
 
-    // print the periodic stats report (resident vs capacity, hit rate, list
-    // churn since the previous report, per-layer breakdown) via LLAMA_LOG_INFO
-    // (verbosity 4). Called by llama_context at the shared
-    // --experts-stats-interval cadence; also refreshes the churn snapshot.
+    // print the periodic stats report via LLAMA_LOG_INFO (verbosity 4): a header
+    // line plus one themed line each for the slots, hit rate (cumulative and
+    // since the previous report), churn, uploads and the per-layer breakdown.
+    // Called by llama_context at the shared --experts-stats-interval cadence;
+    // also refreshes the interval snapshots.
     void print_stats();
 
     // Aggregate counters and current state for the server metrics exporter.

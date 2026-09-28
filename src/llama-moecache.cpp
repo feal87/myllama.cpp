@@ -150,6 +150,15 @@ struct llama_moe_cache::impl {
     uint64_t n_uploads_queued   = 0;
     uint64_t n_uploads_succeeded = 0;
     uint64_t n_uploads_failed  = 0;
+    uint32_t n_reports        = 0;
+
+    // previous report's counters, for the interval rates (see print_stats). The
+    // per-layer hit/miss are indexed by layer id, so a rebalance that reorders or
+    // drops a layer does not shift them
+    std::vector<uint64_t> prev_layer_hit;
+    std::vector<uint64_t> prev_layer_miss;
+    uint64_t prev_route_hit  = 0;
+    uint64_t prev_route_miss = 0;
 
     // slot occupancy and ranking generation for the cheap apply_target early-out
     // (n_total_slots/n_used_slots are guarded by mtx: fill_upload_queue runs on
@@ -1603,12 +1612,35 @@ void llama_moe_cache::print_stats() {
     size_t   n_res_total   = 0;
     size_t   n_new         = 0;  // residents that arrived since the previous report
     uint64_t n_ticks       = 0;
+    uint64_t n_rebalances  = 0;
+    uint64_t n_changes     = 0;
+    uint64_t n_queued      = 0;
+    uint64_t n_served      = 0;
+    uint64_t n_failed      = 0;
+    uint32_t n_reports     = 0;
+    uint64_t budget_bytes  = 0;
+    uint64_t pool_bytes    = 0;
+    int32_t  n_layers_total = 0;
+    size_t   n_layers_cached = 0;
+    size_t   n_layers_empty  = 0;
 
     {
         std::lock_guard<std::mutex> wlk(p->wmtx);
         std::lock_guard<std::mutex> lk(p->mtx);
 
-        n_ticks = p->n_ticks;
+        n_ticks         = p->n_ticks;
+        n_rebalances    = p->n_rebalances;
+        n_changes       = p->n_resident_changes;
+        n_queued        = p->n_uploads_queued;
+        n_served        = p->n_uploads_succeeded;
+        n_failed        = p->n_uploads_failed;
+        n_reports       = p->n_reports;
+        budget_bytes    = p->budget_bytes;
+        n_layers_total  = 0;
+        for (const auto & ls : p->layers) {
+            n_layers_total = std::max(n_layers_total, ls.pub.il + 1);
+        }
+        pool_bytes      = p->pool ? ggml_backend_buffer_get_size(p->pool) : 0;
         report.reserve(p->layers.size());
         for (auto & ls : p->layers) {
             layer_report r = { ls.pub.il, ls.pub.n_slots, 0, 0, 0 };
@@ -1624,6 +1656,8 @@ void llama_moe_cache::print_stats() {
             }
             n_slots_total += (size_t) r.n_slots;
             n_res_total   += (size_t) r.n_res;
+            n_layers_cached += r.n_slots > 0 ? 1 : 0;
+            n_layers_empty  += r.n_slots == 0 ? 1 : 0;
             report.push_back(r);
         }
 
@@ -1660,28 +1694,103 @@ void llama_moe_cache::print_stats() {
         n_hit_total += r.n_hit;
     }
 
-    const uint64_t t_total = n_hit_total + route_hit + route_miss;
-    LLAMA_LOG_INFO("[moe-cache] VRAM tier: resident=%zu/%zu slots (%zu layer(s), queue cap=%d)"
-                   " | hit=%.1f%% (%" PRIu64 "/%" PRIu64 " routed)"
-                   " | churn=%.1f%% (%zu/%zu changed since last report)"
-                   " | ticks=%" PRIu64 " | per-layer: {",
-                   n_res_total, n_slots_total, report.size(), p->max_inserts,
-                   t_total ? 100.0 * n_hit_total / t_total : 0.0, n_hit_total, t_total,
-                   n_res_total ? 100.0 * n_new / n_res_total : 0.0, n_new, n_res_total,
-                   n_ticks);
-    // one write for the whole per-layer breakdown: a console write per layer was
-    // the only measurable cost of the report (Windows console writes are synchronous)
-    std::string per_layer;
-    for (size_t li = 0; li < report.size(); ++li) {
-        const auto & r   = report[li];
-        const uint64_t t = r.n_hit + r.n_miss;
-        char buf[128];
-        snprintf(buf, sizeof(buf), "L%d:slots=%d res=%d hit=%.1f%%%s", r.il, r.n_slots, r.n_res,
-                t ? 100.0 * r.n_hit / t : 0.0, (li + 1 < report.size()) ? ", " : "");
-        per_layer += buf;
+    // interval deltas against the previous report (a layer id that was dropped
+    // from the layout counts its whole history as one interval, which is the
+    // conservative reading)
+    uint64_t d_hit = 0;
+    uint64_t d_miss = 0;
+    for (const auto & r : report) {
+        if (r.il < 0) {
+            continue;
+        }
+        const size_t il   = (size_t) r.il;
+        const uint64_t ph = il < p->prev_layer_hit.size() ? p->prev_layer_hit[il] : 0;
+        const uint64_t pm = il < p->prev_layer_miss.size() ? p->prev_layer_miss[il] : 0;
+        d_hit  += r.n_hit  > ph ? r.n_hit  - ph : 0;
+        d_miss += r.n_miss > pm ? r.n_miss - pm : 0;
     }
-    LLAMA_LOG_CONT("%s", per_layer.c_str());
-    LLAMA_LOG_CONT("}\n");
+    const uint64_t d_route_hit  = route_hit  > p->prev_route_hit  ? route_hit  - p->prev_route_hit  : 0;
+    const uint64_t d_route_miss = route_miss > p->prev_route_miss ? route_miss - p->prev_route_miss : 0;
+
+    {
+        // the interval base is only final once the hot counters are in: refresh it
+        // under the same locks as tick() (wmtx before mtx)
+        std::lock_guard<std::mutex> wlk(p->wmtx);
+        std::lock_guard<std::mutex> lk(p->mtx);
+        p->prev_layer_hit.assign((size_t) n_layers_total, 0);
+        p->prev_layer_miss.assign((size_t) n_layers_total, 0);
+        for (const auto & r : report) {
+            if (r.il >= 0 && (size_t) r.il < p->prev_layer_hit.size()) {
+                p->prev_layer_hit[(size_t) r.il]  = r.n_hit;
+                p->prev_layer_miss[(size_t) r.il] = r.n_miss;
+            }
+        }
+        p->prev_route_hit  = route_hit;
+        p->prev_route_miss = route_miss;
+        p->n_reports++;
+    }
+
+    const uint64_t t_total  = n_hit_total + route_hit + route_miss;
+    const uint64_t d_total  = d_hit + d_miss + d_route_hit + d_route_miss;
+    const double   mib     = 1024.0 * 1024.0;
+
+    // one themed line each, emitted as a single write: a console write per line
+    // was the only measurable cost of the report (Windows console writes are
+    // synchronous)
+    std::string out = "[moe-cache] VRAM tier report #";
+    out += std::to_string(n_reports + 1);
+    out += "\n";
+
+    char buf[1024];
+    auto line = [&out, &buf](const char * fmt, auto... args) {
+        const int n_chars = snprintf(buf, sizeof(buf), fmt, args...);
+        if (n_chars > 0) {
+            out.append(buf, (size_t) std::min((size_t) n_chars, sizeof(buf) - 1));
+        }
+        out += '\n';
+    };
+
+    line("  slots    : %zu/%zu residents | %zu of %d layers cached (%zu with no slot) | queue cap %d"
+         " | pool %.2f MiB of %.2f MiB budget (%.1f%%)",
+         n_res_total, n_slots_total, n_layers_cached, n_layers_total, n_layers_empty, p->max_inserts,
+         pool_bytes / mib, budget_bytes / mib,
+         budget_bytes ? 100.0 * pool_bytes / (double) budget_bytes : 0.0);
+
+    line("  hit      : %.1f%% cumulative (%" PRIu64 "/%" PRIu64 " routed) | %.1f%% this interval (%" PRIu64 "/%" PRIu64 ")",
+         t_total ? 100.0 * n_hit_total / t_total : 0.0, n_hit_total, t_total,
+         d_total ? 100.0 * d_hit / d_total : 0.0, d_hit, d_total);
+
+    line("  churn    : %.1f%% of the residents changed (%" PRIu64 "/%zu) | %" PRIu64 " resident changes"
+         " | %" PRIu64 " rebalances",
+         n_res_total ? 100.0 * n_new / n_res_total : 0.0, (uint64_t) n_new, n_res_total,
+         n_changes, n_rebalances);
+
+    line("  uploads  : %" PRIu64 " queued, %" PRIu64 " served, %" PRIu64 " failed | %" PRIu64 " ticks",
+         n_queued, n_served, n_failed, n_ticks);
+
+    if (n_layers_cached > 0) {
+        std::string row = "  layers   :";
+        for (const auto & r : report) {
+            if (r.n_slots <= 0) {
+                continue;
+            }
+            const uint64_t t = r.n_hit + r.n_miss;
+            const int n_chars = snprintf(buf, sizeof(buf), " L%d %d/%d %.1f%%", r.il, r.n_res, r.n_slots,
+                                         t ? 100.0 * r.n_hit / t : 0.0);
+            if (row.size() > 110) {
+                out += row;
+                out += '\n';
+                row = "            ";
+            }
+            if (n_chars > 0) {
+                row.append(buf, (size_t) std::min((size_t) n_chars, sizeof(buf) - 1));
+            }
+        }
+        out += row;
+        out += '\n';
+    }
+
+    LLAMA_LOG_INFO("%s", out.c_str());
 }
 
 void llama_moe_cache::stats_snapshot(llama_expert_stats & out) const {

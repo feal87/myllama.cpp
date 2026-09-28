@@ -253,11 +253,12 @@ class llama_hot_expert_cache {
     // prompt_decay <= 1.
     void on_prompt_begin();
 
-    // Prints the periodic stats report (pinned vs capacity, realized RAM-tier hit
-    // rate, list churn since the previous report, locked bytes, per-layer pinned
-    // breakdown) via LLAMA_LOG_INFO (verbosity 4). Called by llama_context at the
-    // shared --experts-stats-interval cadence and once by the destructor.
-    void print_stats();
+    // Prints the periodic stats report via LLAMA_LOG_INFO (verbosity 4): a header
+    // line plus one themed line each for the slots, hit rate, churn, memory, locks,
+    // ranking, decays, base set, prefetch and the per-layer breakdown. Called by
+    // llama_context at the shared --experts-stats-interval cadence and once by the
+    // destructor (which passes final_report, so the teardown dump is recognizable).
+    void print_stats(bool final_report = false);
 
   private:
     // Unique key identifying a specific expert in a specific layer
@@ -574,6 +575,7 @@ class llama_hot_expert_cache {
     uint64_t n_prefetch_bytes    = 0;
     uint64_t n_prefetch_failures = 0;
     uint64_t n_decays            = 0;
+    uint64_t n_decays_prompt     = 0;  // the on_prompt_begin halvings (n_decays counts both)
     uint64_t n_hysteresis_holds  = 0;  // takeovers refused by the margin/grace guards
     uint64_t n_min_count_holds   = 0;  // pins refused by the minimum-usage floor
     uint64_t n_content_tokens    = 0;  // decode tokens observed (see content_tokens())
@@ -584,6 +586,10 @@ class llama_hot_expert_cache {
     // previous report's route counters, for the interval base share
     uint64_t prev_route_base     = 0;
     uint64_t prev_route_total    = 0;
+    // previous report's RAM-tier route hit/miss totals, for the interval hit rate
+    uint64_t prev_route_hit      = 0;
+    uint64_t prev_routed_total   = 0;
+    uint64_t n_reports_total     = 0;  // reports printed so far (shown in the header)
 
     // VRAM-tier residency query (see the public API docs); guarded by mu
     vram_query_fn vram_query = nullptr;
