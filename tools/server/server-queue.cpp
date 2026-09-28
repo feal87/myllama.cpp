@@ -518,6 +518,7 @@ void server_response_reader::post_task(server_task && task, bool front) {
     task.index = 0;
     id_tasks.insert(task.id);
     states.push_back(task.create_state());
+    reported_tool_names.emplace_back();
     queue_results.add_waiting_task_id(task.id);
     queue_tasks.post(std::move(task), front);
 }
@@ -536,6 +537,7 @@ void server_response_reader::post_tasks(std::vector<server_task> && tasks, bool 
             states.push_back(child_task.create_state());
         }
     }
+    reported_tool_names.resize(states.size());
     GGML_ASSERT(states.size() == id_tasks.size());
     queue_results.add_waiting_task_ids(id_tasks);
     queue_tasks.post(std::move(tasks), front);
@@ -565,7 +567,32 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
                 // update the generation state if needed
                 const size_t idx = result->index;
                 GGML_ASSERT(idx < states.size());
+                GGML_ASSERT(idx < reported_tool_names.size());
                 result->update(states[idx]);
+                if (tool_call_cb) {
+                    const auto & calls = states[idx].chat_msg.tool_calls;
+                    auto & reported = reported_tool_names[idx];
+                    size_t n_names = 0;
+                    bool changed = false;
+                    for (const common_chat_tool_call & call : calls) {
+                        if (call.name.empty()) {
+                            continue;
+                        }
+                        changed |= n_names >= reported.size() || reported[n_names] != call.name;
+                        n_names++;
+                    }
+                    changed |= n_names != reported.size();
+                    if (changed && n_names > 0) {
+                        reported.clear();
+                        reported.reserve(n_names);
+                        for (const common_chat_tool_call & call : calls) {
+                            if (!call.name.empty()) {
+                                reported.push_back(call.name);
+                            }
+                        }
+                        tool_call_cb(reported);
+                    }
+                }
             }
             if (result->is_stop()) {
                 received_count++;

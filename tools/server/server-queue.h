@@ -5,7 +5,9 @@
 #include <condition_variable>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 #include <unordered_set>
@@ -211,6 +213,8 @@ struct server_response_reader {
     // tracking generation state and partial tool calls
     // only used by streaming completions
     std::vector<task_result_state> states;
+    std::vector<std::vector<std::string>> reported_tool_names;
+    std::function<void(const std::vector<std::string> &)> tool_call_cb;
 
     // should_stop function will be called each polling_interval_seconds
     server_response_reader(server_queue & queue_tasks, server_response & queue_results, int polling_interval_seconds)

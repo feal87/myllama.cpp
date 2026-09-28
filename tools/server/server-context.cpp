@@ -431,7 +431,6 @@ struct server_slot {
     size_t last_nl_pos = 0;
 
     std::string  generated_text;
-    std::unique_ptr<task_result_state> expert_base_parse_state;
     bool expert_base_tool_detection_active = false;
     std::string  debug_generated_text;
     llama_tokens generated_tokens;
@@ -535,7 +534,6 @@ struct server_slot {
 
         last_nl_pos    = 0;
         generated_text = "";
-        expert_base_parse_state.reset();
         expert_base_tool_detection_active = false;
         has_new_line   = false;
         truncated      = false;
@@ -1044,6 +1042,10 @@ public:
     server_metrics get_metrics() {
         update_expert_metrics();
         return metrics;
+    }
+
+    llama_context * get_ctx_tgt() const {
+        return ctx_tgt;
     }
 
     void reset_metrics_bucket() {
@@ -2248,10 +2250,6 @@ private:
 
         slot.expert_base_tool_detection_active =
                 !params_base.pin_experts_template.empty() && task.params.expert_base_detect_tools;
-        slot.expert_base_parse_state.reset();
-        if (slot.expert_base_tool_detection_active && task.need_sampling()) {
-            slot.expert_base_parse_state = std::make_unique<task_result_state>(task.params.chat_parser_params);
-        }
         slot.task = std::make_unique<const server_task>(std::move(task));
 
         slot.state = slot.task->is_child()
@@ -2278,28 +2276,6 @@ private:
 
         // check if there is incomplete UTF-8 character at the end
         bool incomplete = validate_utf8(slot.generated_text) < slot.generated_text.size();
-
-        if (!incomplete && slot.expert_base_parse_state != nullptr) {
-            // Partial output can end inside a tool-call prefix.
-            try {
-                std::vector<common_chat_msg_diff> diffs;
-                const common_chat_msg msg = slot.expert_base_parse_state->update_chat_msg(token_str, true, diffs);
-                const bool got_tool_name = std::any_of(diffs.begin(), diffs.end(), [](const common_chat_msg_diff & diff) {
-                    return diff.tool_call_index != std::string::npos && !diff.tool_call_delta.name.empty();
-                });
-                if (got_tool_name) {
-                    std::vector<const char *> tools;
-                    tools.reserve(msg.tool_calls.size());
-                    for (const common_chat_tool_call & call : msg.tool_calls) {
-                        if (!call.name.empty()) {
-                            tools.push_back(call.name.c_str());
-                        }
-                    }
-                    llama_expert_base_set_tools(ctx_tgt, tools.data(), tools.size());
-                }
-            } catch (const std::exception &) {
-            }
-        }
 
         // search stop word and delete it
         if (!incomplete) {
@@ -5346,7 +5322,19 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 }
 
 std::unique_ptr<server_res_generator> server_routes::create_response(bool bypass_sleep) {
-    return std::make_unique<server_res_generator>(queue_tasks, queue_results, params.sleep_idle_seconds, bypass_sleep);
+    auto res = std::make_unique<server_res_generator>(queue_tasks, queue_results, params.sleep_idle_seconds, bypass_sleep);
+    if (!params.pin_experts_template.empty()) {
+        llama_context * ctx = ctx_server.get_ctx_tgt();
+        res->rd.tool_call_cb = [ctx](const std::vector<std::string> & tools) {
+            std::vector<const char *> names;
+            names.reserve(tools.size());
+            for (const std::string & tool : tools) {
+                names.push_back(tool.c_str());
+            }
+            llama_expert_base_set_tools(ctx, names.data(), names.size());
+        };
+    }
+    return res;
 }
 
 server_routes::server_routes(const common_params & params, server_context & ctx_server)
