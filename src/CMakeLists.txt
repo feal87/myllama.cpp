@@ -20,6 +20,8 @@ set(LLAMA_CORE_SOURCES
     llama-disk-buft.h
     llama-disk-stage.cpp
     llama-disk-stage.h
+    llama-expert-base.cpp
+    llama-expert-base.h
     llama-grammar.cpp
     llama-graph.cpp
     llama-hot-experts.cpp

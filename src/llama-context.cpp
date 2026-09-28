@@ -155,6 +155,7 @@ llama_context::llama_context(
     cparams.expert_profile_path              = params.expert_profile_path;
     cparams.pin_experts_from_profile_path    = params.pin_experts_from_profile_path;
     cparams.warm_experts_from_profile_path   = params.warm_experts_from_profile_path;
+    cparams.pin_experts_template_path        = params.pin_experts_template_path;
 
     cparams.n_moe_cache_budget_bytes = params.n_moe_cache_budget_bytes;
     cparams.n_moe_cache_inserts      = params.n_moe_cache_inserts;
@@ -192,7 +193,7 @@ llama_context::llama_context(
                 cparams.n_pin_hot_experts, cparams.n_pin_hot_experts_budget_bytes,
                 cparams.n_pin_hot_experts_pool_layers,
                 cparams.pin_experts_from_profile_path, cparams.warm_experts_from_profile_path,
-                cparams.disk_stage_split_hot);
+                cparams.pin_experts_template_path, cparams.disk_stage_split_hot);
         if (stage->is_active()) {
             disk_stage = std::move(stage);
         }
@@ -208,6 +209,7 @@ llama_context::llama_context(
     };
     require_disk(cparams.pin_experts_from_profile_path,  "--pin-experts-from-profile");
     require_disk(cparams.warm_experts_from_profile_path, "--warm-experts-from-profile");
+    require_disk(cparams.pin_experts_template_path,      "--pin-experts-template");
 
     const bool disk_active = disk_stage != nullptr;
 
@@ -1661,6 +1663,23 @@ void llama_context::flush_expert_profile() {
     if (hot_experts) {
         hot_experts->flush_profile();
     }
+}
+
+void llama_context::set_expert_base_tools(const char * const * tools, size_t n_tools) {
+    if (!hot_experts) {
+        return;
+    }
+    if (tools == nullptr) {
+        n_tools = 0;
+    }
+    std::vector<std::string> names;
+    names.reserve(n_tools);
+    for (size_t i = 0; i < n_tools; ++i) {
+        if (tools[i] != nullptr) {
+            names.emplace_back(tools[i]);
+        }
+    }
+    hot_experts->set_base_set_for_tools(names);
 }
 
 void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
@@ -4893,6 +4912,7 @@ llama_context_params llama_context_default_params() {
         /*.expert_profile_path           =*/ nullptr,
         /*.pin_experts_from_profile_path =*/ nullptr,
         /*.warm_experts_from_profile_path=*/ nullptr,
+        /*.pin_experts_template_path    =*/ nullptr,
         /*.n_moe_cache_budget_bytes    =*/ 0,
         /*.n_moe_cache_inserts         =*/ 2,
         /*.n_moe_cache_drift_percent   =*/ 0.0f,
@@ -5111,6 +5131,10 @@ void llama_synchronize(llama_context * ctx) {
 
 void llama_expert_profile_flush(llama_context * ctx) {
     ctx->flush_expert_profile();
+}
+
+void llama_expert_base_set_tools(llama_context * ctx, const char * const * tools, size_t n_tools) {
+    ctx->set_expert_base_tools(tools, n_tools);
 }
 
 float * llama_get_logits(llama_context * ctx) {

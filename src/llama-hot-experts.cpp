@@ -180,6 +180,12 @@ void llama_hot_expert_cache::print_stats(bool final_report) {
     uint64_t prev_base           = 0;
     uint64_t prev_total          = 0;
     size_t   n_base_used         = 0;
+    int32_t  base_count          = 0;
+    uint64_t base_switches       = 0;
+    uint64_t base_admitted       = 0;
+    uint64_t base_released       = 0;
+    uint64_t base_refused        = 0;
+    std::string base_name;
     uint64_t prev_hit            = 0;
     uint64_t prev_routed         = 0;
     uint64_t n_reserved          = 0;
@@ -220,6 +226,12 @@ void llama_hot_expert_cache::print_stats(bool final_report) {
         prev_routed         = prev_routed_total;
         n_reserved          = n_bytes_reserved;
         n_prompt_decays     = n_decays_prompt;
+        base_count          = n_base;
+        base_switches       = n_base_switches;
+        base_admitted       = n_base_admitted;
+        base_released       = n_base_released;
+        base_refused        = n_base_refused;
+        base_name           = active_base_set;
         n_inflight          = pin_inflight.size();
         n_queued            = pin_queue.size();
         n_reports           = n_reports_total;
@@ -279,7 +291,7 @@ void llama_hot_expert_cache::print_stats(bool final_report) {
     }
 
     const size_t n_dynamic   = total_pinned - n_base_ram;
-    const int    n_base_vram = (int) ((int32_t) n_base - (int32_t) n_base_ram);
+    const int    n_base_vram = (int) (base_count - (int32_t) n_base_ram);
     const size_t n_free      = (size_t) std::max((int32_t) n_pin_total - (int32_t) total_pinned, 0);
     const double mib         = 1024.0 * 1024.0;
 
@@ -345,13 +357,16 @@ void llama_hot_expert_cache::print_stats(bool final_report) {
 
     // base set feedback: how much of the decode routing the base experts serve and
     // how many of them were ever routed (a large gap to n_base means dead weight)
-    if (n_base > 0) {
+    if (base_count > 0) {
         const uint64_t d_base  = route_base  - prev_base;
         const uint64_t d_total = route_total - prev_total;
-        line("  base set : %.1f%% of the routes (%" PRIu64 "/%" PRIu64 ") | %.1f%% this interval (%" PRIu64 "/%" PRIu64 ")"
-             " | %zu/%d ever routed",
+        line("  base set : %s, %d experts, %" PRIu64 " switch(es), %.1f%% of routes (%" PRIu64 "/%" PRIu64 ")"
+             " | %.1f%% this interval (%" PRIu64 "/%" PRIu64 ") | %zu/%d ever routed"
+             " | admitted %" PRIu64 ", released %" PRIu64 ", refused %" PRIu64,
+             base_name.empty() ? "<base>" : base_name.c_str(), base_count, base_switches,
              route_total ? 100.0 * route_base / route_total : 0.0, route_base, route_total,
-             d_total ? 100.0 * d_base / d_total : 0.0, d_base, d_total, n_base_used, (int) n_base);
+             d_total ? 100.0 * d_base / d_total : 0.0, d_base, d_total, n_base_used, base_count,
+             base_admitted, base_released, base_refused);
     }
 
     // the row prefetch works on the mmap'd model pages, which the disk decode
@@ -854,6 +869,7 @@ void llama_hot_expert_cache::set_disk_stage(llama_disk_stage * ds) {
     // promotion/victim policy while still letting them join the VRAM tier
     // through the shared ranking
     const std::vector<std::vector<int32_t>> & base = ds->base_experts();
+    active_base_set = ds->active_base_set();
     for (int il = 0; il < (int) base.size(); ++il) {
         if (base[(size_t) il].empty() || il >= (int) layers.size()) {
             continue;
@@ -1230,6 +1246,158 @@ void llama_hot_expert_cache::add_base_pin(int il, layer_state & ls, int32_t expe
     evicted_at.erase(key);
 }
 
+void llama_hot_expert_cache::demote_base_pin(int il, layer_state & ls, int32_t expert_id) {
+    const expert_key key{ il, expert_id };
+    ls.pin_state[(size_t) expert_id] &= (uint8_t) ~PIN_BASE;
+    if (n_base > 0) {
+        n_base--;
+    }
+    const auto it = pinned.find(key);
+    if (it == pinned.end()) {
+        return;  // a VRAM takeover freed the RAM slot; normal promotion can re-admit it
+    }
+    ls.pin_state[(size_t) expert_id] |= PIN_RESIDENT;
+    pinned_rank_pool[(size_t) pool_of_layer(il)].insert({ count_of(il, expert_id), il, expert_id });
+}
+
+bool llama_hot_expert_cache::admit_base_pin(int il, layer_state & ls, int32_t expert_id) {
+    if (!disk_stage->base_add(il, expert_id)) {
+        return false;
+    }
+    const size_t id = (size_t) expert_id;
+    if ((ls.pin_state[id] & PIN_BASE) != 0) {
+        return true;
+    }
+
+    ls.pin_state[id] |= PIN_BASE;
+    n_base++;
+
+    // A dynamic resident can become base without changing slots. Remove all
+    // stale rank keys for it; its current count is not necessarily the key
+    // stored between rank rebuilds.
+    auto & rank = pinned_rank_pool[(size_t) pool_of_layer(il)];
+    for (auto it = rank.begin(); it != rank.end();) {
+        if (std::get<1>(*it) == il && std::get<2>(*it) == expert_id) {
+            it = rank.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (disk_stage->resident_slot_held(il, expert_id)) {
+        add_base_pin(il, ls, expert_id);
+    }
+    return true;
+}
+
+bool llama_hot_expert_cache::evict_coldest_for_base(int pool) {
+    auto & rank = pinned_rank_pool[(size_t) pool];
+    for (;;) {
+        auto it = rank.begin();
+        if (it == rank.end()) {
+            return false;
+        }
+        const int     il = std::get<1>(*it);
+        const int32_t id = std::get<2>(*it);
+        if (pinned.count(expert_key{ il, id }) == 0) {
+            rank.erase(it);
+            continue;
+        }
+        const uint64_t count = count_of(il, id);
+        if (std::get<0>(*it) != count) {
+            rank.erase(it);
+            rank.insert({ count, il, id });
+            continue;
+        }
+        rank.erase(it);
+        layer_state & ls = layers[(size_t) il];
+        if (!ls.resolved_tensors) {
+            resolve_tensors(il, ls);
+        }
+        unpin_expert(il, ls, id, /* keep_l2 = */ false);
+        return true;
+    }
+}
+
+void llama_hot_expert_cache::set_base_set_for_tools(const std::vector<std::string> & tools) {
+    if (disk_stage == nullptr) {
+        return;
+    }
+    const std::string name = disk_stage->select_base_set(tools);
+    const auto * target = disk_stage->base_set_by_name(name);
+    if (target == nullptr) {
+        LLAMA_LOG_WARN("%s: expert base template selected unknown set '%s'\n", __func__, name.c_str());
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(mu);
+    if (disk_stage->active_base_set() == name) {
+        return;
+    }
+
+    // First demote experts no longer in the target. Their slots stay resident
+    // and join the normal rank; if the pool needs room below, normal ranking
+    // chooses which of them (or other dynamic residents) to evict.
+    for (int il = 0; il < (int) layers.size() && il < (int) target->size(); ++il) {
+        layer_state & ls = layers[(size_t) il];
+        if (!ls.resolved_tensors) {
+            resolve_tensors(il, ls);
+        }
+        for (uint32_t id = 0; id < ls.n_experts; ++id) {
+            if ((ls.pin_state[(size_t) id] & PIN_BASE) == 0 ||
+                    std::binary_search((*target)[(size_t) il].begin(), (*target)[(size_t) il].end(), (int32_t) id)) {
+                continue;
+            }
+            disk_stage->base_remove(il, (int32_t) id);
+            demote_base_pin(il, ls, (int32_t) id);
+            n_base_released++;
+        }
+    }
+
+    // Promote target residents first, so forced admission cannot evict an
+    // expert that is itself part of the new target.
+    for (int il = 0; il < (int) layers.size() && il < (int) target->size(); ++il) {
+        layer_state & ls = layers[(size_t) il];
+        for (const int32_t id : (*target)[(size_t) il]) {
+            if (id >= 0 && (uint32_t) id < ls.n_experts && disk_stage->resident_slot_held(il, id) &&
+                    (ls.pin_state[(size_t) id] & PIN_BASE) == 0) {
+                if (admit_base_pin(il, ls, id)) {
+                    n_base_admitted++;
+                }
+            }
+        }
+    }
+
+    // New base experts are mandatory. If a pool is full, evict its coldest
+    // dynamic resident without the usual heat margin/grace and retry.
+    for (int il = 0; il < (int) layers.size() && il < (int) target->size(); ++il) {
+        layer_state & ls = layers[(size_t) il];
+        for (const int32_t id : (*target)[(size_t) il]) {
+            if (id < 0 || (uint32_t) id >= ls.n_experts ||
+                    (ls.pin_state[(size_t) id] & PIN_BASE) != 0) {
+                continue;
+            }
+            bool admitted = admit_base_pin(il, ls, id);
+            while (!admitted && evict_coldest_for_base(pool_of_layer(il))) {
+                admitted = admit_base_pin(il, ls, id);
+            }
+            if (admitted) {
+                n_base_admitted++;
+            } else {
+                n_base_refused++;
+                LLAMA_LOG_WARN("%s: could not admit base expert layer %d expert %d\n", __func__, il, id);
+            }
+        }
+    }
+
+    disk_stage->set_base_target(name);
+    disk_stage->fill_base_experts();
+    active_base_set = name;
+    n_base_switches++;
+    rebuild_pinned_rank();
+    LLAMA_LOG_INFO("%s: switched base expert set to '%s' (%d expert(s) permanent)\n",
+                   __func__, name.empty() ? "<base>" : name.c_str(), n_base);
+}
+
 void llama_hot_expert_cache::complete_disk_pin(int il, layer_state & ls, int32_t expert_id, size_t bytes) {
     // caller holds mu; the slot is reserved, its bytes are read by fill_cache()
     expert_key key{ il, expert_id };
@@ -1420,7 +1588,7 @@ void llama_hot_expert_cache::pin_worker_main() {
     }
 }
 
-void llama_hot_expert_cache::unpin_expert(int il, layer_state & ls, int32_t expert_id) {
+void llama_hot_expert_cache::unpin_expert(int il, layer_state & ls, int32_t expert_id, bool keep_l2) {
     expert_key key{ il, expert_id };
     auto       it = pinned.find(key);
     if (it == pinned.end()) {
@@ -1433,7 +1601,7 @@ void llama_hot_expert_cache::unpin_expert(int il, layer_state & ls, int32_t expe
         ls.pin_state[(size_t) expert_id] &= (uint8_t) ~PIN_RESIDENT;
     }
     if (disk_stage != nullptr) {
-        disk_stage->resident_remove(il, expert_id);
+        disk_stage->resident_remove(il, expert_id, keep_l2);
         if (il >= 0 && il < (int) n_pinned_layer.size() && n_pinned_layer[il] > 0) {
             n_pinned_layer[il]--;
         }

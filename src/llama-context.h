@@ -322,6 +322,9 @@ public:
     // flush the accumulated --expert-profile record to disk
     void flush_expert_profile();
 
+    // select the expert base set for the current turn's tool names
+    void set_expert_base_tools(const char * const * tools, size_t n_tools);
+
 private:
     llm_graph_result * get_gf_res_prev();
 

@@ -431,6 +431,8 @@ struct server_slot {
     size_t last_nl_pos = 0;
 
     std::string  generated_text;
+    std::unique_ptr<task_result_state> expert_base_parse_state;
+    bool expert_base_tool_detection_active = false;
     std::string  debug_generated_text;
     llama_tokens generated_tokens;
     size_t n_sent_text = 0; // number of sent text character (i.e. handle partial UTF-8 on streaming)
@@ -533,13 +535,15 @@ struct server_slot {
 
         last_nl_pos    = 0;
         generated_text = "";
+        expert_base_parse_state.reset();
+        expert_base_tool_detection_active = false;
         has_new_line   = false;
         truncated      = false;
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
         n_sent_text    = 0;
 
-        if (can_speculate()) {
+        if (spec != nullptr) {
             spec_draft.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
@@ -628,7 +632,7 @@ struct server_slot {
     }
 
     bool can_speculate() const {
-        return !!spec;
+        return !!spec && !expert_base_tool_detection_active;
     }
 
     void add_token(const completion_token_output & token) {
@@ -1226,6 +1230,10 @@ private:
         reset_expert_metrics_baseline();
 
         params_base = params;
+        if (!params_base.pin_experts_template.empty() && params_base.n_parallel != 1) {
+            SRV_ERR("%s\n", "--pin-experts-template requires --parallel 1");
+            return false;
+        }
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
@@ -2187,6 +2195,15 @@ private:
             return false;
         }
 
+        if (!params_base.pin_experts_template.empty()) {
+            std::vector<const char *> expert_base_tools;
+            expert_base_tools.reserve(task.params.expert_base_tools.size());
+            for (const std::string & tool : task.params.expert_base_tools) {
+                expert_base_tools.push_back(tool.c_str());
+            }
+            llama_expert_base_set_tools(ctx_tgt, expert_base_tools.data(), expert_base_tools.size());
+        }
+
         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
 
         // initialize samplers
@@ -2229,6 +2246,12 @@ private:
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
+        slot.expert_base_tool_detection_active =
+                !params_base.pin_experts_template.empty() && task.params.expert_base_detect_tools;
+        slot.expert_base_parse_state.reset();
+        if (slot.expert_base_tool_detection_active && task.need_sampling()) {
+            slot.expert_base_parse_state = std::make_unique<task_result_state>(task.params.chat_parser_params);
+        }
         slot.task = std::make_unique<const server_task>(std::move(task));
 
         slot.state = slot.task->is_child()
@@ -2255,6 +2278,28 @@ private:
 
         // check if there is incomplete UTF-8 character at the end
         bool incomplete = validate_utf8(slot.generated_text) < slot.generated_text.size();
+
+        if (!incomplete && slot.expert_base_parse_state != nullptr) {
+            // Partial output can end inside a tool-call prefix.
+            try {
+                std::vector<common_chat_msg_diff> diffs;
+                const common_chat_msg msg = slot.expert_base_parse_state->update_chat_msg(token_str, true, diffs);
+                const bool got_tool_name = std::any_of(diffs.begin(), diffs.end(), [](const common_chat_msg_diff & diff) {
+                    return diff.tool_call_index != std::string::npos && !diff.tool_call_delta.name.empty();
+                });
+                if (got_tool_name) {
+                    std::vector<const char *> tools;
+                    tools.reserve(msg.tool_calls.size());
+                    for (const common_chat_tool_call & call : msg.tool_calls) {
+                        if (!call.name.empty()) {
+                            tools.push_back(call.name.c_str());
+                        }
+                    }
+                    llama_expert_base_set_tools(ctx_tgt, tools.data(), tools.size());
+                }
+            } catch (const std::exception &) {
+            }
+        }
 
         // search stop word and delete it
         if (!incomplete) {
@@ -5084,6 +5129,15 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     params,
                     meta->logit_bias_eog,
                     data);
+            task.params.expert_base_detect_tools = json_value(data, "expert_base_detect_tools", false);
+            const json expert_base_tools = json_value(data, "expert_base_tools", json::array());
+            if (expert_base_tools.is_array()) {
+                for (const json & tool : expert_base_tools) {
+                    if (tool.is_string()) {
+                        task.params.expert_base_tools.push_back(tool.get<std::string>());
+                    }
+                }
+            }
 
             if (!defer_mtmd) {
                 task.params.message_spans = task.tokens.find_message_spans(delimiters);

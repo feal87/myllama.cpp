@@ -514,6 +514,8 @@ struct common_params {
     // warm set of experts to prefill the remaining decode-cache slots with at
     // load (--warm-experts-from-profile), same format as the base set
     std::string warm_experts_from_profile;
+    // tool-conditioned base-expert template (--pin-experts-template)
+    std::string pin_experts_template;
     // batch/prefill read-ahead (madvise WILLNEED / PrefetchVirtualMemory) of the
     // MoE experts that were just routed but are neither pinned nor served from
     // VRAM. Multi-token ubatches only: single-token decode is skipped (it reads

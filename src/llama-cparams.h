@@ -85,6 +85,8 @@ struct llama_cparams {
     const char * pin_experts_from_profile_path;
     // warm set of experts to prefill the remaining decode-cache slots (nullptr = off)
     const char * warm_experts_from_profile_path;
+    // tool-conditioned base-expert set template (nullptr = off)
+    const char * pin_experts_template_path;
 
     // GPU-resident MoE expert cache, VRAM tier on top of the hot-expert cache
     // (see llama-moecache.h). The shared routing ranking is observed by the

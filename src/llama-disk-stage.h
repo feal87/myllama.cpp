@@ -79,13 +79,18 @@ public:
     // warm_experts_path: optional set in the same format, read into the slots
     // left free by the base set. These are evictable count-0 residents; base
     // experts are skipped. Best effort: it fills up to capacity
+    // base_template_path: optional expert-set template (llama-expert-base.h)
+    // that names the base set, the per-mode sets and the tool conditions that
+    // select between them. It replaces base_experts_path (which is then
+    // ignored) and the mode is switched at runtime through select_base_set()
     // split_hot: split the host decode MoE into a hot (resident) and a cold
     // (disk) pass on a second CPU backend, so the cold read overlaps the hot
     // compute
     llama_disk_stage(const llama_model & model, ggml_backend_dev_t dev,
                      int32_t n_pin_experts, uint64_t cache_budget_bytes,
                      int32_t pool_layers_max, const char * base_experts_path,
-                     const char * warm_experts_path, bool split_hot);
+                     const char * warm_experts_path, const char * base_template_path,
+                     bool split_hot);
     ~llama_disk_stage();
 
     // staging tensors of MoE layer il, or null when the layer is not stageable
@@ -157,9 +162,37 @@ public:
     // largest pool resident capacity, for logs and the hot-expert engine gate
     int32_t resident_capacity() const;
 
-    // base-expert set parsed from the profile: [layer] -> expert ids. Empty when
-    // no set was given. The vectors are immutable once the constructor returns
+    // currently selected base-expert target: [layer] -> expert ids. The set
+    // vectors are immutable after construction; the active view changes on a switch
     const std::vector<std::vector<int32_t>> & base_experts() const;
+
+    // ----- mode switching (--pin-experts-template) ---------------------------
+    // The template's sets are parsed and merged with the base set at load, so a
+    // switch is a lookup: base_set_by_name() returns the resident target of a
+    // set (base + that set merged per layer), or null when the name is unknown.
+    // The empty name is the base set alone and always resolves
+    const std::vector<std::vector<int32_t>> * base_set_by_name(const std::string & name) const;
+    std::string select_base_set(const std::vector<std::string> & tools) const;
+    bool set_base_target(const std::string & name);
+
+    // make `id` of layer `il` a base resident: marks it unevictable and reserves
+    // its slot (no I/O: the bytes are read when the expert is next routed, or by
+    // the background base prefill). An expert that already holds a slot or is
+    // served from VRAM only needs the mark. false when the pool has no slot to
+    // spare, in which case nothing changed
+    bool base_add(int il, int32_t id);
+
+    // drop the base mark of `id`: it keeps its slot and becomes an ordinary
+    // resident, so the hot-expert policy decides whether it stays
+    void base_remove(int il, int32_t id);
+    bool resident_slot_held(int il, int32_t id) const;
+
+    // set selected by the last base_set_by_name() lookup, for logs and stats
+    const std::string & active_base_set() const;
+
+    // read the base experts whose bytes are not in the cache yet. Called at
+    // the mode switch between graphs; blocks for the full batched read
+    size_t fill_base_experts();
 
     // warm experts actually read into the cache (base entries excluded), for the
     // hot-expert engine to register as evictable count-0 residents
@@ -169,7 +202,7 @@ public:
     int32_t base_count() const;
 
     // true when (il, id) is a base expert: a permanent decode-cache resident that
-    // the promotion policy must never evict. Lock-free (immutable after load)
+    // the promotion policy must never evict. The query takes the cache lock
     bool is_base(int il, int32_t id) const;
 
     // make expert id of layer il resident: reserve a slot for it and mark it
@@ -177,8 +210,9 @@ public:
     // time it is routed, so a promoted expert is read from disk exactly once
     bool resident_add(int il, int32_t id);
 
-    // drop a resident expert, freeing its slot for the next promotion
-    void resident_remove(int il, int32_t id);
+    // drop a resident expert, freeing its slot for the next promotion. `keep_l2`
+    // controls whether its filled data is copied to the L2 pool first
+    void resident_remove(int il, int32_t id, bool keep_l2 = true);
 
     // true when (il, id) is a resident whose bytes are present in its slot, so
     // it is a candidate for a VRAM upload

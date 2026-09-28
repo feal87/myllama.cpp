@@ -253,6 +253,11 @@ class llama_hot_expert_cache {
     // prompt_decay <= 1.
     void on_prompt_begin();
 
+    // Select and apply the base-expert mode for this turn's tool names. The
+    // disk stage resolves the template rules; the current set is unchanged when
+    // the selected name is already active
+    void set_base_set_for_tools(const std::vector<std::string> & tools);
+
     // Prints the periodic stats report via LLAMA_LOG_INFO (verbosity 4): a header
     // line plus one themed line each for the slots, hit rate, churn, memory, locks,
     // ranking, decays, base set, prefetch and the per-layer breakdown. Called by
@@ -388,6 +393,14 @@ class llama_hot_expert_cache {
     // policy cannot select it
     void add_base_pin(int il, layer_state & ls, int32_t expert_id);
 
+    // demote/admit one base expert while switching modes (caller holds mu)
+    void demote_base_pin(int il, layer_state & ls, int32_t expert_id);
+    bool admit_base_pin(int il, layer_state & ls, int32_t expert_id);
+
+    // free one cold dynamic slot in `pool`; forced base admission does not use
+    // the normal hysteresis guards. false when no dynamic resident can be freed
+    bool evict_coldest_for_base(int pool);
+
     // disk-cache pool of a layer (0 in the non-disk mlock mode, where the whole
     // model is one pool)
     int pool_of_layer(int il) const;
@@ -400,7 +413,7 @@ class llama_hot_expert_cache {
     bool is_vram_resident(int il, int32_t expert_id) const;
 
     // -- pinning -------------------------------------------------------------
-    void unpin_expert(int il, layer_state & ls, int32_t expert_id);
+    void unpin_expert(int il, layer_state & ls, int32_t expert_id, bool keep_l2 = true);
 
     // (mu held) flat per-expert state of a resolved layer. `ls` must be resolved
     // and `expert_id` in [0, n_experts) - all callers guarantee this. These are
@@ -483,7 +496,12 @@ class llama_hot_expert_cache {
 
     const int32_t  n_pin;            // N experts per layer
     int32_t        n_pin_total = 0;  // N * num_moe_layers (global cap)
-    int32_t        n_base      = 0;  // base experts (--pin-experts-from-profile), for stats
+    int32_t        n_base      = 0;  // current base experts, for stats
+    uint64_t       n_base_switches = 0;
+    uint64_t       n_base_admitted = 0;
+    uint64_t       n_base_released = 0;
+    uint64_t       n_base_refused  = 0;
+    std::string    active_base_set;
     std::vector<int32_t> n_pinned_layer; // residents per layer (disk cache path)
     const uint64_t budget_bytes;     // 0 = unlimited
     const uint64_t decay_interval;   // 0 = lifetime counts (no aging)

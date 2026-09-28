@@ -1725,6 +1725,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.expert_profile_path              = params.expert_profile.empty() ? nullptr : params.expert_profile.c_str();
     cparams.pin_experts_from_profile_path    = params.pin_experts_from_profile.empty() ? nullptr : params.pin_experts_from_profile.c_str();
     cparams.warm_experts_from_profile_path   = params.warm_experts_from_profile.empty() ? nullptr : params.warm_experts_from_profile.c_str();
+    cparams.pin_experts_template_path        = params.pin_experts_template.empty() ? nullptr : params.pin_experts_template.c_str();
     cparams.n_moe_cache_budget_bytes = params.n_moe_cache_budget_mib * 1024ull * 1024ull;
     cparams.n_moe_cache_inserts      = params.n_moe_cache_inserts;
     cparams.n_moe_cache_drift_percent = params.n_moe_cache_drift_percent;

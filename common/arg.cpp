@@ -3000,6 +3000,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--pin-experts-template"}, "FILE",
+        "select permanently resident disk-cache experts from a tool-conditioned template\n"
+        "(default: disabled). The template starts with 'llama-expert-base-template v1',\n"
+        "then declares 'base FILE', named 'set NAME FILE' entries, a 'default NAME',\n"
+        "and ordered 'tools NAME[,NAME...] SET' rules. Rules match the latest assistant\n"
+        "tool call in the current turn, not the tools merely offered by the request.\n"
+        "Set files use the 'llama-expert-base v1' format; relative paths resolve from\n"
+        "FILE's directory. The first matching tool rule wins; otherwise the default set\n"
+        "is used. The base set stays resident in every mode. Requires --load-mode dio",
+        [](common_params & params, const std::string & value) {
+            params.pin_experts_template = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--warm-experts-from-profile"}, "FILE",
         "prefill the remaining disk decode-cache slots at load from FILE\n"
         "(default: disabled), so the RAM tier is full from the first token\n"

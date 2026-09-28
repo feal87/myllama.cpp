@@ -463,6 +463,11 @@ extern "C" {
         // the disk stage; base experts already listed there are skipped
         const char * warm_experts_from_profile_path;
 
+        // tool-conditioned expert base template (nullptr = disabled). The file
+        // names the always-resident base set, named mode sets and tool-name rules;
+        // requires the disk decode cache (--load-mode dio)
+        const char * pin_experts_template_path;
+
         // GPU-resident cache for host-offloaded MoE expert weights, VRAM tier on
         // top of the hot-expert cache (--pin-hot-experts). Decode on a
         // host-offloaded MoE layer is host-RAM-bandwidth bound; this serves the
@@ -1264,6 +1269,11 @@ extern "C" {
     // Flush the accumulated decode expert profile (--expert-profile) to disk and
     // start a new record. No-op when profiling is disabled.
     LLAMA_API void llama_expert_profile_flush(struct llama_context * ctx);
+
+    // Select the tool-conditioned base-expert set for the next server turn.
+    // Tool names are matched by the template loaded with --pin-experts-template.
+    // Call between llama_decode() calls, with no graph in flight.
+    LLAMA_API void llama_expert_base_set_tools(struct llama_context * ctx, const char * const * tools, size_t n_tools);
 
     // Token logits obtained from the last call to llama_decode()
     // The logits for which llama_batch.logits[i] != 0 are stored contiguously
