@@ -2216,10 +2216,11 @@ size_t llama_disk_stage::fill_base_experts() {
 
     std::vector<disk_stage_job>          jobs;
     std::vector<std::pair<int, int32_t>> filled;
-    size_t                               bytes = 0;
+    size_t                               bytes      = 0;
+    size_t                               n_resident = 0;
 
-    // The server calls this between graphs. Hold the cache lock across the read
-    // too, so a VRAM upload cannot free and reuse a slot while the batch writes it.
+    // only called at load, before any graph runs; the cache lock still keeps a
+    // concurrent VRAM upload from reusing a slot while the batch writes it
     std::lock_guard<std::mutex> cache_lock(p.cache_mu);
     for (int il = 0; il < (int) p.cache.size() && il < (int) target->size(); ++il) {
         impl::cache_layer & c = p.cache[(size_t) il];
@@ -2230,8 +2231,12 @@ size_t llama_disk_stage::fill_base_experts() {
         const std::vector<impl::region> & regions = p.layer_regions[(size_t) il];
 
         for (const int32_t id : (*target)[(size_t) il]) {
-            if (id < 0 || id >= (int32_t) c.resident_slot.size() || c.vram[(size_t) id] != 0) {
+            if (id < 0 || id >= (int32_t) c.resident_slot.size()) {
                 continue;
+            }
+            if (c.vram[(size_t) id] != 0) {
+                n_resident++;
+                continue;  // served from VRAM, no decode-cache slot needed
             }
             if (c.resident_slot[(size_t) id] < 0) {
                 // no slot yet: the fit check in the constructor makes this
@@ -2245,6 +2250,7 @@ size_t llama_disk_stage::fill_base_experts() {
                 c.resident_slot[(size_t) id]   = slot;
                 c.resident_filled[(size_t) id] = 0;
             } else if (c.resident_filled[(size_t) id] != 0) {
+                n_resident++;
                 continue;  // already cached
             }
             c.base[(size_t) id] = 1;
@@ -2260,6 +2266,7 @@ size_t llama_disk_stage::fill_base_experts() {
                 bytes += read_len;
             }
             filled.emplace_back(il, id);
+            n_resident++;
         }
     }
 
@@ -2279,13 +2286,11 @@ size_t llama_disk_stage::fill_base_experts() {
                 p.cache[(size_t) il].resident_filled[(size_t) id] = 1;
             }
         }
-    }
-
-    if (p.have_base_template && bytes > 0) {
         LLAMA_LOG_INFO("%s: loaded %zu base expert(s), %.1f MiB into the decode cache\n",
                        __func__, filled.size(), bytes / (1024.0 * 1024.0));
     }
-    return bytes > 0 ? filled.size() : 0;
+
+    return n_resident;
 #else
     return 0;
 #endif
@@ -3515,26 +3520,6 @@ void llama_disk_stage::base_remove(int il, int32_t id) {
 
 const std::vector<std::vector<int32_t>> & llama_disk_stage::warm_experts() const {
     return pimpl->warm_loaded;
-}
-
-int32_t llama_disk_stage::base_count() const {
-    int32_t n = 0;
-    for (const auto & v : base_experts()) {
-        n += (int32_t) v.size();
-    }
-    return n;
-}
-
-bool llama_disk_stage::is_base(int il, int32_t id) const {
-    if (il < 0 || il >= (int) pimpl->cache.size()) {
-        return false;
-    }
-    const impl::cache_layer & c = pimpl->cache[(size_t) il];
-    if (c.table == nullptr || id < 0 || id >= (int32_t) c.base.size()) {
-        return false;
-    }
-    std::lock_guard<std::mutex> lock(pimpl->cache_mu);
-    return c.base[(size_t) id] != 0;
 }
 
 bool llama_disk_stage::resident_add(int il, int32_t id) {

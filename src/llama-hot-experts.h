@@ -253,9 +253,10 @@ class llama_hot_expert_cache {
     // prompt_decay <= 1.
     void on_prompt_begin();
 
-    // Select and apply the base-expert mode for this turn's tool names. The
-    // disk stage resolves the template rules; the current set is unchanged when
-    // the selected name is already active
+    // Queue the base-expert mode for this turn's tool names. The disk stage
+    // resolves the template rules; the change is applied on the decode thread at
+    // the next ubatch boundary. Safe to call from any thread, no graph is
+    // touched here
     void set_base_set_for_tools(const std::vector<std::string> & tools);
     bool set_base_set_for_fence();
 
@@ -395,9 +396,16 @@ class llama_hot_expert_cache {
     void add_base_pin(int il, layer_state & ls, int32_t expert_id);
 
     // demote/admit one base expert while switching modes (caller holds mu)
-    bool set_base_set(const std::string & name);
+    bool apply_base_set(const std::string & name);
     void demote_base_pin(int il, layer_state & ls, int32_t expert_id);
     bool admit_base_pin(int il, layer_state & ls, int32_t expert_id);
+
+    // queue a base-set change picked by a caller thread; the last request before
+    // the next ubatch boundary wins. Locked, but does no eviction or I/O
+    void request_base_set(const std::string & name);
+
+    // apply the queued set (decode thread, between graphs)
+    void apply_pending_base_set();
 
     // free one cold dynamic slot in `pool`; forced base admission does not use
     // the normal hysteresis guards. false when no dynamic resident can be freed
@@ -504,6 +512,8 @@ class llama_hot_expert_cache {
     uint64_t       n_base_released = 0;
     uint64_t       n_base_refused  = 0;
     std::string    active_base_set;
+    std::string    pending_base_set;
+    bool           have_pending_base_set = false;
     std::vector<int32_t> n_pinned_layer; // residents per layer (disk cache path)
     const uint64_t budget_bytes;     // 0 = unlimited
     const uint64_t decay_interval;   // 0 = lifetime counts (no aging)

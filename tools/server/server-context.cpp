@@ -431,7 +431,6 @@ struct server_slot {
     size_t last_nl_pos = 0;
 
     std::string  generated_text;
-    bool expert_base_tool_detection_active = false;
     std::string  debug_generated_text;
     llama_tokens generated_tokens;
     size_t n_sent_text = 0; // number of sent text character (i.e. handle partial UTF-8 on streaming)
@@ -534,14 +533,13 @@ struct server_slot {
 
         last_nl_pos    = 0;
         generated_text = "";
-        expert_base_tool_detection_active = false;
         has_new_line   = false;
         truncated      = false;
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
         n_sent_text    = 0;
 
-        if (spec != nullptr) {
+        if (can_speculate()) {
             spec_draft.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
@@ -630,7 +628,7 @@ struct server_slot {
     }
 
     bool can_speculate() const {
-        return !!spec && !expert_base_tool_detection_active;
+        return !!spec;
     }
 
     void add_token(const completion_token_output & token) {
@@ -2198,12 +2196,9 @@ private:
         }
 
         if (!params_base.pin_experts_template.empty()) {
-            std::vector<const char *> expert_base_tools;
-            expert_base_tools.reserve(task.params.expert_base_tools.size());
-            for (const std::string & tool : task.params.expert_base_tools) {
-                expert_base_tools.push_back(tool.c_str());
-            }
-            llama_expert_base_set_tools(ctx_tgt, expert_base_tools.data(), expert_base_tools.size());
+            // a new turn always starts from the template default; the streamed
+            // tool parser selects another set while the model is generating
+            llama_expert_base_set_tools(ctx_tgt, nullptr, 0);
         }
 
         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
@@ -2248,8 +2243,6 @@ private:
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
-        slot.expert_base_tool_detection_active =
-                !params_base.pin_experts_template.empty() && task.params.expert_base_detect_tools;
         slot.task = std::make_unique<const server_task>(std::move(task));
 
         slot.state = slot.task->is_child()
@@ -5105,15 +5098,6 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     params,
                     meta->logit_bias_eog,
                     data);
-            task.params.expert_base_detect_tools = json_value(data, "expert_base_detect_tools", false);
-            const json expert_base_tools = json_value(data, "expert_base_tools", json::array());
-            if (expert_base_tools.is_array()) {
-                for (const json & tool : expert_base_tools) {
-                    if (tool.is_string()) {
-                        task.params.expert_base_tools.push_back(tool.get<std::string>());
-                    }
-                }
-            }
 
             if (!defer_mtmd) {
                 task.params.message_spans = task.tokens.find_message_spans(delimiters);

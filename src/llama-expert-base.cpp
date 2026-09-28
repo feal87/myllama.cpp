@@ -8,6 +8,17 @@
 
 namespace {
 
+// cut a trailing comment: a '#' at the start of the line or behind whitespace
+// ends the meaningful part, so the documented inline comments parse
+std::string strip_comment(const std::string & line) {
+    for (size_t i = 0; i < line.size(); ++i) {
+        if (line[i] == '#' && (i == 0 || std::isspace((unsigned char) line[i - 1]))) {
+            return line.substr(0, i);
+        }
+    }
+    return line;
+}
+
 // whitespace-separated fields of `line`, empty fields dropped
 std::vector<std::string> split_ws(const std::string & line) {
     std::vector<std::string> out;
@@ -75,11 +86,16 @@ bool is_abs(const std::string & path) {
 bool llama_expert_base_tool_match(const std::string & tool, const std::string & name) {
     const std::string t = to_lower(tool);
     const std::string n = to_lower(name);
-    if (n.empty() || t.size() < n.size()) {
+    if (n.empty()) {
         return false;
     }
     if (t == n) {
         return true;
+    }
+    // the size check must come after the equality test: equal lengths that are
+    // not equal would underflow the suffix index below
+    if (t.size() <= n.size()) {
+        return false;
     }
     // a namespaced tool matches its trailing name: mcp__fs__read_file -> read_file
     return is_sep(t[t.size() - n.size() - 1]) && t.compare(t.size() - n.size(), n.size(), n) == 0;
@@ -99,6 +115,8 @@ std::string llama_expert_base_template::select(const std::vector<std::string> & 
 }
 
 void llama_expert_base_template_parse(const std::string & path, llama_expert_base_template & out) {
+    out = llama_expert_base_template{};
+
     std::ifstream in(path);
     if (!in) {
         throw std::runtime_error("expert base template: cannot open '" + path + "'");
@@ -122,7 +140,7 @@ void llama_expert_base_template_parse(const std::string & path, llama_expert_bas
         if (!line.empty() && line.back() == '\r') {
             line.pop_back();
         }
-        const std::vector<std::string> f = split_ws(line);
+        const std::vector<std::string> f = split_ws(strip_comment(line));
         if (f.empty() || f[0][0] == '#') {
             continue;
         }

@@ -1319,9 +1319,10 @@ bool llama_hot_expert_cache::evict_coldest_for_base(int pool) {
 }
 
 void llama_hot_expert_cache::set_base_set_for_tools(const std::vector<std::string> & tools) {
-    if (disk_stage != nullptr) {
-        set_base_set(disk_stage->select_base_set(tools));
+    if (disk_stage == nullptr) {
+        return;
     }
+    request_base_set(disk_stage->select_base_set(tools));
 }
 
 bool llama_hot_expert_cache::set_base_set_for_fence() {
@@ -1329,10 +1330,43 @@ bool llama_hot_expert_cache::set_base_set_for_fence() {
         return false;
     }
     const std::string name = disk_stage->fence_base_set();
-    return !name.empty() && set_base_set(name);
+    if (name.empty()) {
+        return false;
+    }
+    request_base_set(name);
+    return true;
 }
 
-bool llama_hot_expert_cache::set_base_set(const std::string & name) {
+void llama_hot_expert_cache::request_base_set(const std::string & name) {
+    if (disk_stage->base_set_by_name(name) == nullptr) {
+        LLAMA_LOG_WARN("%s: expert base template selected unknown set '%s'\n", __func__, name.c_str());
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(mu);
+    if (active_base_set == name) {
+        have_pending_base_set = false;  // already there; drop any queued change
+        return;
+    }
+    pending_base_set      = name;
+    have_pending_base_set = true;
+}
+
+void llama_hot_expert_cache::apply_pending_base_set() {
+    std::string name;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        if (!have_pending_base_set) {
+            return;
+        }
+        name = pending_base_set;
+        pending_base_set.clear();
+        have_pending_base_set = false;
+    }
+    apply_base_set(name);
+}
+
+bool llama_hot_expert_cache::apply_base_set(const std::string & name) {
     if (disk_stage == nullptr) {
         return false;
     }
@@ -1370,6 +1404,9 @@ bool llama_hot_expert_cache::set_base_set(const std::string & name) {
     // expert that is itself part of the new target.
     for (int il = 0; il < (int) layers.size() && il < (int) target->size(); ++il) {
         layer_state & ls = layers[(size_t) il];
+        if (!ls.resolved_tensors) {
+            resolve_tensors(il, ls);
+        }
         for (const int32_t id : (*target)[(size_t) il]) {
             if (id >= 0 && (uint32_t) id < ls.n_experts && disk_stage->resident_slot_held(il, id) &&
                     (ls.pin_state[(size_t) id] & PIN_BASE) == 0) {
@@ -1382,8 +1419,12 @@ bool llama_hot_expert_cache::set_base_set(const std::string & name) {
 
     // New base experts are mandatory. If a pool is full, evict its coldest
     // dynamic resident without the usual heat margin/grace and retry.
+    size_t refused = 0;
     for (int il = 0; il < (int) layers.size() && il < (int) target->size(); ++il) {
         layer_state & ls = layers[(size_t) il];
+        if (!ls.resolved_tensors) {
+            resolve_tensors(il, ls);
+        }
         for (const int32_t id : (*target)[(size_t) il]) {
             if (id < 0 || (uint32_t) id >= ls.n_experts ||
                     (ls.pin_state[(size_t) id] & PIN_BASE) != 0) {
@@ -1397,16 +1438,20 @@ bool llama_hot_expert_cache::set_base_set(const std::string & name) {
                 n_base_admitted++;
             } else {
                 n_base_refused++;
+                refused++;
                 LLAMA_LOG_WARN("%s: could not admit base expert layer %d expert %d\n", __func__, il, id);
             }
         }
     }
 
     disk_stage->set_base_target(name);
-    disk_stage->fill_base_experts();
     active_base_set = name;
     n_base_switches++;
     rebuild_pinned_rank();
+    if (refused > 0) {
+        LLAMA_LOG_WARN("%s: %zu base expert(s) of set '%s' have no slot; they will be promoted on demand\n",
+                       __func__, refused, name.empty() ? "<base>" : name.c_str());
+    }
     LLAMA_LOG_INFO("%s: switched base expert set to '%s' (%d expert(s) permanent)\n",
                    __func__, name.empty() ? "<base>" : name.c_str(), n_base);
     return true;
@@ -1660,6 +1705,11 @@ void llama_hot_expert_cache::on_ubatch_begin(int64_t n_tokens) {
     n_ubatches++;
     n_tokens_cur = n_tokens;
 
+    // a mode switch is queued by another thread: apply it here, between graphs,
+    // so the decode thread is the only one that touches the layers and the disk
+    // stage target
+    apply_pending_base_set();
+
     // the ranking is fed by single-token decode ubatches only, so only they
     // advance its clock: the decay halves the counts (and thereby moves the pin
     // set at the next promotion), so a multi-token batch/prefill ubatch must
@@ -1804,6 +1854,13 @@ void llama_hot_expert_cache::flush_profile() {
 }
 
 void llama_hot_expert_cache::on_prompt_begin() {
+    // A new prompt always starts from the template's default base set: the
+    // previous turn's tool choice must not leak into the new one. The streamed
+    // tool parser and the Markdown fence switch it again during the decode.
+    if (disk_stage != nullptr) {
+        request_base_set(disk_stage->select_base_set({}));
+    }
+
     std::lock_guard<std::mutex> lock(mu);
 
     if (profile_file != nullptr) {

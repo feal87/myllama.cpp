@@ -18,7 +18,7 @@
 //
 // The sets themselves keep the "llama-expert-base v1" format and are read by
 // the disk stage; this file only maps conditions to set names. Rule order
-// decides: the first rule matching any tool of the turn wins, the default set
+// decides: the first rule matching any tool in the list wins, the default set
 // is used when none does.
 //
 // A tool name matches a rule name when it is equal to it or ends with it behind

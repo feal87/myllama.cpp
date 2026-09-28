@@ -1291,28 +1291,8 @@ json oaicompat_chat_params_parse(
     inputs.messages               = common_chat_msgs_parse_oaicompat(messages);
     inputs.tools                  = common_chat_tools_parse_oaicompat(tools);
     inputs.tool_choice            = common_chat_tool_choice_parse_oaicompat(tool_choice);
-    // Use the tool calls from this turn's history, not every tool definition
-    // offered by the client: the latter can contain several modes at once.
-    llama_params["expert_base_tools"] = json::array();
-    llama_params["expert_base_detect_tools"] = !inputs.tools.empty();
-    size_t last_user = 0;
-    bool have_user = false;
-    for (size_t i = 0; i < inputs.messages.size(); ++i) {
-        if (inputs.messages[i].role == "user") {
-            last_user = i;
-            have_user = true;
-        }
-    }
-    const size_t first_turn_msg = have_user ? last_user + 1 : 0;
-    for (size_t i = inputs.messages.size(); i > first_turn_msg; --i) {
-        const common_chat_msg & msg = inputs.messages[i - 1];
-        if (msg.role == "assistant") {
-            for (const common_chat_tool_call & call : msg.tool_calls) {
-                llama_params["expert_base_tools"].push_back(call.name);
-            }
-            break;
-        }
-    }
+    // the expert base set always starts a turn at the template default; the
+    // streamed tool parser switches it when the model actually calls a tool
     inputs.json_schema            = json_schema.is_null() ? "" : json_schema.dump();
     inputs.grammar                = grammar;
     inputs.use_jinja              = opt.use_jinja;

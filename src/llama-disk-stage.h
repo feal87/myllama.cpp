@@ -177,10 +177,10 @@ public:
     bool set_base_target(const std::string & name);
 
     // make `id` of layer `il` a base resident: marks it unevictable and reserves
-    // its slot (no I/O: the bytes are read when the expert is next routed, or by
-    // the background base prefill). An expert that already holds a slot or is
-    // served from VRAM only needs the mark. false when the pool has no slot to
-    // spare, in which case nothing changed
+    // its slot (no I/O: the bytes are read when the expert is next routed). An
+    // expert that already holds a slot or is served from VRAM only needs the
+    // mark. false when the pool has no slot to spare, in which case nothing
+    // changed. Call from the decode thread only
     bool base_add(int il, int32_t id);
 
     // drop the base mark of `id`: it keeps its slot and becomes an ordinary
@@ -191,20 +191,13 @@ public:
     // set selected by the last base_set_by_name() lookup, for logs and stats
     const std::string & active_base_set() const;
 
-    // read the base experts whose bytes are not in the cache yet. Called at
-    // the mode switch between graphs; blocks for the full batched read
+    // read the base experts whose bytes are not in the cache yet. Called once at
+    // load, before any graph runs; blocks for the full batched read
     size_t fill_base_experts();
 
     // warm experts actually read into the cache (base entries excluded), for the
     // hot-expert engine to register as evictable count-0 residents
     const std::vector<std::vector<int32_t>> & warm_experts() const;
-
-    // total base experts loaded, for stats/logs
-    int32_t base_count() const;
-
-    // true when (il, id) is a base expert: a permanent decode-cache resident that
-    // the promotion policy must never evict. The query takes the cache lock
-    bool is_base(int il, int32_t id) const;
 
     // make expert id of layer il resident: reserve a slot for it and mark it
     // unfilled. No I/O here - fill_cache() reads the expert into the slot the next

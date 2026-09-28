@@ -3005,9 +3005,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "(default: disabled). The template starts with 'llama-expert-base-template v1',\n"
         "then declares 'base FILE', named 'set NAME FILE' entries, a 'default NAME',\n"
         "an optional 'fence SET' for Markdown fenced code blocks, and ordered\n"
-        "'tools NAME[,NAME...] SET' rules. A closed fence restores the prior mode.\n"
-        "Rules match the latest assistant\n"
-        "tool call in the current turn, not the tools merely offered by the request.\n"
+        "'tools NAME[,NAME...] SET' rules. A turn always starts on the default\n"
+        "set and switches to a mode set only when the model emits a matching\n"
+        "tool call while generating; a closed fence restores the prior mode.\n"
         "Set files use the 'llama-expert-base v1' format; relative paths resolve from\n"
         "FILE's directory. The first matching tool rule wins; otherwise the default set\n"
         "is used. The base set stays resident in every mode. Requires --load-mode dio",

@@ -4916,7 +4916,6 @@ llama_context_params llama_context_default_params() {
         /*.expert_profile_path           =*/ nullptr,
         /*.pin_experts_from_profile_path =*/ nullptr,
         /*.warm_experts_from_profile_path=*/ nullptr,
-        /*.pin_experts_template_path    =*/ nullptr,
         /*.n_moe_cache_budget_bytes    =*/ 0,
         /*.n_moe_cache_inserts         =*/ 2,
         /*.n_moe_cache_drift_percent   =*/ 0.0f,
@@ -4935,6 +4934,7 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.pin_experts_template_path    =*/ nullptr,
     };
 
     return result;

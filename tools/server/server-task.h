@@ -72,9 +72,6 @@ struct task_params {
 
     std::vector<std::string> antiprompt;
     std::vector<std::string> response_fields;
-    // Tool calls from this turn's history, used by the expert-base template
-    std::vector<std::string> expert_base_tools;
-    bool expert_base_detect_tools = false;
 
     bool timings_per_token   = false;
     bool post_sampling_probs = false;

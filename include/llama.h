@@ -463,11 +463,6 @@ extern "C" {
         // the disk stage; base experts already listed there are skipped
         const char * warm_experts_from_profile_path;
 
-        // tool-conditioned expert base template (nullptr = disabled). The file
-        // names the always-resident base set, named mode sets and tool-name rules;
-        // requires the disk decode cache (--load-mode dio)
-        const char * pin_experts_template_path;
-
         // GPU-resident cache for host-offloaded MoE expert weights, VRAM tier on
         // top of the hot-expert cache (--pin-hot-experts). Decode on a
         // host-offloaded MoE layer is host-RAM-bandwidth bound; this serves the
@@ -529,6 +524,11 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // tool-conditioned expert base template (nullptr = disabled). The file
+        // names the always-resident base set, named mode sets and tool-name rules;
+        // requires the disk decode cache (--load-mode dio)
+        const char * pin_experts_template_path;
     };
 
     struct llama_model_tensor_override {
@@ -1270,12 +1270,13 @@ extern "C" {
     // start a new record. No-op when profiling is disabled.
     LLAMA_API void llama_expert_profile_flush(struct llama_context * ctx);
 
-    // Select the tool-conditioned base-expert set for the next server turn.
+    // Queue the tool-conditioned base-expert set for the next server turn.
     // Tool names are matched by the template loaded with --pin-experts-template.
-    // Call between llama_decode() calls, with no graph in flight.
+    // Thread-safe: the change is applied by the decode thread at the next ubatch
+    // boundary, so this may be called while a graph is in flight.
     LLAMA_API void llama_expert_base_set_tools(struct llama_context * ctx, const char * const * tools, size_t n_tools);
 
-    // Select the expert set configured for Markdown fenced code blocks.
+    // Queue the expert set configured for Markdown fenced code blocks.
     // Returns false when the template has no 'fence' set.
     LLAMA_API bool llama_expert_base_set_fence(struct llama_context * ctx);
 
