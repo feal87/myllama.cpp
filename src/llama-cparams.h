@@ -75,6 +75,8 @@ struct llama_cparams {
     uint64_t n_experts_stats_interval;
     // halve all usage counts every N tokens (0 = disabled, lifetime counts)
     uint64_t n_pin_hot_experts_decay_tokens;
+    // divide all usage counts by N at every prompt start (0 or 1 = keep them)
+    uint64_t n_pin_hot_experts_prompt_decay;
     // minimum usage count an expert must reach before it is pinned (0 = any routed
     // expert); with aging the counts shrink, so scale this with the decay window
     uint64_t n_pin_hot_experts_min_count;

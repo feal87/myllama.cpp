@@ -1720,6 +1720,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_pin_hot_experts_pool_layers  = params.n_pin_hot_experts_pool_layers;
     cparams.n_experts_stats_interval = params.n_experts_stats_interval;
     cparams.n_pin_hot_experts_decay_tokens   = params.n_pin_hot_experts_decay_tokens;
+    cparams.n_pin_hot_experts_prompt_decay    = params.n_pin_hot_experts_prompt_decay;
     cparams.n_pin_hot_experts_min_count      = params.n_pin_hot_experts_min_count;
     cparams.expert_profile_path              = params.expert_profile.empty() ? nullptr : params.expert_profile.c_str();
     cparams.pin_experts_from_profile_path    = params.pin_experts_from_profile.empty() ? nullptr : params.pin_experts_from_profile.c_str();

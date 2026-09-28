@@ -436,6 +436,12 @@ extern "C" {
         // session occupy slots after they drifted cold.
         uint64_t n_pin_hot_experts_decay_tokens;
 
+        // divisor applied to all hot-expert usage counts at every prompt start,
+        // so the pin set re-converges on the new prompt's routing mix (0 or 1
+        // = keep the counts across prompts). The same trade-off as the periodic
+        // halving above, but per prompt instead of per token budget.
+        uint64_t n_pin_hot_experts_prompt_decay;
+
         // minimum usage count an expert must reach before the RAM tier mlock's
         // it (0 = pin any routed expert as soon as a slot is free). A count is
         // one single-token decode ubatch that routed the expert, halved every

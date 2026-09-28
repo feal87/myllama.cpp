@@ -496,6 +496,9 @@ struct common_params {
     // halve all usage counts every N tokens (0 = disabled). See
     // --pin-hot-experts-decay-tokens.
     uint64_t n_pin_hot_experts_decay_tokens = 0;
+    // divide all usage counts by N at every prompt start (0 or 1 = keep them
+    // across prompts). See --pin-hot-experts-prompt-decay.
+    uint64_t n_pin_hot_experts_prompt_decay = 4;
     // minimum usage count an expert must reach before --pin-hot-experts will
     // mlock it (0 = any routed expert). A count is one decode token that routed
     // the expert, halved every n_pin_hot_experts_decay_tokens, so with aging

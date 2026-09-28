@@ -56,6 +56,12 @@
 //    routing mix instead of lifetime leaders (a long session otherwise lets
 //    first-past-the-post experts occupy slots after they drifted cold). Prefill
 //    tokens never advance the clock: they neither feed nor age the ranking.
+//  - prompt-start decay (--pin-hot-experts-prompt-decay N): all usage counts
+//    are divided by N at every prompt boundary, so the sets re-converge on the
+//    new prompt's routing mix. The same trade-off as the periodic decay, only
+//    applied per prompt instead of per token budget: N = 1 (or 0) keeps the
+//    counts across prompts, a large N forgets the previous prompt almost
+//    completely.
 //  - minimum-usage floor (--pin-hot-experts-min-count N): an expert is only
 //    mlock'd once its usage count reaches N, so a one-off route (count 1) is
 //    never pinned and cannot grab a slot or flip-flap the set. With aging the
@@ -97,6 +103,8 @@ class llama_hot_expert_cache {
     // budget_bytes:      hard cap on total bytes locked across ALL layers combined (0 = unlimited, NOT recommended)
     // decay_interval:    halve all usage counts every N decode tokens (0 = disabled, lifetime
     //                    counts); prefill tokens neither count nor age the ranking
+    // prompt_decay:      divide all usage counts by N at every prompt boundary
+    //                    (<= 1 = keep the counts across prompts)
     // min_pin_count:     usage-count floor below which an expert is never mlock'd: a one-off
     //                    route is noise, not heat (0 = pin any routed expert). Counts are
     //                    halved every decay_interval, so scale this with the decay window
@@ -116,6 +124,7 @@ class llama_hot_expert_cache {
                            int32_t             n_pin_experts,
                            uint64_t            budget_bytes,
                            uint64_t            decay_interval,
+                           uint64_t            prompt_decay,
                            uint64_t            min_pin_count,
                            bool                prefetch_enabled,
                            bool                track_rank,
@@ -237,10 +246,11 @@ class llama_hot_expert_cache {
 
     // A new prompt has begun (llama_context detects the decode -> prefill
     // transition of the ubatch stream, llama-server runs np = 1): divide every
-    // usage count by four immediately, so the shared ranking (and the RAM pin
-    // set / VRAM MoE layout it drives) can re-converge on the new prompt's
-    // routing mix instead of carrying the previous prompt's leaders. No-op in
-    // prefetch-only mode (no counts are maintained there).
+    // usage count by `prompt_decay` immediately, so the shared ranking (and the
+    // RAM pin set / VRAM MoE layout it drives) can re-converge on the new
+    // prompt's routing mix instead of carrying the previous prompt's leaders.
+    // No-op in prefetch-only mode (no counts are maintained there) and when
+    // prompt_decay <= 1.
     void on_prompt_begin();
 
     // Prints the periodic stats report (pinned vs capacity, realized RAM-tier hit
@@ -476,6 +486,7 @@ class llama_hot_expert_cache {
     std::vector<int32_t> n_pinned_layer; // residents per layer (disk cache path)
     const uint64_t budget_bytes;     // 0 = unlimited
     const uint64_t decay_interval;   // 0 = lifetime counts (no aging)
+    const uint64_t prompt_decay;     // count divisor at every prompt start (<= 1 = off)
     const uint64_t min_pin_count;    // usage-count floor for pinning (0 = any routed expert)
     const bool     prefetch_enabled; // read-ahead routed-but-unpinned expert rows (--hot-experts-prefetch)
     llama_disk_stage * disk_stage = nullptr; // direct-read staging of the routed experts (null when disabled)

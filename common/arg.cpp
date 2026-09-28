@@ -2940,6 +2940,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PIN_HOTEXPERTS_DECAY_TOKENS"));
     add_opt(common_arg(
+        {"--pin-hot-experts-prompt-decay"}, "N",
+        string_format(
+            "divide all hot-expert usage counts by N every time a new prompt starts, so the pin set\n"
+            "re-converges on the new prompt's routing mix instead of carrying the previous prompt's\n"
+            "leaders (default: %" PRIu64 ", 0 or 1 = disabled). Same trade-off as the periodic\n"
+            "--pin-hot-experts-decay-tokens, but per prompt instead of per token budget: a large N\n"
+            "forgets the previous prompt almost completely (fast re-convergence, some churn early in\n"
+            "the new prompt), a small one keeps most of the previous prompt's heat\n"
+            "(useful with a fixed workload, e.g. the same tool loop every turn)",
+            params.n_pin_hot_experts_prompt_decay
+        ),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --pin-hot-experts-prompt-decay must be >= 0");
+            }
+            params.n_pin_hot_experts_prompt_decay = (uint64_t) value;
+        }
+    ).set_env("LLAMA_ARG_PIN_HOTEXPERTS_PROMPT_DECAY"));
+    add_opt(common_arg(
         {"--pin-hot-experts-min-count"}, "N",
         string_format(
             "minimum usage count an expert needs before --pin-hot-experts will mlock it, so a\n"

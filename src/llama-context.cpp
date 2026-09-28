@@ -150,6 +150,7 @@ llama_context::llama_context(
     cparams.n_pin_hot_experts_pool_layers  = params.n_pin_hot_experts_pool_layers;
     cparams.n_experts_stats_interval = params.n_experts_stats_interval;
     cparams.n_pin_hot_experts_decay_tokens   = params.n_pin_hot_experts_decay_tokens;
+    cparams.n_pin_hot_experts_prompt_decay    = params.n_pin_hot_experts_prompt_decay;
     cparams.n_pin_hot_experts_min_count      = params.n_pin_hot_experts_min_count;
     cparams.expert_profile_path              = params.expert_profile_path;
     cparams.pin_experts_from_profile_path    = params.pin_experts_from_profile_path;
@@ -241,7 +242,8 @@ llama_context::llama_context(
                                                         : cparams.n_pin_hot_experts;
             hot_experts = std::make_unique<llama_hot_expert_cache>(
                 model, n_pin_effective, cparams.n_pin_hot_experts_budget_bytes,
-                cparams.n_pin_hot_experts_decay_tokens, cparams.n_pin_hot_experts_min_count,
+                cparams.n_pin_hot_experts_decay_tokens, cparams.n_pin_hot_experts_prompt_decay,
+                cparams.n_pin_hot_experts_min_count,
                 cparams.hot_experts_prefetch,
                 cparams.n_pin_hot_experts > 0 || moe_requested || disk_active || cparams.expert_profile_path != nullptr,
                 disk_active, cparams.expert_profile_path);
@@ -1731,9 +1733,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // and every new prompt starts with a multi-token (prefill) ubatch: that
     // decode -> prefill transition is the prompt boundary. Reset the expert
     // tiers for the new prompt - the RAM/VRAM hot sets must re-learn its
-    // routing priorities (the hot cache divides all counts by 4) and the VRAM
-    // MoE layout rebuilds once the new prompt produced its own profile,
-    // while the old layout keeps serving that warm-up window.
+    // routing priorities (the hot cache divides all counts by
+    // --pin-hot-experts-prompt-decay) and the VRAM MoE layout rebuilds once the
+    // new prompt produced its own profile, while the old layout keeps serving
+    // that warm-up window.
     if (hot_experts && prev_ubatch_n_tokens == 1 && ubatch.n_tokens > 1) {
         hot_experts->on_prompt_begin();
         if (moe_cache) {
@@ -4885,6 +4888,7 @@ llama_context_params llama_context_default_params() {
         /*.n_pin_hot_experts_pool_layers =*/ 6,
         /*.n_experts_stats_interval     =*/ 5,
         /*.n_pin_hot_experts_decay_tokens=*/ 0,
+        /*.n_pin_hot_experts_prompt_decay =*/ 4,
         /*.n_pin_hot_experts_min_count   =*/ 8,
         /*.expert_profile_path           =*/ nullptr,
         /*.pin_experts_from_profile_path =*/ nullptr,

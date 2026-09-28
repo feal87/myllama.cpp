@@ -18,6 +18,7 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
                                                int32_t             n_pin_experts,
                                                uint64_t            budget_bytes,
                                                uint64_t            decay_interval,
+                                               uint64_t            prompt_decay,
                                                uint64_t            min_pin_count,
                                                bool                prefetch_enabled,
                                                bool                track_rank,
@@ -27,6 +28,7 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
     n_pin(n_pin_experts),
     budget_bytes(budget_bytes),
     decay_interval(decay_interval),
+    prompt_decay(prompt_decay),
     min_pin_count(min_pin_count),
     prefetch_enabled(prefetch_enabled),
     track_rank(track_rank) {
@@ -113,6 +115,9 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
     }
     if (decay_interval > 0) {
         LLAMA_LOG_INFO("%s: halving all usage counts every %" PRIu64 " decode tokens\n", __func__, decay_interval);
+    }
+    if (prompt_decay > 1) {
+        LLAMA_LOG_INFO("%s: dividing all usage counts by %" PRIu64 " at every prompt start\n", __func__, prompt_decay);
     }
 
 }
@@ -1553,22 +1558,27 @@ void llama_hot_expert_cache::on_prompt_begin() {
         write_profile();
     }
 
-    if (!track_rank) {
+    // fresh epoch for the periodic decay clock: do not fire a scheduled halving
+    // right on top of a prompt-start decay
+    n_tokens_seen = 0;
+
+    if (!track_rank || prompt_decay <= 1) {
         return;  // prefetch-only mode: no usage counts are maintained
     }
 
     // A new prompt defines new routing priorities (its decode ubatches start
-    // feeding the ranking right after this): divide every usage count by four
-    // immediately (same floor-at-1 rounding as the periodic halving), so the
-    // pin/VRAM sets can re-converge on the new prompt's expert mix instead of
-    // letting the previous prompt's lifetime leaders hold their slots.
+    // feeding the ranking right after this): divide every usage count by
+    // prompt_decay immediately (same floor-at-1 rounding as the periodic
+    // halving), so the pin/VRAM sets can re-converge on the new prompt's
+    // expert mix instead of letting the previous prompt's lifetime leaders hold
+    // their slots.
     for (size_t il = 0; il < layers.size(); ++il) {
         auto & ls = layers[il];
         if (!ls.resolved_tensors) {
             continue;
         }
         for (uint64_t & c : ls.counts) {
-            const uint64_t new_count = (c + 3) / 4;  // divide by 4, floor at 1
+            const uint64_t new_count = c / prompt_decay + (c % prompt_decay != 0);  // divide, floor at 1
             if (new_count != c) {
                 c = new_count;
             }
@@ -1579,9 +1589,6 @@ void llama_hot_expert_cache::on_prompt_begin() {
     // set once instead of patching one key per pinned expert
     rebuild_pinned_rank();
 
-    // fresh epoch for the periodic decay clock (do not fire a scheduled halving
-    // right on top of this one)
-    n_tokens_seen = 0;
     n_decays++;
 }
 
