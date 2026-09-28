@@ -519,17 +519,49 @@ struct llama_disk_stage::impl {
         int64_t stall_us = 0; // read time still outstanding when the cold pass needed it
         int64_t span_us  = 0; // wall clock from begin() to the end of the cold pass
         int64_t bytes    = 0;
+
+        split_acc operator-(const split_acc & o) const {
+            return { layers - o.layers, plan_us - o.plan_us, hot_us - o.hot_us, read_us - o.read_us,
+                     cold_us - o.cold_us, ovl_us - o.ovl_us, stall_us - o.stall_us,
+                     span_us - o.span_us, bytes - o.bytes };
+        }
+
+        split_acc & operator+=(const split_acc & o) {
+            layers   += o.layers;
+            plan_us  += o.plan_us;
+            hot_us   += o.hot_us;
+            read_us  += o.read_us;
+            cold_us  += o.cold_us;
+            ovl_us   += o.ovl_us;
+            stall_us += o.stall_us;
+            span_us  += o.span_us;
+            bytes    += o.bytes;
+            return *this;
+        }
     };
     split_acc trace_split_tok;
+    // running totals of the same: trace_split_tok is reset every decode token and
+    // only the trace prints it, while the report needs the interval
+    split_acc split_tot;
+    split_acc prev_split_tot;
+    uint32_t  n_reports = 0;
 
-    // previous stats report, for the per-interval delta line
+    // previous stats report, for the per-interval deltas
     uint64_t prev_l2_hits        = 0;
     uint64_t prev_l2_misses      = 0;
+    uint64_t prev_l2_cold        = 0;
     uint64_t prev_l2_evictions   = 0;
     uint64_t prev_l2_demotions   = 0;
     uint64_t prev_l2_hit_bytes   = 0;
     uint64_t prev_l2_promo_bytes = 0;
     uint64_t prev_l2_filtered    = 0;
+    // previous report's decode-cache counters and decode token count, for the
+    // interval hit rate and the per-token fill cost
+    uint64_t prev_dec_cache_hits    = 0;
+    uint64_t prev_dec_cache_misses  = 0;
+    uint64_t prev_dec_cache_fills   = 0;
+    uint64_t prev_dec_cache_changes = 0;
+    uint64_t prev_dec_tokens        = 0;
 
     // decode fill timing: the blocking read share of a decode step, so it can be
     // compared with the compute. Summed over every fill_cache() call
@@ -942,69 +974,185 @@ void llama_disk_stage::node_prepare_callback(struct ggml_tensor * node, void * u
 #endif
 }
 
-void llama_disk_stage::print_stats() {
+// a byte volume for the report: the disk counters reach the TiB range, while the
+// sizes and budgets stay in MiB
+static std::string report_volume(uint64_t n_bytes) {
+    char buf[64];
+
+    if (n_bytes >= 1024ull * 1024 * 1024) {
+        snprintf(buf, sizeof(buf), "%.2f GiB", n_bytes / (1024.0 * 1024.0 * 1024.0));
+    } else {
+        snprintf(buf, sizeof(buf), "%.2f MiB", n_bytes / (1024.0 * 1024.0));
+    }
+    return buf;
+}
+
+void llama_disk_stage::print_stats(uint64_t decode_tokens) {
     impl & p = *pimpl;
 
-    // decode fill: the read share of a decode step. Reported before the L2 early
-    // return so a cache without a pool still gets the number
-    const uint64_t d_dec_us   = p.n_dec_fill_us - p.prev_dec_fill_us;
-    const uint64_t d_dec_call = p.n_dec_fill_calls - p.prev_dec_fill_calls;
-    const uint64_t d_dec_byt  = p.n_dec_fill_bytes - p.prev_dec_fill_bytes;
-    if (d_dec_call > 0) {
-        LLAMA_LOG_INFO("[disk-stage] decode fill: %.2f ms/call over %" PRIu64 " call(s), %.2f MiB read, %.2f ms/MiB\n",
-                       (double) d_dec_us / 1000.0 / (double) d_dec_call, d_dec_call,
-                       d_dec_byt / (1024.0 * 1024.0),
-                       d_dec_byt ? (double) d_dec_us / 1000.0 / (d_dec_byt / (1024.0 * 1024.0)) : 0.0);
-    }
-    p.prev_dec_fill_us    = p.n_dec_fill_us;
-    p.prev_dec_fill_calls = p.n_dec_fill_calls;
-    p.prev_dec_fill_bytes = p.n_dec_fill_bytes;
-
-    if (p.evict_pools.empty()) {
+    if (!p.active) {
         return;
     }
 
-    const uint64_t lookups  = p.n_l2_hits + p.n_l2_misses;
-    const uint64_t d_hits   = p.n_l2_hits - p.prev_l2_hits;
-    const uint64_t d_look   = d_hits + (p.n_l2_misses - p.prev_l2_misses);
-    const uint64_t d_bytes  = p.n_l2_hit_bytes - p.prev_l2_hit_bytes;
-    const uint64_t d_promo  = p.n_l2_promo_bytes - p.prev_l2_promo_bytes;
-    const uint64_t d_evict  = p.n_l2_evictions - p.prev_l2_evictions;
-    const uint64_t d_demote = p.n_l2_demotions - p.prev_l2_demotions;
-    const uint64_t d_filter = p.n_l2_filtered - p.prev_l2_filtered;
+    // interval deltas against the previous report
+    const uint64_t d_hits       = p.n_l2_hits - p.prev_l2_hits;
+    const uint64_t d_look       = d_hits + (p.n_l2_misses - p.prev_l2_misses);
+    const uint64_t d_evict      = p.n_l2_evictions - p.prev_l2_evictions;
+    const uint64_t d_demote     = p.n_l2_demotions - p.prev_l2_demotions;
+    const uint64_t d_filtered   = p.n_l2_filtered - p.prev_l2_filtered;
+    const uint64_t d_hit_bytes  = p.n_l2_hit_bytes - p.prev_l2_hit_bytes;
+    const uint64_t d_promo      = p.n_l2_promo_bytes - p.prev_l2_promo_bytes;
+    const uint64_t d_dec_us     = p.n_dec_fill_us - p.prev_dec_fill_us;
+    const uint64_t d_dec_calls  = p.n_dec_fill_calls - p.prev_dec_fill_calls;
+    const uint64_t d_dec_bytes  = p.n_dec_fill_bytes - p.prev_dec_fill_bytes;
+    const uint64_t d_cache_hit  = p.n_decode_cache_hits - p.prev_dec_cache_hits;
+    const uint64_t d_cache_miss = p.n_decode_cache_misses - p.prev_dec_cache_misses;
+    const uint64_t d_cache_fill = p.n_decode_cache_fills - p.prev_dec_cache_fills;
+    const uint64_t d_cache_chg  = p.n_decode_cache_resident_changes - p.prev_dec_cache_changes;
+    const uint64_t d_tokens     = decode_tokens > p.prev_dec_tokens ? decode_tokens - p.prev_dec_tokens : 0;
+    const impl::split_acc split = p.split_tot - p.prev_split_tot;
 
-    LLAMA_LOG_INFO("[disk-stage] L2 pool: hit=%.1f%% (%" PRIu64 "/%" PRIu64 " warm routed, %" PRIu64 " cold fill skipped)"
-                   " | disk avoided=%.2f MiB (promo %.2f MiB) | evictions=%" PRIu64 " | demotions=%" PRIu64
-                   " | filtered=%" PRIu64 "\n",
-                   lookups ? 100.0 * p.n_l2_hits / lookups : 0.0, p.n_l2_hits, lookups, p.n_l2_cold,
-                   p.n_l2_hit_bytes / (1024.0 * 1024.0), p.n_l2_promo_bytes / (1024.0 * 1024.0),
-                   p.n_l2_evictions, p.n_l2_demotions, p.n_l2_filtered);
+    // one themed line each, emitted as a single write: the report used to be four
+    // writes, with the cumulative and the interval value of the same number on
+    // separate lines
+    std::string out = "[disk-stage] report #";
+    out += std::to_string(p.n_reports + 1);
+    out += "\n";
 
-    LLAMA_LOG_INFO("[disk-stage] L2 pool: delta hit=%.1f%% (%" PRIu64 "/%" PRIu64 ")"
-                   " | disk avoided=%.2f MiB (promo %.2f MiB) | evictions=%" PRIu64 " | demotions=%" PRIu64
-                   " | filtered=%" PRIu64 "\n",
-                   d_look ? 100.0 * d_hits / d_look : 0.0, d_hits, d_look,
-                   d_bytes / (1024.0 * 1024.0), d_promo / (1024.0 * 1024.0), d_evict, d_demote, d_filter);
+    char buf[1024];
+    auto line = [&out, &buf](const char * fmt, auto... args) {
+        const int n_chars = snprintf(buf, sizeof(buf), fmt, args...);
+        if (n_chars > 0) {
+            out.append(buf, (size_t) std::min((size_t) n_chars, sizeof(buf) - 1));
+        }
+        out += '\n';
+    };
 
-    std::string pools;
-    for (size_t k = 0; k < p.evict_pools.size(); ++k) {
-        const impl::evict_pool & ep = p.evict_pools[k];
-        const uint64_t look = ep.hits + ep.misses;
-        char buf[128];
-        snprintf(buf, sizeof(buf), "%spool %zu: %zu/%d live, hit=%.1f%% (%" PRIu64 "/%" PRIu64 "), evictions=%" PRIu64,
-                 k ? " | " : "", k, ep.slot_of.size(), ep.cap,
-                 look ? 100.0 * (double) ep.hits / (double) look : 0.0, ep.hits, look, ep.evictions);
-        pools += buf;
+    // resident capacity per pool, the transient window every routed non-resident
+    // expert is read into, the cache itself and the sets read into it at load
+    std::string slots;
+    for (size_t k = 0; k < p.pools.size(); ++k) {
+        if (k > 0) {
+            slots += " + ";
+        }
+        slots += std::to_string(p.pools[k].res_cap);
     }
-    LLAMA_LOG_INFO("[disk-stage] L2 per-pool: %s\n", pools.c_str());
+    if (p.pools.size() > 1) {
+        slots = "(" + slots + ")";
+    }
+    size_t n_base = 0;
+    size_t n_warm = 0;
+    size_t n_warm_loaded = 0;
+    for (const auto & v : p.base_set) {
+        n_base += v.size();
+    }
+    for (const auto & v : p.warm_set) {
+        n_warm += v.size();
+    }
+    for (const auto & v : p.warm_loaded) {
+        n_warm_loaded += v.size();
+    }
+    const size_t cache_bytes = p.cache_buf ? ggml_backend_buffer_get_size(p.cache_buf) : 0;
 
-    p.prev_l2_hits        = p.n_l2_hits;
-    p.prev_l2_misses      = p.n_l2_misses;
-    p.prev_l2_evictions   = p.n_l2_evictions;
-    p.prev_l2_demotions   = p.n_l2_demotions;
-    p.prev_l2_hit_bytes   = p.n_l2_hit_bytes;
-    p.prev_l2_promo_bytes = p.n_l2_promo_bytes;
-    p.prev_l2_filtered    = p.n_l2_filtered;
+    line("  layout    : %zu pool(s) over %zu layer(s) | %s resident slots | %d transient per layer"
+         " | decode cache %.2f MiB%s | base %zu, warm %zu of %zu loaded | split hot/cold %s",
+         p.pools.size(), p.cache.size(), slots.c_str(), p.n_trans, cache_bytes / (1024.0 * 1024.0),
+         p.cache_lock ? " RAM-locked" : "", n_base, n_warm_loaded, n_warm,
+         p.split_hot_active ? "on" : "off");
+
+    line("  fill      : %.2f ms/call over %" PRIu64 " call(s) (%.1f per decode token) | %s read"
+         " | %.2f ms/MiB | %.1f ms of reads per decode token | %s over %" PRIu64 " calls since start",
+         d_dec_calls ? (double) d_dec_us / 1000.0 / (double) d_dec_calls : 0.0, d_dec_calls,
+         d_tokens ? (double) d_dec_calls / (double) d_tokens : 0.0,
+         report_volume(d_dec_bytes).c_str(),
+         d_dec_bytes ? (double) d_dec_us / 1000.0 / ((double) d_dec_bytes / (1024.0 * 1024.0)) : 0.0,
+         d_tokens ? (double) d_dec_us / 1000.0 / (double) d_tokens : 0.0,
+         report_volume(p.n_dec_fill_bytes).c_str(), p.n_dec_fill_calls);
+
+    const uint64_t lookups      = p.n_l2_hits + p.n_l2_misses;
+    const uint64_t cache_look   = p.n_decode_cache_hits + p.n_decode_cache_misses;
+    const uint64_t d_look_cache = d_cache_hit + d_cache_miss;
+    line("  cache     : %.1f%% of the routed selections found a filled resident slot"
+         " (%" PRIu64 "/%" PRIu64 " this interval) | %.1f%% cumulative (%" PRIu64 "/%" PRIu64 ")"
+         " | %" PRIu64 " fills and %" PRIu64 " resident changes this interval",
+         d_look_cache ? 100.0 * d_cache_hit / d_look_cache : 0.0, d_cache_hit, d_look_cache,
+         cache_look ? 100.0 * p.n_decode_cache_hits / cache_look : 0.0,
+         p.n_decode_cache_hits, cache_look, d_cache_fill, d_cache_chg);
+
+    line("  l2 hit    : %.1f%% of the warm lookups (%" PRIu64 "/%" PRIu64 " this interval)"
+         " | %.1f%% cumulative (%" PRIu64 "/%" PRIu64 ")"
+         " | %" PRIu64 " lookups skipped while the pool was still cold",
+         d_look ? 100.0 * d_hits / d_look : 0.0, d_hits, d_look,
+         lookups ? 100.0 * p.n_l2_hits / lookups : 0.0, p.n_l2_hits, lookups, p.n_l2_cold);
+
+    line("  l2 served : %s of disk reads avoided this interval (%s of it promoted into a resident slot)"
+         " | %s cumulative (%s promoted)",
+         report_volume(d_hit_bytes).c_str(), report_volume(d_promo).c_str(),
+         report_volume(p.n_l2_hit_bytes).c_str(), report_volume(p.n_l2_promo_bytes).c_str());
+
+    if (!p.evict_pools.empty()) {
+        size_t n_entries  = 0;
+        size_t n_capacity = 0;
+        for (const auto & ep : p.evict_pools) {
+            n_entries  += ep.slot_of.size();
+            n_capacity += (size_t) ep.cap;
+        }
+        line("  l2 policy : %" PRIu64 " evictions, %" PRIu64 " demotions, %" PRIu64 " of %" PRIu64
+             " misses turned away by the ghost this interval | %zu/%zu entries live%s",
+             d_evict, d_demote, d_filtered, d_look - d_hits, n_entries, n_capacity,
+             p.l2_warm ? "" : " | not warm yet");
+    }
+
+    // split hot/cold: how much of the read the hot pass actually covered. The
+    // accumulators exist for the trace, which prints them per token
+    if (split.layers > 0 && d_tokens > 0) {
+        line("  split     : %.2f ms of read per decode token, %.0f%% hidden behind the hot pass,"
+             " %.0f%% still outstanding at the cold pass | %.2f MiB per token over %d layer(s)",
+             (double) split.read_us / 1000.0 / (double) d_tokens,
+             split.read_us > 0 ? 100.0 * (double) split.ovl_us / (double) split.read_us : 0.0,
+             split.read_us > 0 ? 100.0 * (double) split.stall_us / (double) split.read_us : 0.0,
+             (double) split.bytes / (1024.0 * 1024.0) / (double) d_tokens, split.layers);
+    }
+
+    if (!p.evict_pools.empty()) {
+        std::string row = "  pools     :";
+        for (size_t k = 0; k < p.evict_pools.size(); ++k) {
+            const impl::evict_pool & ep = p.evict_pools[k];
+            const uint64_t look = ep.hits + ep.misses;
+            if (row.size() > 110) {
+                out += row;
+                out += '\n';
+                row = "            ";
+            }
+            snprintf(buf, sizeof(buf), " pool %zu: %zu/%d live, hit %.1f%% (%" PRIu64 "/%" PRIu64
+                     " warm), evictions %" PRIu64, k, ep.slot_of.size(), ep.cap,
+                     look ? 100.0 * (double) ep.hits / (double) look : 0.0, ep.hits, look, ep.evictions);
+            row += buf;
+        }
+        out += row;
+        out += '\n';
+    }
+
+    LLAMA_LOG_INFO("%s", out.c_str());
+
+    p.prev_l2_hits           = p.n_l2_hits;
+    p.prev_l2_misses         = p.n_l2_misses;
+    p.prev_l2_cold           = p.n_l2_cold;
+    p.prev_l2_evictions      = p.n_l2_evictions;
+    p.prev_l2_demotions      = p.n_l2_demotions;
+    p.prev_l2_hit_bytes      = p.n_l2_hit_bytes;
+    p.prev_l2_promo_bytes    = p.n_l2_promo_bytes;
+    p.prev_l2_filtered       = p.n_l2_filtered;
+    p.prev_dec_fill_us       = p.n_dec_fill_us;
+    p.prev_dec_fill_calls    = p.n_dec_fill_calls;
+    p.prev_dec_fill_bytes    = p.n_dec_fill_bytes;
+    p.prev_dec_cache_hits    = p.n_decode_cache_hits;
+    p.prev_dec_cache_misses  = p.n_decode_cache_misses;
+    p.prev_dec_cache_fills   = p.n_decode_cache_fills;
+    p.prev_dec_cache_changes = p.n_decode_cache_resident_changes;
+    p.prev_dec_tokens        = decode_tokens;
+    p.prev_split_tot         = p.split_tot;
+    p.n_reports++;
 }
 
 const llama_disk_stage_layer * llama_disk_stage::layer(int il) const {
@@ -3100,6 +3248,7 @@ void llama_disk_stage::split_report() {
     a.stall_us += stall_us;
     a.span_us  += t_end - s.t_begin;
     a.bytes    += (int64_t) p.dec_bytes;
+    p.split_tot += a;
 
     p.trace_split = {};
 #else

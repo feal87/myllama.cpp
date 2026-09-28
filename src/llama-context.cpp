@@ -1977,7 +1977,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 hot_experts->print_stats();
             }
             if (disk_stage) {
-                disk_stage->print_stats();
+                disk_stage->print_stats(hot_experts ? hot_experts->content_tokens() : 0);
             }
             if (moe_cache && moe_cache->is_active()) {
                 moe_cache->print_stats();

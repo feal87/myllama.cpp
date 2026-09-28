@@ -206,11 +206,14 @@ public:
     // Aggregate DIO cache counters and current state for the server metrics exporter.
     void stats_snapshot(llama_expert_stats & out) const;
 
-    // print the L2 eviction-pool stats (warm hit rate, disk bytes saved, and the
-    // per-interval delta). The pool reuses the prefill staging slabs during
-    // decode; no-op when the pool is disabled. Called from the shared
-    // --experts-stats-interval report.
-    void print_stats();
+    // print the stats report via LLAMA_LOG_INFO (verbosity 4): a header line plus
+    // one themed line each for the layout, the decode fill cost, the decode cache
+    // hit rate, the L2 pool (hit rate, disk bytes served, admission policy), the
+    // split-hot overlap and the per-pool breakdown. decode_tokens is the number of
+    // single-token decode ubatches seen so far (the hot cache's content_tokens()),
+    // so the fill and split costs can be reported per decode token. No-op when the
+    // decode cache is off. Called from the shared --experts-stats-interval report.
+    void print_stats(uint64_t decode_tokens);
 
     // true when decode is served by the internal scheduler hook instead of the
     // mid-graph eval callback (the decode cache maps each layer's expert ids)
