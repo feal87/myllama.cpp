@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -28,6 +29,8 @@
 //
 // llama_context
 //
+
+static bool token_cost_enabled();
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
@@ -1783,6 +1786,10 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // [token cost] probe: single-token decode only
+    const bool    cost_probe   = token_cost_enabled() && ubatch.n_tokens == 1;
+    const int64_t t_cost_begin = cost_probe ? ggml_time_us() : 0;
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1985,7 +1992,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 need_eval_cb ? hot_experts.get() : nullptr);
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (cost_probe) {
+        // mark every split so token_cost_accumulate can read back its wall clock
+        ggml_backend_sched_set_split_timing(sched.get(), true);
+    }
+
+    const int64_t t_cost_build   = cost_probe ? ggml_time_us() : 0;
+    const auto    status         = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    const int64_t t_cost_compute = cost_probe ? ggml_time_us() : 0;
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2008,6 +2022,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         hot_experts->observe_decode_finish();
     }
 
+    const int64_t t_cost_sync = cost_probe ? ggml_time_us() : 0;
+
     // graph boundary: publish the completed MoE expert-cache uploads and schedule
     // new ones (evictions + table updates are only safe between graph executions).
     // Runs on single-token decode ubatches only: the VRAM tier serves decode
@@ -2016,6 +2032,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // batch/prefill ubatch that reads the host rows of those same experts.
     if (moe_cache && ubatch.n_tokens == 1) {
         moe_cache->tick(ubatch.n_tokens);
+    }
+
+    if (cost_probe) {
+        token_cost_accumulate(t_cost_begin, t_cost_build, t_cost_compute, t_cost_sync,
+                              ggml_time_us());
     }
 
     // periodic expert-tier stats report: one shared wall-clock interval (seconds)
@@ -4257,11 +4278,181 @@ expert_funnel expert_funnel_from(uint64_t routed, uint64_t vram, uint64_t ram,
 
 } // namespace
 
+// [token cost] probes the single-token decode wall clock. On by default while
+// the probe is being evaluated; set LLAMA_TOKEN_COST=0 to disable it
+static bool token_cost_enabled() {
+    static const bool on = [] {
+        const char * v = std::getenv("LLAMA_TOKEN_COST");
+        return v == nullptr || (v[0] != '\0' && v[0] != '0');
+    }();
+    return on;
+}
+
+// the phase a node belongs to, by name
+int llama_context::token_phase_of_node(const char * name) {
+    // the expert chains are named by the shared MoE builder, so these hold for
+    // every architecture
+    if (strncmp(name, "ffn_moe_cold_",  13) == 0) return TOKEN_PHASE_MOE_COLD;
+    if (strncmp(name, "ffn_moe_cache_", 14) == 0) return TOKEN_PHASE_MOE_CACHE;
+
+    // the routing half of the MoE shares the "ffn_moe_" prefix but is computed
+    // on the device next to the attention, so it must not count as the expert
+    // chain. It is folded into the attention by the split priority below
+    if (strncmp(name, "ffn_moe_logits",    14) == 0) return TOKEN_PHASE_ROUTER;
+    if (strncmp(name, "ffn_moe_probs",     13) == 0) return TOKEN_PHASE_ROUTER;
+    if (strncmp(name, "ffn_moe_group_topk",18) == 0) return TOKEN_PHASE_ROUTER;
+    if (strncmp(name, "ffn_moe_argsort",   15) == 0) return TOKEN_PHASE_ROUTER;
+    if (strncmp(name, "ffn_moe_topk",      12) == 0) return TOKEN_PHASE_ROUTER;
+    if (strncmp(name, "ffn_moe_weights",   15) == 0) return TOKEN_PHASE_ROUTER;
+    if (strncmp(name, "ffn_moe_",          8) == 0) return TOKEN_PHASE_MOE_HOST;
+
+    // the lm_head chain
+    if (strncmp(name, "result_output", 13) == 0) return TOKEN_PHASE_OUTPUT;
+    if (strncmp(name, "result_norm",   11) == 0) return TOKEN_PHASE_OUTPUT;
+
+    // attention. The MLA and sparse archs (deepseek, glm) do not use
+    // Qcur/Kcur/Vcur: they build qr/q/kv directly and add indexer and
+    // compression nodes
+    static const char * const attn[] = {
+        "Qcur", "Kcur", "Vcur", "kq", "kqv", "v_cont", "fattn", "wqkv", "wq", "wk", "wv",
+        "attn", "q", "kv", "indexer", "lid", "csa", "hca",
+    };
+    for (const char * p : attn) {
+        if (strncmp(name, p, strlen(p)) == 0) {
+            return TOKEN_PHASE_ATTN;
+        }
+    }
+
+    // dense and shared ffn, including the MoE input norm
+    if (strncmp(name, "ffn_", 4) == 0) return TOKEN_PHASE_FFN;
+
+    // layer machinery: the hyper-connection mixing (deepseek4), the input norm
+    // and the small shape ops. Shares the split with the attention, so it is
+    // folded into it by the split vote below
+    if (strncmp(name, "hc_", 3) == 0) return TOKEN_PHASE_LAYER;
+    if (strncmp(name, "norm", 4) == 0) return TOKEN_PHASE_LAYER;
+    if (strncmp(name, "layer_inp", 9) == 0) return TOKEN_PHASE_LAYER;
+    if (strncmp(name, "embd", 4) == 0) return TOKEN_PHASE_LAYER;
+
+    return TOKEN_PHASE_OTHER;
+}
+
+// a split takes the majority phase of its nodes. A split on one backend holds
+// one phase, so this only matters where the attention shares its split with the
+// layer machinery (norms, hyper-connections) and its router
+// a split takes the highest priority phase among its nodes. The graph is split
+// by backend and by weight locality, so a split holds one real phase together
+// with the layer machinery that feeds it (norm, hyper-connections, the router)
+int llama_context::token_phase_of_split(ggml_cgraph * g, const char * backend) {
+    bool seen[TOKEN_PHASE_COUNT] = {};
+    std::set<std::string> names;
+
+    for (int i = 0; i < ggml_graph_n_nodes(g); ++i) {
+        const char * name = ggml_graph_node(g, i)->name;
+        const size_t len  = strlen(name);
+
+        // view and shape ops carry no phase. They are named with a leading space
+        // (" (permuted)", " (reshaped)") or with a " (view)" suffix
+        const char * stem = name;
+        while (*stem == ' ') {
+            ++stem;
+        }
+        if (*stem == '(' || (len >= 7 && strcmp(name + len - 7, " (view)") == 0)) {
+            continue;
+        }
+
+        seen[token_phase_of_node(name)] = true;
+
+        const char * dash = strchr(name, '-');
+        names.insert(std::string(name, dash ? dash - name : len));
+    }
+
+    // attn is above the expert phases: a whole layer's device work is one split
+    // (the previous layer's MoE merge, the shared expert, the residual and this
+    // layer's attention all land on the same backend), so the attention has to
+    // win it over the small merge node that shares it. moe_host is above router:
+    // the host expert chain consumes the remapped expert ids and shares its
+    // split with them, so the expert matmuls must not be booked as routing
+    static const int prio[] = {
+        TOKEN_PHASE_MOE_COLD, TOKEN_PHASE_MOE_CACHE, TOKEN_PHASE_OUTPUT,
+        TOKEN_PHASE_ATTN,     TOKEN_PHASE_MOE_HOST,  TOKEN_PHASE_ROUTER,
+        TOKEN_PHASE_FFN,      TOKEN_PHASE_LAYER,
+    };
+    int best = TOKEN_PHASE_OTHER;
+    for (const int p : prio) {
+        if (seen[p]) {
+            best = p;
+            break;
+        }
+    }
+
+    static const char * const phase_name[] = {
+        "attn", "router", "moe_host", "moe_cache", "moe_cold", "ffn", "layer", "output", "other",
+    };
+    std::string sig = phase_name[best];
+    sig += " [";
+    sig += backend;
+    sig += ']';
+    int n = 0;
+    for (const auto & s : names) {
+        if (n++ >= 6) {
+            sig += " ..";
+            break;
+        }
+        sig += ' ';
+        sig += s;
+    }
+    token_cost_split_sig[sig]++;
+
+    return best;
+}
+
+// one decode ubatch of the phase timeline. The sched marked every split with the
+// time it spent blocked (wait_us) and running (work_us); the wait belongs to the
+// phase of the split before it, because that is the backend it synced on
+void llama_context::token_cost_accumulate(int64_t t_begin, int64_t t_build, int64_t t_compute, int64_t t_sync, int64_t t_tick) {
+    const int n_splits = ggml_backend_sched_get_n_splits(sched.get());
+
+    // the sched rebuilds its splits in alloc_graph, so reclassify when the count
+    // changes. The nodes of a split do not change while it is reused
+    if ((int) token_cost_split_class.size() != n_splits) {
+        token_cost_split_class.assign(n_splits, TOKEN_PHASE_OTHER);
+        for (int i = 0; i < n_splits; ++i) {
+            const char * be = ggml_backend_name(ggml_backend_sched_get_split_backend(sched.get(), i));
+            token_cost_split_class[i] = (uint8_t) token_phase_of_split(
+                    ggml_backend_sched_get_split_graph(sched.get(), i), be);
+        }
+    }
+
+    for (int i = 0; i < n_splits; ++i) {
+        int64_t wait_us = 0;
+        int64_t work_us = 0;
+        ggml_backend_sched_get_split_timing(sched.get(), i, &wait_us, &work_us);
+
+        token_cost_us[token_cost_split_class[i]] += work_us;
+
+        // the wait of the first split has no phase before it, it lands in the
+        // unaccounted residual
+        if (i > 0) {
+            token_cost_us[token_cost_split_class[i - 1]] += wait_us;
+        }
+    }
+
+    token_cost_prep_us  += t_build - t_begin;
+    token_cost_graph_us += t_compute - t_build;
+    token_cost_sync_us  += t_sync - t_compute;
+    token_cost_tick_us  += t_tick - t_sync;
+    token_cost_wall_us  += t_tick - t_begin;
+    token_cost_tokens++;
+}
+
 void llama_context::print_expert_report() {
     const bool any_tier = (hot_experts && cparams.n_pin_hot_experts > 0) ||
                           disk_stage != nullptr ||
                           (moe_cache && moe_cache->is_active());
     if (!any_tier) {
+        // the token cost probe does not need any expert tier to be active
+        token_cost_report();
         return;
     }
 
@@ -4322,6 +4513,91 @@ void llama_context::print_expert_report() {
         const uint64_t base_disk = base_drop - tot.dropped;
         disk_stage->print_stats(hot_experts ? hot_experts->content_tokens() : 0,
                                 tot.routed, base_l2, base_sub, base_drop, base_disk);
+    }
+
+    token_cost_report();
+}
+
+void llama_context::token_cost_report() {
+    if (!token_cost_enabled() || token_cost_tokens == 0) {
+        return;
+    }
+
+    char buf[512];
+
+    {
+        const double tok = (double) token_cost_tokens;
+        const auto   ms  = [tok](int64_t us) { return us / 1000.0 / tok; };
+
+        double phases = 0.0;
+        for (int p = 0; p < TOKEN_PHASE_COUNT; ++p) {
+            phases += ms(token_cost_us[p]);
+        }
+
+        int n_split[TOKEN_PHASE_COUNT] = {};
+        for (uint8_t c : token_cost_split_class) {
+            n_split[c]++;
+        }
+
+        std::string cnt = "[token cost] report #";
+        cnt += std::to_string(n_expert_reports);
+        cnt += '\n';
+        snprintf(buf, sizeof(buf), "  tokens  : %" PRIu64 " decode tokens | %.2f ms/token\n",
+                 token_cost_tokens, ms(token_cost_wall_us));
+        cnt += buf;
+        snprintf(buf, sizeof(buf),
+                 "  phases  : attn %.2f + moe_host %.2f + moe_cache %.2f + moe_cold %.2f"
+                 " + output %.2f + ffn %.2f + layer %.2f + router %.2f + other %.2f\n",
+                 ms(token_cost_us[TOKEN_PHASE_ATTN]),      ms(token_cost_us[TOKEN_PHASE_MOE_HOST]),
+                 ms(token_cost_us[TOKEN_PHASE_MOE_CACHE]), ms(token_cost_us[TOKEN_PHASE_MOE_COLD]),
+                 ms(token_cost_us[TOKEN_PHASE_OUTPUT]),    ms(token_cost_us[TOKEN_PHASE_FFN]),
+                 ms(token_cost_us[TOKEN_PHASE_LAYER]),     ms(token_cost_us[TOKEN_PHASE_ROUTER]),
+                 ms(token_cost_us[TOKEN_PHASE_OTHER]));
+        cnt += buf;
+        snprintf(buf, sizeof(buf),
+                 "  splits  : attn %d + moe_host %d + moe_cache %d + moe_cold %d + output %d"
+                 " + ffn %d + layer %d + router %d + other %d of %d\n",
+                 n_split[TOKEN_PHASE_ATTN],      n_split[TOKEN_PHASE_MOE_HOST],
+                 n_split[TOKEN_PHASE_MOE_CACHE], n_split[TOKEN_PHASE_MOE_COLD],
+                 n_split[TOKEN_PHASE_OUTPUT],    n_split[TOKEN_PHASE_FFN],
+                 n_split[TOKEN_PHASE_LAYER],     n_split[TOKEN_PHASE_ROUTER],
+                 n_split[TOKEN_PHASE_OTHER],     (int) token_cost_split_class.size());
+        cnt += buf;
+        snprintf(buf, sizeof(buf),
+                 "  overhead: prep %.2f + sync %.2f + tick %.2f | graph %.2f = split %.2f + unaccounted %.2f\n",
+                 ms(token_cost_prep_us), ms(token_cost_sync_us), ms(token_cost_tick_us),
+                 ms(token_cost_graph_us), phases, ms(token_cost_graph_us) - phases);
+        cnt += buf;
+        if (!token_cost_split_sig.empty()) {
+            std::vector<std::pair<uint32_t, std::string>> sig;
+            sig.reserve(token_cost_split_sig.size());
+            for (const auto & it : token_cost_split_sig) {
+                sig.emplace_back(it.second, it.first);
+            }
+            std::sort(sig.begin(), sig.end(), [](const auto & a, const auto & b) {
+                return a.first != b.first ? a.first > b.first : a.second < b.second;
+            });
+            int shown = 0;
+            for (const auto & s : sig) {
+                if (shown++ >= 10) {
+                    break;
+                }
+                snprintf(buf, sizeof(buf), "  sig %3u x %s\n", s.first, s.second.c_str());
+                cnt += buf;
+            }
+        }
+        LLAMA_LOG_INFO("%s", cnt.c_str());
+
+        // the interval is closed: start the next one empty
+        for (int p = 0; p < TOKEN_PHASE_COUNT; ++p) {
+            token_cost_us[p] = 0;
+        }
+        token_cost_prep_us  = 0;
+        token_cost_graph_us = 0;
+        token_cost_sync_us  = 0;
+        token_cost_tick_us  = 0;
+        token_cost_wall_us  = 0;
+        token_cost_tokens   = 0;
     }
 }
 

@@ -440,6 +440,39 @@ private:
     // last time the periodic expert-tier stats report was printed (us)
     int64_t t_experts_stats_us = 0;
 
+    // per-phase wall clock of single-token decode, printed as [token cost].
+    // Every value is a delta on one CPU timeline, so the phases plus the
+    // overhead partition the decode wall clock. Reset at every expert report
+    enum token_phase {
+        TOKEN_PHASE_ATTN = 0,
+        TOKEN_PHASE_ROUTER,
+        TOKEN_PHASE_MOE_HOST,
+        TOKEN_PHASE_MOE_CACHE,
+        TOKEN_PHASE_MOE_COLD,
+        TOKEN_PHASE_FFN,
+        TOKEN_PHASE_LAYER,
+        TOKEN_PHASE_OUTPUT,
+        TOKEN_PHASE_OTHER,
+        TOKEN_PHASE_COUNT,
+    };
+
+    int64_t  token_cost_us[TOKEN_PHASE_COUNT] = {};
+    int64_t  token_cost_prep_us  = 0; // before the first split: graph build
+    int64_t  token_cost_graph_us = 0; // the whole split dispatch
+    int64_t  token_cost_sync_us  = 0; // the explicit sync after the compute
+    int64_t  token_cost_tick_us  = 0; // ranking readback and VRAM tier tick
+    int64_t  token_cost_wall_us  = 0; // entry of process_ubatch to the tick
+    uint64_t token_cost_tokens   = 0;
+    std::vector<uint8_t> token_cost_split_class; // phase of each split, per graph
+    // diagnostic: backend, node names and assigned phase of each distinct split
+    // shape, with the number of splits that have it
+    std::map<std::string, uint32_t> token_cost_split_sig;
+
+    int token_phase_of_node(const char * name);
+    int token_phase_of_split(ggml_cgraph * g, const char * backend);
+    void token_cost_accumulate(int64_t t_begin, int64_t t_build, int64_t t_compute, int64_t t_sync, int64_t t_tick);
+    void token_cost_report();
+
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
 
