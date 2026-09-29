@@ -121,6 +121,10 @@ struct llama_expert_cache_stats {
     uint64_t uploads_succeeded = 0;
     uint64_t uploads_failed   = 0;
     uint64_t rebalances       = 0;
+    // cache-aware opportunistic dropping (--disk-stage-drop-fraction): routed experts
+    // skipped instead of read from disk, and the disk bytes those reads would have cost
+    uint64_t dropped_routes   = 0;
+    uint64_t dropped_bytes    = 0;
 };
 
 struct llama_expert_l2_stats {

@@ -1771,6 +1771,16 @@ std::string server_task_result_metrics::to_metrics() {
                 "Base experts that have been routed at least once",
                 (double) expert.decode_cache.base_experts_used
             },
+            {
+                "moe_decode_cache_dropped_routes_total",
+                "DIO decode routes dropped by cache-aware opportunistic dropping",
+                (double) expert.decode_cache.dropped_routes
+            },
+            {
+                "moe_decode_cache_dropped_bytes_total",
+                "Disk read bytes skipped by cache-aware opportunistic dropping",
+                (double) expert.decode_cache.dropped_bytes
+            },
         };
         add_items("counter", expert_counters);
 

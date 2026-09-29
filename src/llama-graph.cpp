@@ -2196,6 +2196,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
 
+    // cache-aware opportunistic dropping (--disk-stage-drop-fraction): the decode
+    // cache keeps a per-expert table, 1 for an expert kept this token and 0 for a
+    // cold, low-score one the fill dropped. The weight node is forced onto the
+    // CPU backend so its probs/ids become host split inputs: the disk stage reads
+    // them in the node-prepare callback to decide the drops before the read. The
+    // multiply then zeroes the dropped weights, so the norm_w pass below
+    // renormalizes over the kept experts only. The force is also what lets the
+    // probe read the scores, without a keep table. SOFTMAX_WEIGHT scales the
+    // selected weights themselves, so neither applies there (openai-moe only)
+    if (dc != nullptr && dc->force_weights_host &&
+            gating_op != LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
+        ggml_backend_sched_set_tensor_backend(sched, weights, backend_cpu);
+        if (dc->keep != nullptr) {
+            ggml_tensor * keep_sel = ggml_get_rows(ctx0, dc->keep, selected_experts); // [1, n_expert_used, n_tokens]
+            weights = ggml_mul(ctx0, weights, keep_sel);
+            cb(weights, "ffn_moe_weights_dropped", il);
+        }
+    }
+
 
     if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
         weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);

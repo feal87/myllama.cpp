@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <condition_variable>
 #include <cstdlib>
@@ -317,6 +318,7 @@ struct llama_disk_stage::impl {
         ggml_tensor * slot_skip = nullptr; // I32 [n_slots + 1], 1 at the sentinel
         ggml_tensor * slot_skip_hot  = nullptr; // split-hot pass 1: 1 on transient + sentinel
         ggml_tensor * slot_skip_cold = nullptr; // split-hot pass 2: 1 on resident + sentinel
+        ggml_tensor * keep           = nullptr; // F32 [n_expert], 1 = keep, 0 = dropped this token
         std::vector<int32_t> resident_slot;   // expert id -> slot, -1 when not resident
         std::vector<uint8_t> resident_filled; // expert id -> its slot holds this expert's data
         std::vector<uint8_t> vram;            // expert id -> served by the VRAM cache (host chain skips it)
@@ -410,6 +412,15 @@ struct llama_disk_stage::impl {
     uint64_t n_decode_cache_misses          = 0;
     uint64_t n_decode_cache_fills           = 0;
     uint64_t n_decode_cache_resident_changes = 0;
+    // cache-aware opportunistic dropping: routed experts skipped instead of read
+    // from disk, and the disk bytes those reads would have cost. The score mass
+    // is the router score sum over all routed selections and over the dropped
+    // ones, so the report can state the share of the token's score mass removed
+    uint64_t n_dropped_routes = 0;
+    uint64_t n_dropped_bytes  = 0;
+    double   n_routed_mass    = 0.0;
+    double   n_cold_mass      = 0.0;
+    double   n_dropped_mass   = 0.0;
 
     // fill_cache() scratch: the decode fill runs once per layer per token on the
     // compute thread, so reuse these instead of reallocating per call
@@ -455,6 +466,13 @@ struct llama_disk_stage::impl {
 
     std::vector<disk_stage_job>          fs_jobs;
     std::vector<int32_t>                 fs_newly_filled;
+    // routed expert scores aligned with the ids, reused by the drop plan
+    std::vector<float>                   fs_probs;
+    // per-position drop flags of the current fill, reused to avoid a per-layer
+    // allocation on the decode hot path
+    std::vector<uint8_t>                 fs_drop;
+    // cold routed positions of the current fill, ranked by score
+    std::vector<int64_t>                 fs_cold;
     std::vector<pool_copy>               fs_copies;       // L2 hit -> transient, independent of the disk batch
     std::vector<pool_copy>               fs_copies_pre;   // L2 hit -> resident, before the disk batch
     std::vector<pool_copy>               fs_stores;       // transient -> L2, after the disk batch
@@ -474,6 +492,139 @@ struct llama_disk_stage::impl {
     // next plan drains the stores. One batch in flight, since layers are
     // sequential
     bool split_hot_active = false;
+    // cache-aware opportunistic dropping (--disk-stage-drop-fraction): drop the
+    // lowest `drop_fraction` of the routed experts of a token when cold and below
+    // `drop_below_rel` times the layer's highest score. `drop_probe` only measures
+    float   drop_fraction  = 0.0f;
+    float   drop_below_rel = 0.5f;
+    bool    drop_probe     = false;
+    // dropping and the probe wait until the resident cache is this full, so the
+    // warm-up cold experts (not cached yet, not weak) are not dropped
+    static constexpr int drop_min_fill_percent = 90;
+    bool drop_warm = false;
+    // cleared once the weights get_rows can no longer be intercepted: the
+    // callback then falls back to the plain table-triggered fill
+    bool drop_active = false;
+    // the warm-up check scans every layer, so it runs at most this often
+    static constexpr int64_t drop_fill_check_us = 100000;
+    int64_t drop_fill_check_at = 0;
+
+    bool drop_enabled() const { return drop_fraction > 0.0f || drop_probe; }
+
+    // share of the resident decode slots that hold an expert's bytes
+    double resident_fill() const {
+        size_t cap    = 0;
+        size_t filled = 0;
+        for (const auto & pool : pools) {
+            cap += (size_t) pool.res_cap;
+        }
+        for (const auto & c : cache) {
+            for (size_t id = 0; id < c.resident_filled.size(); ++id) {
+                if (c.resident_slot[id] >= 0 && c.resident_filled[id] != 0) {
+                    filled++;
+                }
+            }
+        }
+        return cap ? 100.0 * (double) filled / (double) cap : 0.0;
+    }
+
+    // latches once the cache is nearly full; before that a cold expert is one
+    // that was not read yet, not one that is weak
+    bool resident_warm() {
+        if (drop_warm) {
+            return true;
+        }
+        const int64_t now = ggml_time_us();
+        if (drop_fill_check_at != 0 && now - drop_fill_check_at < drop_fill_check_us) {
+            return false;
+        }
+        drop_fill_check_at = now;
+        if (resident_fill() < (double) drop_min_fill_percent) {
+            return false;
+        }
+        drop_warm = true;
+        LLAMA_LOG_INFO("%s: decode cache %.0f%% full, cache-aware dropping enabled\n",
+                       __func__, resident_fill());
+        return true;
+    }
+
+    // stop intercepting the weights get_rows: reset every keep table and let the
+    // table get_rows drive the fill again. Called when the scores cannot be read
+    void disable_drop() {
+        drop_active = false;
+        for (auto & c : cache) {
+            if (c.keep == nullptr) {
+                continue;
+            }
+            float * k = (float *) c.keep->data;
+            for (int64_t e = 0; e < c.keep->ne[1]; ++e) {
+                k[e] = 1.0f;
+            }
+        }
+    }
+
+    // drop probe (--disk-stage-drop-probe): the cold score relative to the
+    // layer max, so the report can print the quantiles that pick
+    // --disk-stage-drop-below-rel and the score mass a given floor would remove.
+    // cold_n counts every cold routed selection, rel_n the ones with a valid
+    // relative score, routed_n all of them
+    uint64_t probe_routed   = 0;
+    uint64_t probe_cold_n   = 0;
+    uint64_t probe_rel_n    = 0;
+    uint64_t probe_cold_max = 0;
+    // cold experts per decode layer fill, for the p50/p90 of the cold count
+    uint64_t probe_cold_hist[33] = {};
+    uint64_t probe_calls          = 0;
+    // cold score relative to the layer's max, linear [0,1]: the report reads the
+    // cumulative count and mass at a few floors
+    static constexpr int   probe_n_rel = 64;
+    std::vector<uint64_t>  probe_rel      = std::vector<uint64_t>(probe_n_rel, 0);
+    std::vector<double>    probe_rel_mass = std::vector<double>(probe_n_rel, 0.0);
+
+    static int probe_rel_bin(float r) {
+        if (!(r > 0.0f)) {
+            return 0;
+        }
+        int b = (int) (r * (float) probe_n_rel);
+        if (b < 0) {
+            b = 0;
+        }
+        if (b >= probe_n_rel) {
+            b = probe_n_rel - 1;
+        }
+        return b;
+    }
+    uint64_t probe_rel_below(float a) const {
+        const int b = probe_rel_bin(a);
+        uint64_t acc = 0;
+        for (int i = 0; i < b; ++i) {
+            acc += probe_rel[(size_t) i];
+        }
+        return acc;
+    }
+    double probe_rel_mass_below(float a) const {
+        const int b = probe_rel_bin(a);
+        double acc = 0.0;
+        for (int i = 0; i < b; ++i) {
+            acc += probe_rel_mass[(size_t) i];
+        }
+        return acc;
+    }
+    // floor below which `frac` of the cold scores fall, as a bin center
+    float probe_rel_quantile(float frac) const {
+        if (probe_rel_n == 0) {
+            return 0.0f;
+        }
+        const uint64_t target = (uint64_t) (frac * (double) probe_rel_n);
+        uint64_t acc = 0;
+        for (int i = 0; i < probe_n_rel; ++i) {
+            acc += probe_rel[(size_t) i];
+            if (acc >= target) {
+                return ((float) i + 0.5f) / (float) probe_n_rel;
+            }
+        }
+        return 1.0f;
+    }
     std::thread             dec_io;
     std::mutex              dec_io_mu;
     std::condition_variable dec_io_cv;
@@ -572,7 +723,10 @@ struct llama_disk_stage::impl {
     uint64_t prev_dec_cache_misses  = 0;
     uint64_t prev_dec_cache_fills   = 0;
     uint64_t prev_dec_cache_changes = 0;
+    uint64_t prev_dec_dropped       = 0;
     uint64_t prev_dec_tokens        = 0;
+    double   prev_dec_routed_mass   = 0.0;
+    double   prev_dec_dropped_mass  = 0.0;
 
     // decode fill timing: the blocking read share of a decode step, so it can be
     // compared with the compute. Summed over every fill_cache() call
@@ -671,6 +825,12 @@ struct llama_disk_stage::impl {
         ep.evictions++;
         ghost_add(ep, key); // a re-route of the victim admits it again
         return slot;
+    }
+
+    // a read-only presence test: unlike evict_touch a dropped expert must not
+    // promote its entry in the SLRU
+    bool evict_has(int pool, int64_t key) const {
+        return evict_pools[(size_t) pool].slot_of.count(key) != 0;
     }
 
     // a hit: promote probation -> protected, or refresh protected
@@ -892,6 +1052,8 @@ void llama_disk_stage::stats_snapshot(llama_expert_stats & out) const {
     out.decode_cache.route_misses     = p.n_decode_cache_misses;
     out.decode_cache.fills            = p.n_decode_cache_fills;
     out.decode_cache.resident_changes = p.n_decode_cache_resident_changes;
+    out.decode_cache.dropped_routes   = p.n_dropped_routes;
+    out.decode_cache.dropped_bytes    = p.n_dropped_bytes;
 
     out.disk_l2.enabled = !p.evict_pools.empty();
     out.disk_l2.warm    = p.l2_warm;
@@ -945,6 +1107,83 @@ void llama_disk_stage::node_prepare_callback(struct ggml_tensor * node, void * u
             return;
         }
         self->split_cold_end();
+    }
+
+    // cache-aware dropping: the graph forces the weights get_rows onto the CPU
+    // backend, so its probs (src[0]) and ids (src[1]) are host inputs of this
+    // split. The fill is triggered here instead of at the table get_rows so the
+    // scores are available, and it still lands before the split computes.
+    // drop_active is cleared when the scores turn out unreadable: the table
+    // get_rows then drives the plain fill again, so the cache still works
+    if (p.drop_enabled()) {
+        static const char wprefix[] = "ffn_moe_weights-";
+        const bool is_weights = node->op == GGML_OP_GET_ROWS &&
+                std::strncmp(node->name, wprefix, sizeof(wprefix) - 1) == 0;
+        if (is_weights) {
+            const char * dash = std::strrchr(node->name, '-');
+            const int    il   = dash != nullptr ? atoi(dash + 1) : -1;
+            const ggml_tensor * t_ids  = node->src[1];
+            const ggml_tensor * t_prob = node->src[0];
+            // multi-token weights: not a decode fill, leave dropping alone
+            if (t_ids == nullptr || t_ids->ne[1] != 1) {
+                return;
+            }
+            if (il < 0 || il >= (int) p.cache.size() || p.cache[il].table == nullptr ||
+                    t_prob == nullptr || t_ids->type != GGML_TYPE_I32 ||
+                    t_prob->type != GGML_TYPE_F32 ||
+                    t_ids->buffer == nullptr || t_prob->buffer == nullptr ||
+                    !ggml_backend_buffer_is_host(t_ids->buffer) ||
+                    !ggml_backend_buffer_is_host(t_prob->buffer) ||
+                    t_ids->data == nullptr || t_prob->data == nullptr ||
+                    t_ids->nb[0] != sizeof(int32_t)) {
+                if (p.drop_active) {
+                    p.disable_drop();
+                    if (disk_stage_trace()) {
+                        LLAMA_LOG_WARN("%s: dropping disabled: the weights get_rows inputs are not host-side\n", __func__);
+                    }
+                    // the table get_rows is skipped while dropping intercepts the
+                    // weights, so fill here without the scores to keep the table
+                    // current for this token
+                    const bool ids_host = t_ids->type == GGML_TYPE_I32 &&
+                            t_ids->buffer != nullptr && ggml_backend_buffer_is_host(t_ids->buffer) &&
+                            t_ids->data != nullptr && t_ids->nb[0] == sizeof(int32_t) &&
+                            t_ids->ne[1] == 1 && t_ids->ne[0] > 0;
+                    if (ids_host && il >= 0 && il < (int) p.cache.size()) {
+                        if (p.split_hot_active) {
+                            self->fill_cache_begin(il, (const int32_t *) t_ids->data, t_ids->ne[0], nullptr);
+                        } else {
+                            self->fill_cache(il, (const int32_t *) t_ids->data, t_ids->ne[0], nullptr);
+                        }
+                    }
+                }
+                return;
+            }
+            const int64_t n_used = t_ids->ne[0];
+            if (n_used <= 0) {
+                return;
+            }
+            // probs is the reshaped [1, n_expert, n_tokens] gating output: for
+            // decode ne[0] == ne[2] == 1, so expert e sits at e * nb[1]
+            const char *    base = (const char *) t_prob->data;
+            const int32_t * idp  = (const int32_t *) t_ids->data;
+            p.fs_probs.resize((size_t) n_used);
+            for (int64_t i = 0; i < n_used; ++i) {
+                const int32_t id = idp[i];
+                p.fs_probs[(size_t) i] = (id >= 0 && id < (int32_t) t_prob->ne[1])
+                        ? *(const float *) (base + (int64_t) id * t_prob->nb[1]) : 1.0f;
+            }
+            if (p.split_hot_active) {
+                self->fill_cache_begin(il, idp, n_used, p.fs_probs.data());
+            } else {
+                self->fill_cache(il, idp, n_used, p.fs_probs.data());
+            }
+            return;
+        }
+        // while dropping intercepts the weights, the table get_rows must not
+        // trigger a second fill of the same layer
+        if (p.drop_active) {
+            return;
+        }
     }
 
     if (node->op != GGML_OP_GET_ROWS || node->src[0] == nullptr || node->src[1] == nullptr) {
@@ -1020,6 +1259,9 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
     const uint64_t d_cache_miss = p.n_decode_cache_misses - p.prev_dec_cache_misses;
     const uint64_t d_cache_fill = p.n_decode_cache_fills - p.prev_dec_cache_fills;
     const uint64_t d_cache_chg  = p.n_decode_cache_resident_changes - p.prev_dec_cache_changes;
+    const uint64_t d_dropped    = p.n_dropped_routes - p.prev_dec_dropped;
+    const double   d_routed_mass  = p.n_routed_mass - p.prev_dec_routed_mass;
+    const double   d_dropped_mass = p.n_dropped_mass - p.prev_dec_dropped_mass;
     const uint64_t d_tokens     = decode_tokens > p.prev_dec_tokens ? decode_tokens - p.prev_dec_tokens : 0;
     const impl::split_acc split = p.split_tot - p.prev_split_tot;
 
@@ -1089,6 +1331,73 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
          d_look_cache ? 100.0 * d_cache_hit / d_look_cache : 0.0, d_cache_hit, d_look_cache,
          cache_look ? 100.0 * p.n_decode_cache_hits / cache_look : 0.0,
          p.n_decode_cache_hits, cache_look, d_cache_fill, d_cache_chg);
+
+    if (p.drop_enabled() && !p.drop_warm) {
+        line("  drop      : waiting for the decode cache, %.1f%% full of %d%% before dropping or probing",
+             p.resident_fill(), p.drop_min_fill_percent);
+    }
+
+    if (p.drop_fraction > 0.0f && p.drop_warm) {
+        line("  drop      : fraction %.3f, below-rel %.2f | %" PRIu64 " routed selections dropped this interval (%.1f%% of score mass)"
+             " | %" PRIu64 " cumulative (%s of disk reads skipped, %.1f%% mass)",
+             (double) p.drop_fraction, (double) p.drop_below_rel, d_dropped,
+             d_routed_mass > 0.0 ? 100.0 * d_dropped_mass / d_routed_mass : 0.0,
+             p.n_dropped_routes, report_volume(p.n_dropped_bytes).c_str(),
+             p.n_routed_mass > 0.0 ? 100.0 * p.n_dropped_mass / p.n_routed_mass : 0.0);
+    }
+
+    if (p.drop_probe && p.drop_warm) {
+        // cumulative probe: the distribution is what it is over the whole run,
+        // not per interval. The quantiles are the inverse of the cold relative
+        // cumulative, so a target drop share picks the floor directly
+        const uint64_t calls = p.probe_calls;
+        const auto hist_at = [&p, calls](double f) -> uint64_t {
+            if (calls == 0) {
+                return 0;
+            }
+            const uint64_t target = (uint64_t) (f * (double) calls);
+            uint64_t acc = 0;
+            for (uint64_t c = 0; c <= 32; ++c) {
+                acc += p.probe_cold_hist[c];
+                if (acc >= target) {
+                    return c;
+                }
+            }
+            return 32;
+        };
+        const uint64_t cold   = p.probe_cold_n;
+        const uint64_t rel_n  = p.probe_rel_n;
+        const uint64_t routed = p.probe_routed;
+        line("  drop probe: %" PRIu64 " routed, %" PRIu64 " cold (%.1f%% of selections, %.1f%% of score mass)"
+             " | cold/layer p50=%" PRIu64 " p90=%" PRIu64 " p99=%" PRIu64 " max=%" PRIu64,
+             routed, cold,
+             routed ? 100.0 * (double) cold / (double) routed : 0.0,
+             p.n_routed_mass > 0.0 ? 100.0 * p.n_cold_mass / p.n_routed_mass : 0.0,
+             hist_at(0.50), hist_at(0.90), hist_at(0.99), p.probe_cold_max);
+        line("  cold rel  : q10=%.2f q25=%.2f q50=%.2f q75=%.2f q90=%.2f q95=%.2f q99=%.2f (score / layer max)",
+             (double) p.probe_rel_quantile(0.10f), (double) p.probe_rel_quantile(0.25f),
+             (double) p.probe_rel_quantile(0.50f), (double) p.probe_rel_quantile(0.75f),
+             (double) p.probe_rel_quantile(0.90f), (double) p.probe_rel_quantile(0.95f),
+             (double) p.probe_rel_quantile(0.99f));
+        static const float curve[] = { 0.10f, 0.20f, 0.30f, 0.40f, 0.50f, 0.60f, 0.70f, 0.80f, 0.90f };
+        std::string row_a = "  drop curve:  A     ";
+        std::string row_n = "               cold% ";
+        std::string row_m = "               mass% ";
+        char cell[32];
+        for (const float a : curve) {
+            snprintf(cell, sizeof(cell), "%5.2f ", (double) a);
+            row_a += cell;
+            snprintf(cell, sizeof(cell), "%5.1f ",
+                     rel_n ? 100.0 * (double) p.probe_rel_below(a) / (double) rel_n : 0.0);
+            row_n += cell;
+            snprintf(cell, sizeof(cell), "%5.1f ",
+                     p.n_routed_mass > 0.0 ? 100.0 * p.probe_rel_mass_below(a) / p.n_routed_mass : 0.0);
+            row_m += cell;
+        }
+        out += row_a + "\n";
+        out += row_n + "\n";
+        out += row_m + "\n";
+    }
 
     line("  l2 hit    : %.1f%% of the warm lookups (%" PRIu64 "/%" PRIu64 " this interval)"
          " | %.1f%% cumulative (%" PRIu64 "/%" PRIu64 ")"
@@ -1163,6 +1472,9 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
     p.prev_dec_cache_misses  = p.n_decode_cache_misses;
     p.prev_dec_cache_fills   = p.n_decode_cache_fills;
     p.prev_dec_cache_changes = p.n_decode_cache_resident_changes;
+    p.prev_dec_dropped       = p.n_dropped_routes;
+    p.prev_dec_routed_mass   = p.n_routed_mass;
+    p.prev_dec_dropped_mass  = p.n_dropped_mass;
     p.prev_dec_tokens        = decode_tokens;
     p.prev_split_tot         = p.split_tot;
     p.n_reports++;
@@ -1198,7 +1510,8 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                    int32_t n_pin_experts, uint64_t cache_budget_bytes,
                                    int32_t pool_layers_max, const char * base_experts_path,
                                    const char * warm_experts_path, const char * base_template_path,
-                                   bool split_hot) :
+                                   bool split_hot, float drop_fraction, float drop_below_rel,
+                                   bool drop_probe) :
     pimpl(std::make_unique<impl>(model)) {
     impl & p = *pimpl;
 
@@ -1213,11 +1526,32 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     GGML_UNUSED(warm_experts_path);
     GGML_UNUSED(base_template_path);
     GGML_UNUSED(split_hot);
+    GGML_UNUSED(drop_fraction);
+    GGML_UNUSED(drop_below_rel);
+    GGML_UNUSED(drop_probe);
     return;
 #else
     if (!model.has_disk_weights()) {
         return;
     }
+
+    // cache-aware opportunistic dropping: the lowest fraction of the routed
+    // experts of a token is dropped instead of read when it is cold and weak
+    // relative to the layer's top. drop_below_rel is what keeps a flat layer
+    // from losing a significant expert, and it always keeps the top expert.
+    // SOFTMAX_WEIGHT scales the selected weights, so the multiplicative keep
+    // mask the graph applies is wrong there: drop nothing for that gating
+    if (model.hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
+        if (drop_fraction > 0.0f || drop_probe) {
+            LLAMA_LOG_WARN("%s: dropping disabled: SOFTMAX_WEIGHT gating is not supported\n", __func__);
+        }
+        drop_fraction = 0.0f;
+        drop_probe    = false;
+    }
+    p.drop_fraction  = drop_fraction;
+    p.drop_below_rel = std::min(std::max(drop_below_rel, 1e-3f), 1.0f);
+    p.drop_probe     = drop_probe;
+    p.drop_active    = p.drop_enabled();
 
     // split the host decode MoE into a hot and a cold pass so the cold disk read
     // overlaps the hot compute
@@ -1715,6 +2049,10 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                             // split-hot: the hot and cold slot tables
                             cache_bytes += 2 * align_up((size_t) (n_pool_slots + 1) * sizeof(int32_t), disk_stage_align);
                         }
+                        if (p.drop_fraction > 0.0f) {
+                            // cache-aware dropping: the per-expert keep table
+                            cache_bytes += align_up((size_t) n_expert * sizeof(float), disk_stage_align);
+                        }
                     }
                 }
 
@@ -1843,10 +2181,26 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                     }
                                 }
 
+                                // cache-aware dropping: F32 [1, n_expert], 1 = keep the
+                                // expert this token, 0 = dropped (cold and below the
+                                // threshold). The graph multiplies the weights by
+                                // get_rows(keep, selected_experts) before norm_w
+                                ggml_tensor * keep = nullptr;
+                                if (p.drop_fraction > 0.0f) {
+                                    keep = ggml_new_tensor_2d(p.cache_ctx, GGML_TYPE_F32, 1, n_expert);
+                                    ggml_format_name(keep, "disk_cache_keep.%d", il);
+                                    ggml_backend_tensor_alloc(p.cache_buf, keep, cbase + off);
+                                    for (size_t e = 0; e < (size_t) n_expert; ++e) {
+                                        ((float *) keep->data)[e] = 1.0f;
+                                    }
+                                    off += align_up((size_t) n_expert * sizeof(float), disk_stage_align);
+                                }
+
                                 c.table          = tab;
                                 c.slot_skip      = skip;
                                 c.slot_skip_hot  = skip_hot;
                                 c.slot_skip_cold = skip_cold;
+                                c.keep           = keep;
                                 p.table_layer.emplace(tab, il);
                                 c.pub.gate           = pool.gate;
                                 c.pub.up             = pool.up;
@@ -1855,6 +2209,8 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                 c.pub.slot_skip      = skip;
                                 c.pub.slot_skip_hot  = skip_hot;
                                 c.pub.slot_skip_cold = skip_cold;
+                                c.pub.keep           = keep;
+                                c.pub.force_weights_host = p.drop_enabled();
                                 n_cache++;
                             }
                         }
@@ -2751,7 +3107,7 @@ void llama_disk_stage::fill_selected(int il, const int32_t * ids, int64_t n_ids)
 #endif
 }
 
-bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_ids) {
+bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_ids, const float * probs) {
 #if defined(_WIN32)
     impl & p = *pimpl;
     if (il < 0 || il >= (int) p.cache.size()) {
@@ -2836,9 +3192,107 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
     {
         std::lock_guard<std::mutex> lock(p.cache_mu);
 
+        // cache-aware opportunistic dropping: mark the cold, weak experts to
+        // skip. The fraction cap and the relative floor need all scores at once,
+        // so the decision is a pre-pass over the (small) routed set; the main
+        // loop only honors it. The probe records the distribution
+        std::vector<uint8_t> & drop = p.fs_drop;
+        bool drop_planned = false;
+        if (p.drop_enabled() && probs != nullptr && p.resident_warm()) {
+            drop.assign((size_t) n_ids, 0);
+            drop_planned = true;
+            // the layer's highest routed score: the reference the relative floor
+            // is taken against, over warm and cold experts alike
+            float max_score = 0.0f;
+            for (int64_t i = 0; i < n_ids; ++i) {
+                if (probs[i] > max_score) {
+                    max_score = probs[i];
+                }
+            }
+            const float floor_score = p.drop_below_rel * max_score;
+
+            // candidates: cold experts below the relative floor. The highest
+            // score is never below A * max, so the top expert is always kept
+            std::vector<int64_t> & cold = p.fs_cold;
+            uint32_t n_cold_all = 0;
+            cold.clear();
+            for (int64_t i = 0; i < n_ids; ++i) {
+                const int32_t id = ids[i];
+                if (id < 0 || id >= (int32_t) c.resident_slot.size()) {
+                    continue;
+                }
+                // served without a disk read: VRAM, filled RAM resident, L2 pool,
+                // or a permanent base resident. A base expert is never dropped
+                const bool available = c.vram[id] || c.base[id] ||
+                        (c.resident_slot[id] >= 0 && c.resident_filled[id] != 0) ||
+                        (epid >= 0 && p.evict_has(epid, ((int64_t) il << 32) | (uint32_t) id));
+                p.n_routed_mass += (double) probs[i];
+                if (p.drop_probe) {
+                    p.probe_routed++;
+                    if (!available) {
+                        p.probe_cold_n++;
+                        if (max_score > 0.0f) {
+                            const size_t rb = (size_t) p.probe_rel_bin(probs[i] / max_score);
+                            p.probe_rel[rb]++;
+                            p.probe_rel_mass[rb] += (double) probs[i];
+                            p.probe_rel_n++;
+                        }
+                    }
+                }
+                if (!available) {
+                    if (p.drop_probe) {
+                        p.n_cold_mass += (double) probs[i];
+                    }
+                    n_cold_all++;
+                    if (probs[i] < floor_score) {
+                        cold.push_back(i);
+                    }
+                }
+            }
+            if (p.drop_probe) {
+                p.probe_cold_hist[std::min<size_t>(n_cold_all, 32)]++;
+                p.probe_cold_max = std::max<uint64_t>(p.probe_cold_max, n_cold_all);
+                p.probe_calls++;
+            }
+            // drop the lowest-score candidates, up to round(Q * n_expert_used):
+            // the floor decides which experts are weak, Q caps how many of them
+            // are dropped
+            if (p.drop_fraction > 0.0f) {
+                int32_t budget = (int32_t) std::llround((double) p.drop_fraction * (double) n_ids);
+                budget = std::min<int32_t>(budget, (int32_t) cold.size());
+                std::sort(cold.begin(), cold.end(), [probs](int64_t a, int64_t b) {
+                    return probs[a] < probs[b];
+                });
+                for (int32_t k = 0; k < budget; ++k) {
+                    drop[(size_t) cold[(size_t) k]] = 1;
+                }
+            }
+        }
+
         for (int64_t i = 0; i < n_ids; ++i) {
             const int32_t id = ids[i];
             if (id < 0 || id >= (int32_t) c.resident_slot.size()) {
+                continue;
+            }
+
+            // cache-aware dropping: a dropped expert points at the sentinel, so
+            // the host mul_mat_id skips it and nothing is read. keep[id] feeds
+            // the graph's weight renormalization
+            const bool dropped = drop_planned && i < (int64_t) drop.size() && drop[(size_t) i] != 0;
+            if (c.keep != nullptr) {
+                ((float *) c.keep->data)[id] = dropped ? 0.0f : 1.0f;
+            }
+            if (dropped) {
+                table[id] = pool.sentinel;
+                p.n_dropped_routes++;
+                if (probs != nullptr) {
+                    p.n_dropped_mass += (double) probs[i];
+                }
+                for (int r = 0; r < 3; ++r) {
+                    if (regions[r].stride != 0) {
+                        p.n_dropped_bytes += regions[r].stride;
+                    }
+                }
                 continue;
             }
 
@@ -3004,11 +3458,12 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
     GGML_UNUSED(il);
     GGML_UNUSED(ids);
     GGML_UNUSED(n_ids);
+    GGML_UNUSED(probs);
     return false;
 #endif
 }
 
-void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
+void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids, const float * probs) {
 #if defined(_WIN32)
     impl & p = *pimpl;
     const int64_t t0 = ggml_time_us();
@@ -3017,7 +3472,7 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
     // new plan reads or writes the pool
     dec_io_drain();
 
-    if (!fill_cache_plan(il, ids, n_ids)) {
+    if (!fill_cache_plan(il, ids, n_ids, probs)) {
         return;
     }
     std::vector<disk_stage_job> & jobs = p.fs_jobs;
@@ -3147,6 +3602,7 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids) {
     GGML_UNUSED(il);
     GGML_UNUSED(ids);
     GGML_UNUSED(n_ids);
+    GGML_UNUSED(probs);
 #endif
 }
 
@@ -3183,12 +3639,12 @@ void llama_disk_stage::dec_io_drain() {
 #endif
 }
 
-void llama_disk_stage::fill_cache_begin(int il, const int32_t * ids, int64_t n_ids) {
+void llama_disk_stage::fill_cache_begin(int il, const int32_t * ids, int64_t n_ids, const float * probs) {
 #if defined(_WIN32)
     impl & p = *pimpl;
     if (!p.split_hot_active) {
         p.dec_wait_il = -1;
-        fill_cache(il, ids, n_ids);
+        fill_cache(il, ids, n_ids, probs);
         return;
     }
     // a batch left in flight by an aborted graph would be overwritten below
@@ -3200,12 +3656,12 @@ void llama_disk_stage::fill_cache_begin(int il, const int32_t * ids, int64_t n_i
     // no cold pass was emitted for this layer, so nobody would ever wait on the
     // batch: fill it synchronously instead of stranding it on the worker
     if (!split_cold(il)) {
-        fill_cache(il, ids, n_ids);
+        fill_cache(il, ids, n_ids, probs);
         return;
     }
 
     const int64_t t_begin = ggml_time_us();
-    if (!fill_cache_plan(il, ids, n_ids)) {
+    if (!fill_cache_plan(il, ids, n_ids, probs)) {
         p.dec_wait_il = -1;
         return;
     }
@@ -3270,6 +3726,7 @@ void llama_disk_stage::fill_cache_begin(int il, const int32_t * ids, int64_t n_i
     GGML_UNUSED(il);
     GGML_UNUSED(ids);
     GGML_UNUSED(n_ids);
+    GGML_UNUSED(probs);
 #endif
 }
 

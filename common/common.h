@@ -527,6 +527,16 @@ struct common_params {
     // (disk) pass on a second CPU backend, so the cold read overlaps the hot
     // compute. Requires --load-mode dio. See --disk-stage-split-hot.
     bool     disk_stage_split_hot  =    false;
+    // disk stage: drop the lowest fraction of the routed experts of a decode
+    // token when they would need a disk read (0 = off). Requires --load-mode dio.
+    // See --disk-stage-drop-fraction.
+    float    disk_stage_drop_fraction =  0.0f;
+    // disk stage: only drop an expert whose score is below this times the layer's
+    // highest routed score. See --disk-stage-drop-below-rel.
+    float    disk_stage_drop_below_rel = 0.5f;
+    // disk stage: measure and report the routed score distribution without
+    // dropping anything. See --disk-stage-drop-probe.
+    bool     disk_stage_drop_probe =     false;
 
     // GPU-resident cache for host-offloaded MoE experts, served from VRAM on
     // decode (0 = disabled). See --moe-expert-cache*. Works with --pin-hot-experts

@@ -108,5 +108,15 @@ struct llama_cparams {
     // compute (--disk-stage-split-hot)
     bool disk_stage_split_hot;
 
+    // disk stage: drop the lowest fraction of the routed experts of a decode
+    // token when they would need a disk read (--disk-stage-drop-fraction, 0 = off)
+    float   disk_stage_drop_fraction;
+    // disk stage: only drop an expert whose score is below this times the
+    // layer's highest routed score (--disk-stage-drop-below-rel)
+    float   disk_stage_drop_below_rel;
+    // disk stage: measure and report the routed score distribution without
+    // dropping anything (--disk-stage-drop-probe)
+    bool    disk_stage_drop_probe;
+
     llama_context * ctx_other;
 };

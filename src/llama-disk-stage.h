@@ -59,6 +59,15 @@ struct llama_disk_stage_cache_layer {
     // sentinel slots. Null when the split is off
     ggml_tensor * slot_skip_hot  = nullptr;
     ggml_tensor * slot_skip_cold = nullptr;
+    // cache-aware opportunistic dropping (--disk-stage-drop-fraction): F32
+    // [n_expert], 1 for an expert kept this token, 0 for a cold expert dropped.
+    // The graph multiplies the expert weights by get_rows(keep, selected_experts)
+    // before the norm_w pass, so the kept experts are renormalized. Null when
+    // dropping is off (probe-only keeps the force below but not this tensor)
+    ggml_tensor * keep = nullptr;
+    // probe or drop: force the ffn_moe_weights get_rows onto the host so the
+    // disk stage can read the router scores in its node-prepare callback
+    bool force_weights_host = false;
 };
 
 class llama_disk_stage {
@@ -90,7 +99,8 @@ public:
                      int32_t n_pin_experts, uint64_t cache_budget_bytes,
                      int32_t pool_layers_max, const char * base_experts_path,
                      const char * warm_experts_path, const char * base_template_path,
-                     bool split_hot);
+                     bool split_hot, float drop_fraction, float drop_below_rel,
+                     bool drop_probe);
     ~llama_disk_stage();
 
     // staging tensors of MoE layer il, or null when the layer is not stageable
@@ -114,8 +124,10 @@ public:
     const llama_disk_stage_cache_layer * cache_layer(int il) const;
 
     // ensure the routed experts of layer il are in the cache and update the
-    // layer's id table; reads the non-resident ones into transient slots
-    void fill_cache(int il, const int32_t * ids, int64_t n_ids);
+    // layer's id table; reads the non-resident ones into transient slots.
+    // probs, when non-null, is the raw router score of each routed id (same
+    // order), used by cache-aware dropping (--disk-stage-drop-fraction)
+    void fill_cache(int il, const int32_t * ids, int64_t n_ids, const float * probs = nullptr);
 
     // split-hot variant: fill_cache_begin() sets the tables and hands the disk
     // batch to a worker, then returns so the hot pass computes; fill_cache_wait()
@@ -127,7 +139,7 @@ public:
     // compute. The worker keeps storing the transient slots into the L2 pool
     // while the cold pass computes, and the next fill drains it before the
     // window is reused.
-    void fill_cache_begin(int il, const int32_t * ids, int64_t n_ids);
+    void fill_cache_begin(int il, const int32_t * ids, int64_t n_ids, const float * probs = nullptr);
     void fill_cache_wait(int il);
 
     // end of a decode step, from the graph compute: closes the layer whose cold
@@ -274,7 +286,7 @@ private:
     // slot assignment shared by fill_cache() and the split-hot pair: writes the
     // layer's id table and collects the disk jobs, the independent copies and
     // the miss copies. false when the layer has no cache or no routed ids
-    bool fill_cache_plan(int il, const int32_t * ids, int64_t n_ids);
+    bool fill_cache_plan(int il, const int32_t * ids, int64_t n_ids, const float * probs);
 
     // wait out the decode I/O worker and publish the L2 slots its stores
     // filled, so the next plan can hit them. Also called before a prefill

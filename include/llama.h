@@ -515,6 +515,23 @@ extern "C" {
         // gate/up Silu layout is split; other layers use the single pass.
         bool disk_stage_split_hot;
 
+        // cache-aware opportunistic dropping (--load-mode dio, Windows). On a
+        // single-token decode layer a routed expert is dropped when it would
+        // need a disk read (not in VRAM, a filled RAM resident or the L2 pool)
+        // AND its raw router score is below disk_stage_drop_below_rel times the
+        // layer's highest routed score. At most the lowest
+        // disk_stage_drop_fraction of the routed experts are dropped. The
+        // relative floor keeps the knob portable across gating functions (only
+        // SOFTMAX is a true probability) and leaves the top of a flat layer
+        // untouched. Dropped experts are skipped before the read and
+        // renormalized out of the expert weights. 0 = off.
+        float disk_stage_drop_fraction;   // cap on the dropped fraction, [0, 1)
+        float disk_stage_drop_below_rel;  // relative floor, (0, 1]
+
+        // measure the routed score distribution and print a calibration line in
+        // the disk-stage report without dropping anything (--disk-stage-drop-probe)
+        bool disk_stage_drop_probe;
+
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)

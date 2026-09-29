@@ -3046,6 +3046,71 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--disk-stage-drop-fraction"}, "Q",
+        string_format(
+            "with --load-mode dio, drop the lowest Q fraction of the experts a\n"
+            "single-token decode layer routes, but only those that would need a\n"
+            "disk read (not in VRAM, not a filled RAM resident, not in the L2\n"
+            "pool) and whose score is below --disk-stage-drop-below-rel times the\n"
+            "layer's highest routed score. At most round(Q * n_expert_used) are\n"
+            "dropped, so Q caps the dropped fraction rather than forcing it. The\n"
+            "read, the L2 admission and the compute are skipped, and the\n"
+            "remaining experts are renormalized. Dropping waits until the decode\n"
+            "cache is at least 90%% full, because during warm-up a cold expert is\n"
+            "one that was not read yet, not one that is weak. Use\n"
+            "--disk-stage-drop-probe to see the score distribution and the cold\n"
+            "share first. Default: %.3f (disabled)",
+            (double) params.disk_stage_drop_fraction
+        ),
+        [](common_params & params, const std::string & value) {
+            const float v = std::stof(value);
+            if (v < 0.0f || v >= 1.0f) {
+                throw std::invalid_argument("error: --disk-stage-drop-fraction must be in [0, 1)");
+            }
+            params.disk_stage_drop_fraction = v;
+        }
+    ));
+    add_opt(common_arg(
+        {"--disk-stage-drop-below-rel"}, "A",
+        string_format(
+            "with --disk-stage-drop-fraction, only consider an expert for\n"
+            "dropping when its raw router score is below A times the layer's\n"
+            "highest routed score. A is scale-invariant, so it reads the same for\n"
+            "SOFTMAX, SIGMOID and SQRT_SOFTPLUS gating, and it is what keeps a\n"
+            "flat routing distribution (experts near equal) from losing a\n"
+            "significant expert just because Q is set. The highest-score expert\n"
+            "can never be below A * max, so it is always kept (default: %.2f)",
+            (double) params.disk_stage_drop_below_rel
+        ),
+        [](common_params & params, const std::string & value) {
+            const float v = std::stof(value);
+            if (v <= 0.0f || v > 1.0f) {
+                throw std::invalid_argument("error: --disk-stage-drop-below-rel must be in (0, 1]");
+            }
+            params.disk_stage_drop_below_rel = v;
+        }
+    ));
+    add_opt(common_arg(
+        {"--disk-stage-drop-probe"},
+        {"--no-disk-stage-drop-probe"},
+        string_format(
+            "with --load-mode dio, measure the router score distribution of the\n"
+            "single-token decode and print a calibration block in the disk-stage\n"
+            "report: the cold share of selections and of score mass, the quantiles\n"
+            "of the cold score relative to the layer max, and the count and score\n"
+            "mass below a range of --disk-stage-drop-below-rel floors. The\n"
+            "quantiles are the inverse CDF, so to drop a given share of cold reads\n"
+            "set A to the matching quantile. The probe waits for the same 90%% cache\n"
+            "fill as dropping, so the calibration excludes warm-up. Drops nothing\n"
+            "by itself, so it can run without --disk-stage-drop-fraction\n"
+            "(default: %s)",
+            params.disk_stage_drop_probe ? "enabled" : "disabled"
+        ),
+        [](common_params & params, bool value) {
+            params.disk_stage_drop_probe = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--hot-experts-prefetch"},
         {"--no-hot-experts-prefetch"},
         string_format(

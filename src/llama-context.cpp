@@ -162,6 +162,9 @@ llama_context::llama_context(
     cparams.n_moe_cache_drift_percent = params.n_moe_cache_drift_percent;
     cparams.hot_experts_prefetch     = params.hot_experts_prefetch;
     cparams.disk_stage_split_hot     = params.disk_stage_split_hot;
+    cparams.disk_stage_drop_fraction  = params.disk_stage_drop_fraction;
+    cparams.disk_stage_drop_below_rel = params.disk_stage_drop_below_rel;
+    cparams.disk_stage_drop_probe     = params.disk_stage_drop_probe;
 
     // The hot-expert cache is the shared router-observation engine: it maintains
     // the global decayed ranking behind the RAM pinning tier (--pin-hot-experts
@@ -193,7 +196,9 @@ llama_context::llama_context(
                 cparams.n_pin_hot_experts, cparams.n_pin_hot_experts_budget_bytes,
                 cparams.n_pin_hot_experts_pool_layers,
                 cparams.pin_experts_from_profile_path, cparams.warm_experts_from_profile_path,
-                cparams.pin_experts_template_path, cparams.disk_stage_split_hot);
+                cparams.pin_experts_template_path, cparams.disk_stage_split_hot,
+                cparams.disk_stage_drop_fraction, cparams.disk_stage_drop_below_rel,
+                cparams.disk_stage_drop_probe);
         if (stage->is_active()) {
             disk_stage = std::move(stage);
         }
@@ -215,6 +220,16 @@ llama_context::llama_context(
 
     if (cparams.disk_stage_split_hot && !disk_active) {
         LLAMA_LOG_WARN("%s: --disk-stage-split-hot has no effect without the disk decode cache "
+                       "(--load-mode dio on Windows)\n", __func__);
+    }
+
+    if (cparams.disk_stage_drop_fraction > 0.0f && !disk_active) {
+        LLAMA_LOG_WARN("%s: --disk-stage-drop-fraction has no effect without the disk decode cache "
+                       "(--load-mode dio on Windows)\n", __func__);
+    }
+
+    if (cparams.disk_stage_drop_probe && !disk_active) {
+        LLAMA_LOG_WARN("%s: --disk-stage-drop-probe has no effect without the disk decode cache "
                        "(--load-mode dio on Windows)\n", __func__);
     }
 
@@ -4931,6 +4946,9 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.hot_experts_prefetch        =*/ false,
         /*.disk_stage_split_hot        =*/ false,
+        /*.disk_stage_drop_fraction  =*/ 0.0f,
+        /*.disk_stage_drop_below_rel =*/ 0.5f,
+        /*.disk_stage_drop_probe     =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
