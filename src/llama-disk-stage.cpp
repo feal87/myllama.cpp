@@ -549,6 +549,8 @@ struct llama_disk_stage::impl {
     // cleared once the weights get_rows can no longer be intercepted: the
     // callback then falls back to the plain table-triggered fill
     bool drop_active = false;
+    // one-shot: the reason the weights intercept was given up, for the log
+    bool drop_disable_warned = false;
     // the warm-up check scans every layer, so it runs at most this often
     static constexpr int64_t drop_fill_check_us = 100000;
     int64_t drop_fill_check_at = 0;
@@ -1229,10 +1231,16 @@ void llama_disk_stage::node_prepare_callback(struct ggml_tensor * node, void * u
                     t_ids->nb[0] != sizeof(int32_t)) {
                 if (p.drop_active) {
                     p.n_weights_nohost++;
-                    p.disable_drop();
-                    if (disk_stage_trace()) {
-                        LLAMA_LOG_WARN("%s: dropping disabled: the weights get_rows inputs are not host-side\n", __func__);
+                    if (!p.drop_disable_warned) {
+                        p.drop_disable_warned = true;
+                        LLAMA_LOG_WARN("%s: cache-aware dropping disabled: weights get_rows il=%d table=%d prob_null=%d ids_null=%d prob_host=%d ids_host=%d\n",
+                                       __func__, il,
+                                       (int) (il >= 0 && il < (int) p.cache.size() && p.cache[il].table != nullptr),
+                                       (int) (t_prob == nullptr), (int) (t_ids == nullptr),
+                                       (int) (t_prob != nullptr && t_prob->buffer != nullptr && ggml_backend_buffer_is_host(t_prob->buffer)),
+                                       (int) (t_ids != nullptr && t_ids->buffer != nullptr && ggml_backend_buffer_is_host(t_ids->buffer)));
                     }
+                    p.disable_drop();
                     // the table get_rows is skipped while dropping intercepts the
                     // weights, so fill here without the scores to keep the table
                     // current for this token
@@ -1638,8 +1646,8 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
 
     line("  l2 served : %s of disk reads avoided this interval (%s of it promoted into a resident slot)"
          " | %s cumulative (%s promoted)",
-         report_volume(d_hit_bytes).c_str(), report_volume(d_promo).c_str(),
-         report_volume(p.n_l2_hit_bytes).c_str(), report_volume(p.n_l2_promo_bytes).c_str());
+         report_volume(d_hit_bytes + d_promo).c_str(), report_volume(d_promo).c_str(),
+         report_volume(p.n_l2_hit_bytes + p.n_l2_promo_bytes).c_str(), report_volume(p.n_l2_promo_bytes).c_str());
 
     if (!p.evict_pools.empty()) {
         size_t n_entries  = 0;
