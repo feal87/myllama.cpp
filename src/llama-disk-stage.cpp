@@ -419,6 +419,13 @@ struct llama_disk_stage::impl {
     uint64_t n_fill_plan_ids                = 0;
     uint64_t n_fill_weights                 = 0;
     uint64_t n_fill_table                   = 0;
+    // diagnostic: which callback branch filled, to find a layer filled twice
+    uint64_t n_weights_seen                 = 0;
+    uint64_t n_weights_main                 = 0;
+    uint64_t n_weights_fallback             = 0;
+    uint64_t n_weights_nohost               = 0;
+    uint64_t n_table_seen                   = 0;
+    uint64_t n_table_block                  = 0;
     uint64_t n_decode_cache_fills           = 0;
     uint64_t n_decode_cache_resident_changes = 0;
     // cache-aware opportunistic dropping: routed experts skipped instead of read
@@ -1197,12 +1204,19 @@ void llama_disk_stage::node_prepare_callback(struct ggml_tensor * node, void * u
         const bool is_weights = node->op == GGML_OP_GET_ROWS &&
                 std::strncmp(node->name, wprefix, sizeof(wprefix) - 1) == 0;
         if (is_weights) {
+            p.n_weights_seen++;
             const char * dash = std::strrchr(node->name, '-');
             const int    il   = dash != nullptr ? atoi(dash + 1) : -1;
             const ggml_tensor * t_ids  = node->src[1];
             const ggml_tensor * t_prob = node->src[0];
             // multi-token weights: not a decode fill, leave dropping alone
             if (t_ids == nullptr || t_ids->ne[1] != 1) {
+                return;
+            }
+            // drop was disabled (the scores turned out unreadable): the table
+            // get_rows is no longer blocked, so it must own the fill. Filling here
+            // as well would read the same layer twice
+            if (!p.drop_active) {
                 return;
             }
             if (il < 0 || il >= (int) p.cache.size() || p.cache[il].table == nullptr ||
@@ -1214,6 +1228,7 @@ void llama_disk_stage::node_prepare_callback(struct ggml_tensor * node, void * u
                     t_ids->data == nullptr || t_prob->data == nullptr ||
                     t_ids->nb[0] != sizeof(int32_t)) {
                 if (p.drop_active) {
+                    p.n_weights_nohost++;
                     p.disable_drop();
                     if (disk_stage_trace()) {
                         LLAMA_LOG_WARN("%s: dropping disabled: the weights get_rows inputs are not host-side\n", __func__);
@@ -1227,6 +1242,7 @@ void llama_disk_stage::node_prepare_callback(struct ggml_tensor * node, void * u
                             t_ids->ne[1] == 1 && t_ids->ne[0] > 0;
                     if (ids_host && il >= 0 && il < (int) p.cache.size()) {
                         p.n_fill_weights++;
+                        p.n_weights_fallback++;
                         if (p.split_hot_active) {
                             self->fill_cache_begin(il, (const int32_t *) t_ids->data, t_ids->ne[0], nullptr);
                         } else {
@@ -1263,6 +1279,7 @@ void llama_disk_stage::node_prepare_callback(struct ggml_tensor * node, void * u
                 p.fs_n_all = 0;
             }
             p.n_fill_weights++;
+            p.n_weights_main++;
             if (p.split_hot_active) {
                 self->fill_cache_begin(il, idp, n_used, p.fs_probs.data());
             } else {
@@ -1273,6 +1290,7 @@ void llama_disk_stage::node_prepare_callback(struct ggml_tensor * node, void * u
         // while dropping intercepts the weights, the table get_rows must not
         // trigger a second fill of the same layer
         if (p.drop_active) {
+            p.n_table_block++;
             return;
         }
     }
@@ -1305,6 +1323,7 @@ void llama_disk_stage::node_prepare_callback(struct ggml_tensor * node, void * u
     }
 
     p.n_fill_table++;
+    p.n_table_seen++;
     if (p.split_hot_active) {
         self->fill_cache_begin(it->second, (const int32_t *) t->data, n_used);
     } else {
@@ -1441,7 +1460,9 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     const size_t s_b = out.size();
     line("  fill      : %.2f ms/call over %" PRIu64 " call(s) (%.1f per decode token) | %s read"
          " | %.2f ms/MiB | %.1f ms of reads per decode token | %s over %" PRIu64 " calls since start"
-         " | %" PRIu64 " plans, %.1f ids/plan, W %" PRIu64 " T %" PRIu64,
+         " | %" PRIu64 " plans, %.1f ids/plan, W %" PRIu64 " T %" PRIu64
+         " | seen W %" PRIu64 " (main %" PRIu64 " fb %" PRIu64 " nohost %" PRIu64 ") T %" PRIu64 " (block %" PRIu64 ")"
+         " | drop_active %d drop_enabled %d warm %d",
          d_dec_calls ? (double) d_dec_us / 1000.0 / (double) d_dec_calls : 0.0, d_dec_calls,
          d_tokens ? (double) d_dec_calls / (double) d_tokens : 0.0,
          report_volume(d_dec_bytes).c_str(),
@@ -1449,7 +1470,10 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
          d_tokens ? (double) d_dec_us / 1000.0 / (double) d_tokens : 0.0,
          report_volume(p.n_dec_fill_bytes).c_str(), p.n_dec_fill_calls,
          p.n_fill_plans, p.n_fill_plans ? (double) p.n_fill_plan_ids / (double) p.n_fill_plans : 0.0,
-         p.n_fill_weights, p.n_fill_table);
+         p.n_fill_weights, p.n_fill_table,
+         p.n_weights_seen, p.n_weights_main, p.n_weights_fallback, p.n_weights_nohost,
+         p.n_table_seen, p.n_table_block,
+         p.drop_active ? 1 : 0, p.drop_enabled() ? 1 : 0, p.drop_warm ? 1 : 0);
     const std::string sec_b = out.substr(s_b);
 
     const size_t s_wait = out.size();
