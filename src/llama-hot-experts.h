@@ -265,7 +265,7 @@ class llama_hot_expert_cache {
     // ranking, decays, base set, prefetch and the per-layer breakdown. Called by
     // llama_context at the shared --experts-stats-interval cadence and once by the
     // destructor (which passes final_report, so the teardown dump is recognizable).
-    void print_stats(bool final_report = false);
+    void print_stats(bool final_report = false, uint64_t ram_hit = 0, uint64_t ram_total = 0);
 
   private:
     // Unique key identifying a specific expert in a specific layer
@@ -619,6 +619,10 @@ class llama_hot_expert_cache {
     // previous report's RAM-tier route hit/miss totals, for the interval hit rate
     uint64_t prev_route_hit      = 0;
     uint64_t prev_routed_total   = 0;
+    // when the disk stage serves the routes its realized hit count replaces the
+    // pin-state one, which is only current after the graph, not at the read
+    uint64_t prev_ext_hit        = 0;
+    uint64_t prev_ext_total      = 0;
     uint64_t n_reports_total     = 0;  // reports printed so far (shown in the header)
 
     // VRAM-tier residency query (see the public API docs); guarded by mu

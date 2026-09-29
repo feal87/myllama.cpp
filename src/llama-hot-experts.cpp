@@ -151,7 +151,7 @@ llama_hot_expert_cache::~llama_hot_expert_cache() {
     }
 }
 
-void llama_hot_expert_cache::print_stats(bool final_report) {
+void llama_hot_expert_cache::print_stats(bool final_report, uint64_t ram_hit, uint64_t ram_total) {
     // gather everything under mu, then log after unlocking: console writes are
     // synchronous on Windows and must not stall the pin worker or a VRAM takeover
     size_t   total_distinct_seen = 0;
@@ -204,8 +204,16 @@ void llama_hot_expert_cache::print_stats(bool final_report) {
 
         total_distinct_seen = (size_t) n_distinct;
         total_pinned        = pinned.size();
-        routed_hit          = n_route_hit;
-        routed_total        = n_route_hit + n_route_miss;
+        // the disk stage decides RAM residency at the read, before the graph
+        // finishes, while the pin state is only current after it. Prefer the
+        // disk stage's realized count when the caller passes it
+        if (ram_total > 0) {
+            routed_hit   = ram_hit;
+            routed_total = ram_total;
+        } else {
+            routed_hit   = n_route_hit;
+            routed_total = n_route_hit + n_route_miss;
+        }
         bytes_locked        = n_bytes_locked;
         lock_calls          = n_lock_calls;
         lock_slow           = n_lock_slow;
@@ -222,8 +230,8 @@ void llama_hot_expert_cache::print_stats(bool final_report) {
         route_total         = n_route_total;
         prev_base           = prev_route_base;
         prev_total          = prev_route_total;
-        prev_hit            = prev_route_hit;
-        prev_routed         = prev_routed_total;
+        prev_hit            = ram_total > 0 ? prev_ext_hit   : prev_route_hit;
+        prev_routed         = ram_total > 0 ? prev_ext_total : prev_routed_total;
         n_reserved          = n_bytes_reserved;
         n_prompt_decays     = n_decays_prompt;
         base_count          = n_base;
@@ -286,6 +294,10 @@ void llama_hot_expert_cache::print_stats(bool final_report) {
         prev_route_total = n_route_total;
         prev_route_hit   = n_route_hit;
         prev_routed_total = n_route_hit + n_route_miss;
+        if (ram_total > 0) {
+            prev_ext_hit   = ram_hit;
+            prev_ext_total = ram_total;
+        }
         n_reports_total++;
         stats_stamp = next_stamp;
     }
@@ -724,6 +736,10 @@ void llama_hot_expert_cache::observe_decode_finish() {
     // uncontended acquisitions per decode token on the same mutex)
     std::lock_guard<std::mutex> lock(mu);
 
+    // with the disk stage active, RAM residency is decided by the decode-cache
+    // slot actually holding the bytes, not by the pin state
+    const bool ds_active = disk_stage != nullptr && disk_stage->is_active();
+
     for (int il = 0; il < (int) obs_off.size(); ++il) {
         if (obs_off[il] < 0) {
             continue;
@@ -764,9 +780,13 @@ void llama_hot_expert_cache::observe_decode_finish() {
                 // and this host read was skipped
                 ls.n_vram_hit++;
             } else {
-                // realized RAM-tier hit rate: a routed expert is a hit when its
-                // pages are already mlock'd at routing time
-                if ((pin_state[id] & (PIN_RESIDENT | PIN_BASE)) != 0) {
+                // realized RAM-tier hit rate. PIN_RESIDENT is set when the slot is
+                // reserved, so with the disk stage active the bytes must also be in
+                // the slot, else the read still happens and this is not a hit
+                const bool hit = ds_active
+                        ? disk_stage->resident_filled(il, id)
+                        : (pin_state[id] & (PIN_RESIDENT | PIN_BASE)) != 0;
+                if (hit) {
                     n_route_hit++;
                 } else {
                     n_route_miss++;

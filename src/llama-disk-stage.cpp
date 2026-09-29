@@ -729,8 +729,9 @@ struct llama_disk_stage::impl {
     // the two calls so the read/hot intersection is visible
     struct split_phase {
         int32_t il      = -1;
-        int64_t t_begin = 0; // fill_cache_begin entry
-        int64_t t_plan  = 0; // the tables and the disk batch are planned
+        int64_t t_begin = 0; // fill_cache_begin entry, the plan starts
+        int64_t t_plan0 = 0; // fill_cache_plan returned
+        int64_t t_copy  = 0; // copies_pre memcpy over
         int64_t t_hot   = 0; // the batch is with the worker, the hot pass starts
         int64_t t_cold  = 0; // the cold split was reached, the read must be done
         int64_t t_join  = 0; // the read landed; the worker may still be storing
@@ -740,32 +741,49 @@ struct llama_disk_stage::impl {
     };
     split_phase trace_split;
     struct split_acc {
-        int32_t layers   = 0;
-        int64_t plan_us  = 0;
-        int64_t hot_us   = 0;
-        int64_t read_us  = 0;
-        int64_t cold_us  = 0;
-        int64_t ovl_us   = 0; // read time hidden behind the hot pass
-        int64_t stall_us = 0; // read time still outstanding when the cold pass needed it
-        int64_t span_us  = 0; // wall clock from begin() to the end of the cold pass
-        int64_t bytes    = 0;
+        int32_t layers         = 0;
+        int64_t plan_us        = 0; // t_plan0 - t_begin, the plan and its copies
+        int64_t copy_us        = 0; // copies_pre memcpy
+        int64_t hot_us         = 0; // hot pass compute (t_cold - t_hot)
+        int64_t read_us        = 0; // worker read
+        int64_t cold_us        = 0; // cold pass compute (t_end - t_join)
+        int64_t ovl_us         = 0; // read time hidden behind the hot pass
+        int64_t stall_us       = 0; // read time still outstanding when the cold pass needed it
+        int64_t wait_us        = 0; // the decode thread blocked in fill_cache_wait
+        int64_t span_us        = 0; // wall clock from begin() to the end of the cold pass
+        int64_t bytes          = 0;
+        int32_t n_read_limited = 0; // layers whose read was not covered by their hot pass
 
         split_acc operator-(const split_acc & o) const {
-            return { layers - o.layers, plan_us - o.plan_us, hot_us - o.hot_us, read_us - o.read_us,
-                     cold_us - o.cold_us, ovl_us - o.ovl_us, stall_us - o.stall_us,
-                     span_us - o.span_us, bytes - o.bytes };
+            split_acc r;
+            r.layers     = layers     - o.layers;
+            r.plan_us    = plan_us    - o.plan_us;
+            r.copy_us    = copy_us    - o.copy_us;
+            r.hot_us     = hot_us     - o.hot_us;
+            r.read_us    = read_us    - o.read_us;
+            r.cold_us    = cold_us    - o.cold_us;
+            r.ovl_us     = ovl_us     - o.ovl_us;
+            r.stall_us   = stall_us   - o.stall_us;
+            r.wait_us    = wait_us    - o.wait_us;
+            r.span_us    = span_us    - o.span_us;
+            r.bytes      = bytes      - o.bytes;
+            r.n_read_limited = n_read_limited - o.n_read_limited;
+            return r;
         }
 
         split_acc & operator+=(const split_acc & o) {
-            layers   += o.layers;
-            plan_us  += o.plan_us;
-            hot_us   += o.hot_us;
-            read_us  += o.read_us;
-            cold_us  += o.cold_us;
-            ovl_us   += o.ovl_us;
-            stall_us += o.stall_us;
-            span_us  += o.span_us;
-            bytes    += o.bytes;
+            layers     += o.layers;
+            plan_us    += o.plan_us;
+            copy_us    += o.copy_us;
+            hot_us     += o.hot_us;
+            read_us    += o.read_us;
+            cold_us    += o.cold_us;
+            ovl_us     += o.ovl_us;
+            stall_us   += o.stall_us;
+            wait_us    += o.wait_us;
+            span_us    += o.span_us;
+            bytes      += o.bytes;
+            n_read_limited += o.n_read_limited;
             return *this;
         }
     };
@@ -778,6 +796,7 @@ struct llama_disk_stage::impl {
 
     // previous stats report, for the per-interval deltas
     uint64_t prev_l2_hits        = 0;
+    uint64_t prev_l2_all_hits    = 0;
     uint64_t prev_l2_misses      = 0;
     uint64_t prev_l2_cold        = 0;
     uint64_t prev_l2_evictions   = 0;
@@ -795,6 +814,10 @@ struct llama_disk_stage::impl {
     uint64_t prev_dec_dropped       = 0;
     uint64_t prev_dec_substituted   = 0;
     uint64_t prev_dec_tokens        = 0;
+    // previous report's funnel bases, for the per-interval tier rates
+    uint64_t prev_base_l2           = 0;
+    uint64_t prev_base_sub          = 0;
+    uint64_t prev_base_drop         = 0;
     double   prev_dec_routed_mass   = 0.0;
     double   prev_dec_dropped_mass  = 0.0;
 
@@ -1384,6 +1407,11 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     const double   d_dropped_mass = p.n_dropped_mass - p.prev_dec_dropped_mass;
     const uint64_t d_tokens     = decode_tokens > p.prev_dec_tokens ? decode_tokens - p.prev_dec_tokens : 0;
     const impl::split_acc split = p.split_tot - p.prev_split_tot;
+    // funnel bases and the L2 hits over them, for the per-interval tier rates
+    const uint64_t d_base_l2   = base_l2   > p.prev_base_l2   ? base_l2   - p.prev_base_l2   : 0;
+    const uint64_t d_base_sub  = base_sub  > p.prev_base_sub  ? base_sub  - p.prev_base_sub  : 0;
+    const uint64_t d_base_drop = base_drop > p.prev_base_drop ? base_drop - p.prev_base_drop : 0;
+    const uint64_t d_l2_all    = p.n_l2_all_hits > p.prev_l2_all_hits ? p.n_l2_all_hits - p.prev_l2_all_hits : 0;
 
     // one themed line each. The report is split in four blocks (L2, substitution,
     // dropping, disk) and each block is emitted in one write
@@ -1442,11 +1470,22 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     const uint64_t lookups = p.n_l2_hits + p.n_l2_misses;
 
     const size_t s_b = out.size();
-    line("  fill      : %.2f ms/call, %.1f ms/token | %s read, %" PRIu64 " calls",
-         d_dec_calls ? (double) d_dec_us / 1000.0 / (double) d_dec_calls : 0.0,
-         d_tokens ? (double) d_dec_us / 1000.0 / (double) d_tokens : 0.0,
-         report_volume(d_dec_bytes).c_str(), d_dec_calls);
-    line("  fill total: %s over %" PRIu64 " calls",
+    if (split.layers > 0 && d_tokens > 0) {
+        const double tk = (double) d_tokens;
+        line("  fill      : %.2f ms/call, %.2f ms/token span = plan %.2f + copy %.2f + hot %.2f + blocked %.2f",
+             d_dec_calls ? (double) d_dec_us / 1000.0 / (double) d_dec_calls : 0.0,
+             (double) d_dec_us / 1000.0 / tk,
+             (double) split.plan_us / 1000.0 / tk,
+             (double) split.copy_us / 1000.0 / tk,
+             (double) split.hot_us / 1000.0 / tk,
+             (double) split.wait_us / 1000.0 / tk);
+    } else {
+        line("  fill      : %.2f ms/call, %.2f ms/token span | %s read, %" PRIu64 " calls",
+             d_dec_calls ? (double) d_dec_us / 1000.0 / (double) d_dec_calls : 0.0,
+             d_tokens ? (double) d_dec_us / 1000.0 / (double) d_tokens : 0.0,
+             report_volume(d_dec_bytes).c_str(), d_dec_calls);
+    }
+    line("  total     : %s read over %" PRIu64 " calls",
          report_volume(p.n_dec_fill_bytes).c_str(), p.n_dec_fill_calls);
     const std::string sec_b = out.substr(s_b);
 
@@ -1461,8 +1500,10 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     if (p.substitute_enabled() && p.drop_warm) {
         line("  config    : window %.2f-%.2f, pool %d",
              (double) p.substitute_rel, 1.0 / (double) p.substitute_rel, (int) p.substitute_pool);
-        line("  substituted: %" PRIu64 " this interval, %" PRIu64 " cumulative (%.1f%% of base, %s of reads skipped)",
-             d_substituted, p.n_subst_routes, pct(p.n_subst_routes, base_sub),
+        line("  substituted: %.1f%% cumulative (%" PRIu64 "/%" PRIu64 ") | %.1f%% this interval (%" PRIu64 "/%" PRIu64
+             ") | %s skipped",
+             pct(p.n_subst_routes, base_sub), p.n_subst_routes, base_sub,
+             pct(d_substituted, d_base_sub), d_substituted, d_base_sub,
              report_volume(p.n_subst_bytes).c_str());
     }
     const std::string sec_sub = out.substr(s_sub);
@@ -1483,9 +1524,10 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
         }
         line("  config    : fraction %.3f, below-rel %.2f, layer-cap %s, token-cap %s",
              (double) p.drop_fraction, (double) p.drop_below_rel, layer_cap, tok_cap);
-        line("  dropped   : %" PRIu64 " this interval, %" PRIu64 " cumulative (%.1f%% of base, %s of reads skipped)"
-             " | worst layer perturb %.1f%%, worst token perturb %.1f%%",
-             d_dropped, p.n_dropped_routes, pct(p.n_dropped_routes, base_drop),
+        line("  dropped   : %.1f%% cumulative (%" PRIu64 "/%" PRIu64 ") | %.1f%% this interval (%" PRIu64 "/%" PRIu64
+             ") | %s skipped | worst layer perturb %.1f%%, worst token perturb %.1f%%",
+             pct(p.n_dropped_routes, base_drop), p.n_dropped_routes, base_drop,
+             pct(d_dropped, d_base_drop), d_dropped, d_base_drop,
              report_volume(p.n_dropped_bytes).c_str(),
              100.0 * p.drop_worst_mass, 100.0 * p.drop_worst_token_mass);
     }
@@ -1496,8 +1538,10 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     // uses. The warm-phase rate excludes the lookups served before the pool
     // warmed, so it is printed apart
     const uint64_t l2_served = base_l2 > base_sub ? base_l2 - base_sub : 0;
-    line("  l2 hit    : %.1f%% of the base (%" PRIu64 "/%" PRIu64 ") | warm-phase %.1f%% | %" PRIu64 " skipped cold",
+    line("  hit       : %.1f%% cumulative (%" PRIu64 "/%" PRIu64 ") | %.1f%% this interval (%" PRIu64 "/%" PRIu64
+         ") | warm-phase %.1f%% | %" PRIu64 " skipped cold",
          pct(l2_served, base_l2), l2_served, base_l2,
+         pct(d_l2_all, d_base_l2), d_l2_all, d_base_l2,
          lookups ? 100.0 * p.n_l2_hits / lookups : 0.0, p.n_l2_cold);
 
     line("  l2 served : %s avoided this interval (%s promoted) | %s total",
@@ -1518,15 +1562,21 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     const std::string sec_l = out.substr(s_l);
 
     const size_t s_d = out.size();
-    // split hot/cold: how much of the read the hot pass actually covered. The
-    // accumulators exist for the trace, which prints them per token
+    // split hot/cold: what the read costs on the critical path. hidden covers the
+    // hot pass, outstanding is the part the cold split had to wait for, blocked is
+    // the wall time actually spent in fill_cache_wait
     if (split.layers > 0 && d_tokens > 0) {
-        line("  split     : %.2f ms of read per decode token, %.0f%% hidden behind the hot pass,"
-             " %.0f%% still outstanding at the cold pass | %.2f MiB per token over %d layer split(s)",
-             (double) split.read_us / 1000.0 / (double) d_tokens,
+        const double tk = (double) d_tokens;
+        const int64_t worker_us = split.wait_us > split.stall_us ? split.wait_us - split.stall_us : 0;
+        line("  read      : %.2f ms/token drive, %.2f MiB/token over %d split(s) | %.0f%% hidden behind the %.2f ms/token hot pass",
+             (double) split.read_us / 1000.0 / tk,
+             (double) split.bytes / (1024.0 * 1024.0) / tk, split.layers,
              split.read_us > 0 ? 100.0 * (double) split.ovl_us / (double) split.read_us : 0.0,
-             split.read_us > 0 ? 100.0 * (double) split.stall_us / (double) split.read_us : 0.0,
-             (double) split.bytes / (1024.0 * 1024.0) / (double) d_tokens, split.layers);
+             (double) split.hot_us / 1000.0 / tk);
+        line("  blocked   : %.2f ms/token in fill_cache_wait (%.2f read outstanding on %d of %d split(s), %.2f worker copy/signal)",
+             (double) split.wait_us / 1000.0 / tk,
+             (double) split.stall_us / 1000.0 / tk, split.n_read_limited, split.layers,
+             (double) worker_us / 1000.0 / tk);
     }
     const std::string sec_d = out.substr(s_d);
 
@@ -1570,9 +1620,10 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
         LLAMA_LOG_INFO("%s", ("[drop]" + rno + body).c_str());
     }
 
-    LLAMA_LOG_INFO("%s", ("[disk]" + rno + sec_base_disk + sec_sets + sec_b + sec_d).c_str());
+    LLAMA_LOG_INFO("%s", ("[disk]" + rno + sec_base_disk + sec_sets + sec_d + sec_b).c_str());
 
     p.prev_l2_hits           = p.n_l2_hits;
+    p.prev_l2_all_hits       = p.n_l2_all_hits;
     p.prev_l2_misses         = p.n_l2_misses;
     p.prev_l2_cold           = p.n_l2_cold;
     p.prev_l2_evictions      = p.n_l2_evictions;
@@ -1595,6 +1646,9 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     p.drop_worst_mass        = 0.0;
     p.drop_worst_token_mass  = 0.0;
     p.prev_dec_tokens        = decode_tokens;
+    p.prev_base_l2           = base_l2;
+    p.prev_base_sub          = base_sub;
+    p.prev_base_drop         = base_drop;
     p.prev_split_tot         = p.split_tot;
     p.n_reports++;
 }
@@ -4187,10 +4241,14 @@ void llama_disk_stage::fill_cache_begin(int il, const int32_t * ids, int64_t n_i
     }
 
     const int64_t t_begin = ggml_time_us();
+    p.trace_split          = {};
+    p.trace_split.il       = il;
+    p.trace_split.t_begin  = t_begin;
     if (!fill_cache_plan(il, ids, n_ids, probs)) {
         p.dec_wait_il = -1;
         return;
     }
+    const int64_t t_plan0 = ggml_time_us();
 
     std::vector<disk_stage_job> & jobs = p.fs_jobs;
     std::vector<impl::pool_copy>& copies_pre = p.fs_copies_pre;
@@ -4209,6 +4267,7 @@ void llama_disk_stage::fill_cache_begin(int il, const int32_t * ids, int64_t n_i
     for (const impl::pool_copy & cp : copies_pre) {
         std::memcpy(cp.dst, cp.src, cp.len);
     }
+    const int64_t t_copy = ggml_time_us();
 
     // resident fills that consumed an L2 entry: drop the now-redundant copy
     if (!p.fs_l2_consume.empty() || !p.fs_newly_filled.empty()) {
@@ -4223,11 +4282,8 @@ void llama_disk_stage::fill_cache_begin(int il, const int32_t * ids, int64_t n_i
 
     // hand the batch over, so the drive works while the hot pass computes. The
     // marks must be in place first: the worker writes its read window into them
-    const int64_t t_plan = ggml_time_us();
-    p.trace_split         = {};
-    p.trace_split.il      = il;
-    p.trace_split.t_begin = t_begin;
-    p.trace_split.t_plan  = t_plan;
+    p.trace_split.t_plan0 = t_plan0;
+    p.trace_split.t_copy  = t_copy;
     p.trace_split.t_hot   = ggml_time_us();
 
     batch.copies    = p.fs_copies;
@@ -4322,26 +4378,37 @@ void llama_disk_stage::split_report() {
     }
 
     if (disk_stage_trace()) {
-        LLAMA_LOG_INFO("[disk-stage] split L%d: bytes=%.2f MiB span=%.3f ms plan=%.3f ms read=%.3f ms hot=%.3f ms"
-                       " wait=%.3f ms cold=%.3f ms hidden=%.3f ms stall=%.3f ms res=%" PRId64
-                       " cold_ids=%" PRId64 " vram=%" PRId64 "\n",
+        LLAMA_LOG_INFO("[disk-stage] split L%d: bytes=%.2f MiB span=%.3f ms plan=%.3f copy=%.3f"
+                       " read=%.3f hot=%.3f wait=%.3f cold=%.3f hidden=%.3f stall=%.3f lim=%d"
+                       " res=%" PRId64 " cold_ids=%" PRId64 " vram=%" PRId64 "\n",
                        s.il, p.dec_bytes / (1024.0 * 1024.0), (t_end - s.t_begin) / 1000.0,
-                       (s.t_plan - s.t_begin) / 1000.0, read_us / 1000.0,
-                       (s.t_cold - s.t_hot) / 1000.0, (s.t_join - s.t_cold) / 1000.0,
+                       (s.t_plan0 - s.t_begin) / 1000.0,
+                       (s.t_copy - s.t_plan0) / 1000.0,
+                       read_us / 1000.0,
+                       (s.t_cold - s.t_hot) / 1000.0,
+                       (s.t_join - s.t_cold) / 1000.0,
                        (t_end - s.t_join) / 1000.0, ovl_us / 1000.0, stall_us / 1000.0,
+                       s.rd1 > s.t_cold ? 1 : 0,
                        p.trace_n_res, p.trace_n_cold, p.trace_n_vram);
     }
 
+    const int64_t wait_us = s.t_join > s.t_cold ? s.t_join - s.t_cold : 0;
+
     impl::split_acc & a = p.trace_split_tok;
     a.layers++;
-    a.plan_us  += s.t_plan - s.t_begin;
-    a.hot_us   += s.t_cold - s.t_hot;
-    a.read_us  += read_us;
-    a.cold_us  += (t_end - s.t_join);
-    a.ovl_us   += ovl_us;
-    a.stall_us += stall_us;
-    a.span_us  += t_end - s.t_begin;
-    a.bytes    += (int64_t) p.dec_bytes;
+    a.plan_us    += s.t_plan0   > 0 ? s.t_plan0   - s.t_begin  : 0;
+    a.copy_us    += s.t_copy    > 0 ? s.t_copy    - s.t_plan0  : 0;
+    a.hot_us     += s.t_cold - s.t_hot;
+    a.read_us    += read_us;
+    a.cold_us    += (t_end - s.t_join);
+    a.ovl_us     += ovl_us;
+    a.stall_us   += stall_us;
+    a.wait_us    += wait_us;
+    a.span_us    += t_end - s.t_begin;
+    a.bytes      += (int64_t) p.dec_bytes;
+    if (read_us > 0 && s.rd1 > s.t_cold) {
+        a.n_read_limited++;
+    }
 
     p.trace_split = {};
 #else
@@ -4383,13 +4450,13 @@ void llama_disk_stage::split_token_end() {
         return;
     }
     if (disk_stage_trace()) {
-        LLAMA_LOG_INFO("[disk-stage] split token: layers=%d bytes=%.2f MiB span=%.3f ms plan=%.3f ms"
-                       " read=%.3f ms hot=%.3f ms cold=%.3f ms hidden=%.3f ms (%.0f%% of the read)"
-                       " stall=%.3f ms\n",
-                       a.layers, a.bytes / (1024.0 * 1024.0), a.span_us / 1000.0, a.plan_us / 1000.0,
-                       a.read_us / 1000.0, a.hot_us / 1000.0, a.cold_us / 1000.0, a.ovl_us / 1000.0,
-                       a.read_us > 0 ? 100.0 * (double) a.ovl_us / (double) a.read_us : 0.0,
-                       a.stall_us / 1000.0);
+        LLAMA_LOG_INFO("[disk-stage] split token: layers=%d bytes=%.2f MiB span=%.3f ms plan=%.3f copy=%.3f"
+                       " read=%.3f hot=%.3f wait=%.3f cold=%.3f hidden=%.3f stall=%.3f lim=%d/%d\n",
+                       a.layers, a.bytes / (1024.0 * 1024.0), a.span_us / 1000.0,
+                       a.plan_us / 1000.0, a.copy_us / 1000.0,
+                       a.read_us / 1000.0, a.hot_us / 1000.0,
+                       a.wait_us / 1000.0, a.cold_us / 1000.0,
+                       a.ovl_us / 1000.0, a.stall_us / 1000.0, a.n_read_limited, a.layers);
     }
     // the token is over: fold it into the interval totals the report prints.
     // This is the only place the token accumulator is whole, split_report() runs

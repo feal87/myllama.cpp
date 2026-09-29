@@ -4267,8 +4267,16 @@ void llama_context::print_expert_report() {
 
     const llama_expert_stats cur = get_expert_stats();
 
+    // the disk stage serves its own routed set and counts its own RAM hits with a
+    // different predicate than the hot tier. Mixing the two makes the funnel
+    // overflow, so when the disk stage is active the whole disk cascade (routed,
+    // RAM, L2, substitution, dropping, read) comes from its own disjoint counters
+    const bool     disk_ram = cur.decode_cache.route_routed > 0;
+    const uint64_t routed   = disk_ram ? cur.decode_cache.route_routed : cur.routed_experts;
+    const uint64_t ram      = disk_ram ? cur.decode_cache.route_hits   : cur.decode_cache.assigned_routes;
+
     const expert_funnel tot = expert_funnel_from(
-            cur.routed_experts, cur.vram_cache.route_hits, cur.decode_cache.assigned_routes,
+            routed, cur.vram_cache.route_hits, ram,
             cur.disk_l2.hits, cur.decode_cache.substituted_routes, cur.decode_cache.dropped_routes);
 
     const auto pct = [](uint64_t part, uint64_t whole) {
@@ -4282,6 +4290,12 @@ void llama_context::print_expert_report() {
     snprintf(buf, sizeof(buf), "  routed    : %" PRIu64 " selections | %" PRIu64 " decode tokens\n",
              tot.routed, cur.decode_tokens);
     out += buf;
+    if (disk_ram && cur.decode_cache.route_routed != cur.routed_experts) {
+        snprintf(buf, sizeof(buf),
+                 "  routes    : routed %" PRIu64 " router, %" PRIu64 " disk\n",
+                 cur.routed_experts, cur.decode_cache.route_routed);
+        out += buf;
+    }
     snprintf(buf, sizeof(buf),
              "  served    : VRAM %.1f%% | RAM %.1f%% | L2 %.1f%% | subst %.1f%% | drop %.1f%% | DISK %.1f%%\n",
              pct(tot.vram, tot.routed), pct(tot.ram, tot.routed), pct(tot.l2, tot.routed),
@@ -4297,7 +4311,9 @@ void llama_context::print_expert_report() {
         moe_cache->print_stats();
     }
     if (hot_experts && cparams.n_pin_hot_experts > 0) {
-        hot_experts->print_stats();
+        // the RAM tier's realized hit rate is the disk stage's, counted at the
+        // read decision. Pass it so the reported rate matches the funnel
+        hot_experts->print_stats(false, tot.ram, tot.routed - tot.vram);
     }
     if (disk_stage) {
         const uint64_t base_l2   = tot.routed - tot.vram - tot.ram;
