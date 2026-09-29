@@ -1626,10 +1626,14 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     const std::string sec_rsub = out.substr(s_rsub);
 
     const size_t s_l = out.size();
-    line("  l2 hit    : %.1f%% of the warm lookups (%" PRIu64 "/%" PRIu64 " this interval)"
-         " | %.1f%% cumulative (%" PRIu64 "/%" PRIu64 ")"
+    // the L2 rate is over the RAM misses it works on, the same base the funnel
+    // uses. The warm-phase rate excludes the lookups served before the pool
+    // warmed, so it is printed apart
+    const uint64_t l2_served = base_l2 > base_sub ? base_l2 - base_sub : 0;
+    line("  l2 hit    : %.1f%% of the base (%" PRIu64 "/%" PRIu64 " cumulative)"
+         " | warm-phase %.1f%% (%" PRIu64 "/%" PRIu64 ")"
          " | %" PRIu64 " lookups skipped while the pool was still cold",
-         d_look ? 100.0 * d_hits / d_look : 0.0, d_hits, d_look,
+         pct(l2_served, base_l2), l2_served, base_l2,
          lookups ? 100.0 * p.n_l2_hits / lookups : 0.0, p.n_l2_hits, lookups, p.n_l2_cold);
 
     line("  l2 served : %s of disk reads avoided this interval (%s of it promoted into a resident slot)"
