@@ -1786,6 +1786,16 @@ std::string server_task_result_metrics::to_metrics() {
                 "Disk read bytes skipped by cache-aware opportunistic dropping",
                 (double) expert.decode_cache.dropped_bytes
             },
+            {
+                "moe_decode_cache_substituted_routes_total",
+                "DIO decode routes served by a nearby resident expert instead of a disk read",
+                (double) expert.decode_cache.substituted_routes
+            },
+            {
+                "moe_decode_cache_substituted_bytes_total",
+                "Disk read bytes skipped by expert substitution",
+                (double) expert.decode_cache.substituted_bytes
+            },
         };
         add_items("counter", expert_counters);
 

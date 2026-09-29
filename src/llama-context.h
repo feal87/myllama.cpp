@@ -66,6 +66,10 @@ struct llama_context {
 
     llama_expert_stats get_expert_stats() const;
 
+    // expert-tier stats report: the totals funnel, then the VRAM, RAM and disk
+    // sections from fastest tier to slowest
+    void print_expert_report();
+
     ggml_backend_sched_t get_sched() const;
 
     uint32_t n_ctx()     const;
@@ -373,6 +377,9 @@ private:
     // n_pin_hot_experts > 0 (0 = ranking-only, e.g. the MoE VRAM tier without
     // pinning). Null when all of them are disabled or a custom cb_eval was given
     std::unique_ptr<llama_hot_expert_cache> hot_experts;
+
+    // report counter for the totals section of the expert-tier report
+    uint64_t n_expert_reports = 0;
 
     // --moe-expert-cache*: GPU-resident cache for host-offloaded MoE experts
     // (null when disabled or when the model has no cacheable layer)

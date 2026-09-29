@@ -2033,15 +2033,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             t_experts_stats_us = now_us;
         } else if (now_us - t_experts_stats_us >= (int64_t) cparams.n_experts_stats_interval * 1000000) {
             t_experts_stats_us = now_us;
-            if (hot_experts && cparams.n_pin_hot_experts > 0) {
-                hot_experts->print_stats();
-            }
-            if (disk_stage) {
-                disk_stage->print_stats(hot_experts ? hot_experts->content_tokens() : 0);
-            }
-            if (moe_cache && moe_cache->is_active()) {
-                moe_cache->print_stats();
-            }
+            print_expert_report();
             model.print_extra_stats();
         }
     }
@@ -4227,6 +4219,91 @@ void llama_context::perf_reset() {
     t_eval_us   = n_eval = 0;
     t_p_eval_us = n_p_eval = 0;
     n_reused    = 0;
+}
+
+namespace {
+
+// One funnel over the expert tiers: every routed selection lands in exactly one
+// bucket, so the shares sum to 100%. `routed` is the canonical total, counted
+// once per selection by the router-observation engine. The disk stage's own
+// routed counter can count a selection more than once (split hot/cold), so its
+// buckets are scaled onto that base before use.
+struct expert_funnel {
+    uint64_t routed = 0;
+    uint64_t vram = 0, ram = 0, l2 = 0, substituted = 0, dropped = 0, read = 0;
+};
+
+expert_funnel expert_funnel_from(uint64_t routed, uint64_t vram, uint64_t disk_routed,
+                                 uint64_t ram, uint64_t l2, uint64_t substituted, uint64_t dropped) {
+    expert_funnel f;
+    f.routed = routed;
+    if (routed == 0) {
+        return f;
+    }
+    const double scale = disk_routed != 0 ? (double) routed / (double) disk_routed : 1.0;
+    f.vram = std::min(vram, routed);
+    uint64_t used = f.vram;
+    const auto take = [&](uint64_t v) -> uint64_t {
+        const uint64_t c = std::min<uint64_t>((uint64_t) ((double) v * scale + 0.5), routed - used);
+        used += c;
+        return c;
+    };
+    f.ram         = take(ram);
+    f.l2          = take(l2);
+    f.substituted = take(substituted);
+    f.dropped     = take(dropped);
+    f.read        = routed - used;
+    return f;
+}
+
+} // namespace
+
+void llama_context::print_expert_report() {
+    const bool any_tier = (hot_experts && cparams.n_pin_hot_experts > 0) ||
+                          disk_stage != nullptr ||
+                          (moe_cache && moe_cache->is_active());
+    if (!any_tier) {
+        return;
+    }
+
+    const llama_expert_stats cur = get_expert_stats();
+
+    const expert_funnel tot = expert_funnel_from(
+            cur.routed_experts, cur.vram_cache.route_hits, cur.decode_cache.route_routed,
+            cur.decode_cache.route_hits, cur.disk_l2.hits,
+            cur.decode_cache.substituted_routes, cur.decode_cache.dropped_routes);
+
+    const auto pct = [](uint64_t part, uint64_t whole) {
+        return whole ? 100.0 * (double) part / (double) whole : 0.0;
+    };
+
+    char buf[512];
+    std::string out = "[expert tiers] totals #";
+    out += std::to_string(n_expert_reports + 1);
+    out += '\n';
+    snprintf(buf, sizeof(buf), "  routed    : %" PRIu64 " selections | %" PRIu64 " decode tokens\n",
+             tot.routed, cur.decode_tokens);
+    out += buf;
+    snprintf(buf, sizeof(buf),
+             "  served    : VRAM %.1f%% | RAM %.1f%% | L2 %.1f%% | subst %.1f%% | drop %.1f%% | DISK %.1f%%\n",
+             pct(tot.vram, tot.routed), pct(tot.ram, tot.routed), pct(tot.l2, tot.routed),
+             pct(tot.substituted, tot.routed), pct(tot.dropped, tot.routed), pct(tot.read, tot.routed));
+    out += buf;
+    LLAMA_LOG_INFO("%s", out.c_str());
+
+    n_expert_reports++;
+
+    // detail sections, fastest tier first: VRAM, RAM, then the disk stage
+    // (its resident decode cache, L2 pool, dropping/substitution and disk I/O)
+    if (moe_cache && moe_cache->is_active()) {
+        moe_cache->print_stats();
+    }
+    if (hot_experts && cparams.n_pin_hot_experts > 0) {
+        hot_experts->print_stats();
+    }
+    if (disk_stage) {
+        disk_stage->print_stats(hot_experts ? hot_experts->content_tokens() : 0);
+    }
 }
 
 llama_expert_stats llama_context::get_expert_stats() const {

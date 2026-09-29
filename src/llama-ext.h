@@ -126,6 +126,10 @@ struct llama_expert_cache_stats {
     // skipped instead of read from disk, and the disk bytes those reads would have cost
     uint64_t dropped_routes   = 0;
     uint64_t dropped_bytes    = 0;
+    // substitution (--disk-stage-drop-substitute-rel/pool): cold routed experts
+    // served by a nearby resident one instead of a disk read
+    uint64_t substituted_routes = 0;
+    uint64_t substituted_bytes  = 0;
 };
 
 struct llama_expert_l2_stats {

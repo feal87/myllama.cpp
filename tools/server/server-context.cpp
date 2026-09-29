@@ -78,6 +78,8 @@ static void accumulate_expert_counters(llama_expert_stats & dst, const llama_exp
     dst.decode_cache.resident_changes  += expert_counter_delta(previous.decode_cache.resident_changes, current.decode_cache.resident_changes);
     dst.decode_cache.dropped_routes    += expert_counter_delta(previous.decode_cache.dropped_routes, current.decode_cache.dropped_routes);
     dst.decode_cache.dropped_bytes     += expert_counter_delta(previous.decode_cache.dropped_bytes, current.decode_cache.dropped_bytes);
+    dst.decode_cache.substituted_routes += expert_counter_delta(previous.decode_cache.substituted_routes, current.decode_cache.substituted_routes);
+    dst.decode_cache.substituted_bytes  += expert_counter_delta(previous.decode_cache.substituted_bytes, current.decode_cache.substituted_bytes);
 
     dst.disk_l2.hits               += expert_counter_delta(previous.disk_l2.hits, current.disk_l2.hits);
     dst.disk_l2.misses             += expert_counter_delta(previous.disk_l2.misses, current.disk_l2.misses);

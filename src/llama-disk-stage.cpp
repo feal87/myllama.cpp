@@ -1123,6 +1123,8 @@ void llama_disk_stage::stats_snapshot(llama_expert_stats & out) const {
     out.decode_cache.resident_changes = p.n_decode_cache_resident_changes;
     out.decode_cache.dropped_routes   = p.n_dropped_routes;
     out.decode_cache.dropped_bytes    = p.n_dropped_bytes;
+    out.decode_cache.substituted_routes = p.n_subst_routes;
+    out.decode_cache.substituted_bytes  = p.n_subst_bytes;
 
     out.disk_l2.enabled = !p.evict_pools.empty();
     out.disk_l2.warm    = p.l2_warm;
