@@ -1364,6 +1364,10 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
         out += '\n';
     };
 
+    // each section is captured where it is emitted and reassembled in tier order
+    // at the end of the function, so the emission code keeps its physical order
+    const std::string sec_hdr = out;
+
     // resident capacity per pool, the transient window every routed non-resident
     // expert is read into, the cache itself and the sets read into it at load
     std::string slots;
@@ -1390,12 +1394,15 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
     }
     const size_t cache_bytes = p.cache_buf ? ggml_backend_buffer_get_size(p.cache_buf) : 0;
 
+    const size_t s_a = out.size();
     line("  layout    : %zu pool(s) over %zu layer(s) | %s resident slots | %d transient per layer"
          " | decode cache %.2f MiB%s | base %zu, warm %zu of %zu loaded | split hot/cold %s",
          p.pools.size(), p.cache.size(), slots.c_str(), p.n_trans, cache_bytes / (1024.0 * 1024.0),
          p.cache_lock ? " RAM-locked" : "", n_base, n_warm_loaded, n_warm,
          p.split_hot_active ? "on" : "off");
+    const std::string sec_a = out.substr(s_a);
 
+    const size_t s_b = out.size();
     line("  fill      : %.2f ms/call over %" PRIu64 " call(s) (%.1f per decode token) | %s read"
          " | %.2f ms/MiB | %.1f ms of reads per decode token | %s over %" PRIu64 " calls since start",
          d_dec_calls ? (double) d_dec_us / 1000.0 / (double) d_dec_calls : 0.0, d_dec_calls,
@@ -1404,7 +1411,9 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
          d_dec_bytes ? (double) d_dec_us / 1000.0 / ((double) d_dec_bytes / (1024.0 * 1024.0)) : 0.0,
          d_tokens ? (double) d_dec_us / 1000.0 / (double) d_tokens : 0.0,
          report_volume(p.n_dec_fill_bytes).c_str(), p.n_dec_fill_calls);
+    const std::string sec_b = out.substr(s_b);
 
+    const size_t s_c = out.size();
     const uint64_t lookups      = p.n_l2_hits + p.n_l2_misses;
     const uint64_t cache_look   = p.n_routed_routes;
     const uint64_t d_look_cache = p.n_routed_routes - p.prev_dec_routed_routes;
@@ -1418,7 +1427,9 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
          d_look_cache ? 100.0 * (double) d_dropped / (double) d_look_cache : 0.0,
          d_look_cache ? 100.0 * (double) d_substituted / (double) d_look_cache : 0.0,
          d_cache_fill, d_cache_chg);
+    const std::string sec_c = out.substr(s_c);
 
+    const size_t s_p = out.size();
     if (p.drop_enabled() && !p.drop_warm) {
         line("  drop      : waiting for the decode cache, %.1f%% full of %d%% before dropping or probing",
              p.resident_fill(), p.drop_min_fill_percent);
@@ -1451,7 +1462,9 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
                  p.n_routed_mass > 0.0 ? 100.0 * p.n_subst_mass / p.n_routed_mass : 0.0);
         }
     }
+    const std::string sec_p = out.substr(s_p);
 
+    const size_t s_r = out.size();
     if (p.drop_probe && p.drop_warm) {
         // cumulative probe: the distribution is what it is over the whole run,
         // not per interval. The quantiles are the inverse of the cold relative
@@ -1553,7 +1566,9 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
                  p.sim_ref_n ? 100.0 * p.sim_ref_loss / (double) p.sim_ref_n : 0.0);
         }
     }
+    const std::string sec_r = out.substr(s_r);
 
+    const size_t s_l = out.size();
     line("  l2 hit    : %.1f%% of the warm lookups (%" PRIu64 "/%" PRIu64 " this interval)"
          " | %.1f%% cumulative (%" PRIu64 "/%" PRIu64 ")"
          " | %" PRIu64 " lookups skipped while the pool was still cold",
@@ -1577,7 +1592,9 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
              d_evict, d_demote, d_filtered, d_look - d_hits, n_entries, n_capacity,
              p.l2_warm ? "" : " | not warm yet");
     }
+    const std::string sec_l = out.substr(s_l);
 
+    const size_t s_d = out.size();
     // split hot/cold: how much of the read the hot pass actually covered. The
     // accumulators exist for the trace, which prints them per token
     if (split.layers > 0 && d_tokens > 0) {
@@ -1588,7 +1605,9 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
              split.read_us > 0 ? 100.0 * (double) split.stall_us / (double) split.read_us : 0.0,
              (double) split.bytes / (1024.0 * 1024.0) / (double) d_tokens, split.layers);
     }
+    const std::string sec_d = out.substr(s_d);
 
+    const size_t s_o = out.size();
     if (!p.evict_pools.empty()) {
         std::string row = "  pools     :";
         for (size_t k = 0; k < p.evict_pools.size(); ++k) {
@@ -1609,6 +1628,11 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
         out += row;
         out += '\n';
     }
+    const std::string sec_o = out.substr(s_o);
+
+    // reassemble fastest tier first: layout, RAM, L2, substitution and dropping,
+    // disk I/O, then the calibration probe
+    out = sec_hdr + sec_a + sec_c + sec_l + sec_o + sec_p + sec_b + sec_d + sec_r;
 
     LLAMA_LOG_INFO("%s", out.c_str());
 
