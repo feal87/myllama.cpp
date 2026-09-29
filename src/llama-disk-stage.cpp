@@ -4384,6 +4384,9 @@ void llama_disk_stage::split_cold_end() {
 void llama_disk_stage::split_token_end() {
 #if defined(_WIN32)
     impl & p = *pimpl;
+    // the graph is over: give the weights intercept another chance, in case the
+    // scores were unreadable on this token and the table fill drove it instead
+    p.drop_active = p.drop_enabled();
     split_cold_end();
     // close the token ceiling budget: keep the worst token share of the interval
     // for the report, then reset for the next token
