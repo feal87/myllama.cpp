@@ -100,7 +100,7 @@ public:
                      int32_t pool_layers_max, const char * base_experts_path,
                      const char * warm_experts_path, const char * base_template_path,
                      bool split_hot, float drop_fraction, float drop_below_rel,
-                     float drop_max_mass_token, float substitute_rel, int32_t substitute_pool,
+                     float drop_max_mass, float drop_max_mass_token, float substitute_rel, int32_t substitute_pool,
                      bool drop_probe);
     ~llama_disk_stage();
 

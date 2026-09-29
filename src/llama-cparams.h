@@ -114,6 +114,10 @@ struct llama_cparams {
     // disk stage: only drop an expert whose score is below this times the
     // layer's highest routed score (--disk-stage-drop-below-rel)
     float   disk_stage_drop_below_rel;
+    // disk stage: hard ceiling on the score mass a single decode layer may
+    // perturb, as a fraction of that layer's routed score mass
+    // (--disk-stage-drop-max-mass, 0 = off)
+    float   disk_stage_drop_max_mass;
     // disk stage: hard ceiling on the score mass a single decode token may
     // perturb, as a fraction of the token's routed score mass
     // (--disk-stage-drop-max-mass-token, 0 = off)

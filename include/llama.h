@@ -527,6 +527,11 @@ extern "C" {
         // renormalized out of the expert weights. 0 = off.
         float disk_stage_drop_fraction;   // cap on the dropped fraction, [0, 1)
         float disk_stage_drop_below_rel;  // relative floor, (0, 1]
+        // hard ceiling on the score mass a single decode layer may perturb
+        // (--disk-stage-drop-max-mass), as a fraction of that layer's routed
+        // score mass. Same drop/substitution accounting as the token cap below,
+        // but applied per layer. 0 = off
+        float disk_stage_drop_max_mass;         // [0, 1]
         // hard ceiling on the score mass a single decode token may perturb
         // (--disk-stage-drop-max-mass-token), as a fraction of the token's
         // routed score mass. A drop contributes its removed score; a

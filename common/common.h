@@ -534,6 +534,10 @@ struct common_params {
     // disk stage: only drop an expert whose score is below this times the layer's
     // highest routed score. See --disk-stage-drop-below-rel.
     float    disk_stage_drop_below_rel = 0.5f;
+    // disk stage: hard ceiling on the score mass a single decode layer may
+    // perturb, as a fraction of that layer's routed score mass (0 = off). See
+    // --disk-stage-drop-max-mass.
+    float    disk_stage_drop_max_mass = 0.0f;
     // disk stage: hard ceiling on the score mass a single decode token may
     // perturb, as a fraction of the token's routed score mass (0 = off). See
     // --disk-stage-drop-max-mass-token.

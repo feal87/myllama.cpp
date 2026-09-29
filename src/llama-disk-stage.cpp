@@ -514,10 +514,10 @@ struct llama_disk_stage::impl {
     // `drop_below_rel` times the layer's highest score. `drop_probe` only measures
     float   drop_fraction  = 0.0f;
     float   drop_below_rel = 0.5f;
-    // hard ceiling on the score mass a single decode token may perturb across
-    // all of its MoE layers, as a fraction of the token's routed score mass
-    // (0 = off). A drop contributes its removed score, a substitution the
-    // absolute score difference
+    // hard ceilings on the combined perturbation (dropped score plus
+    // substitution |c - e|): per layer, as a fraction of the layer's routed
+    // mass, and per token, as a fraction of the token's routed mass (0 = off)
+    float   drop_max_mass = 0.0f;
     float   drop_max_mass_token = 0.0f;
     // substitution: replace a cold routed expert with a nearby resident one
     // instead of reading or dropping it. The spare must score inside
@@ -1423,16 +1423,22 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
     }
 
     if ((p.drop_fraction > 0.0f || p.substitute_enabled()) && p.drop_warm) {
+        char layer_cap[16];
         char tok_cap[16];
+        if (p.drop_max_mass > 0.0f) {
+            snprintf(layer_cap, sizeof(layer_cap), "%.1f%%", 100.0 * (double) p.drop_max_mass);
+        } else {
+            snprintf(layer_cap, sizeof(layer_cap), "off");
+        }
         if (p.drop_max_mass_token > 0.0f) {
             snprintf(tok_cap, sizeof(tok_cap), "%.1f%%", 100.0 * (double) p.drop_max_mass_token);
         } else {
             snprintf(tok_cap, sizeof(tok_cap), "off");
         }
-        line("  drop      : fraction %.3f, below-rel %.2f, token-cap %s | %" PRIu64
+        line("  drop      : fraction %.3f, below-rel %.2f, layer-cap %s, token-cap %s | %" PRIu64
              " dropped, %" PRIu64 " substituted this interval (worst layer perturb %.1f%%, worst token perturb %.1f%%)"
              " | %" PRIu64 " cumulative (%s of disk reads skipped, %.1f%% dropped mass)",
-             (double) p.drop_fraction, (double) p.drop_below_rel, tok_cap, d_dropped, d_substituted,
+             (double) p.drop_fraction, (double) p.drop_below_rel, layer_cap, tok_cap, d_dropped, d_substituted,
              100.0 * p.drop_worst_mass, 100.0 * p.drop_worst_token_mass,
              p.n_dropped_routes, report_volume(p.n_dropped_bytes).c_str(),
              p.n_routed_mass > 0.0 ? 100.0 * p.n_dropped_mass / p.n_routed_mass : 0.0);
@@ -1662,7 +1668,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                    int32_t pool_layers_max, const char * base_experts_path,
                                    const char * warm_experts_path, const char * base_template_path,
                                    bool split_hot, float drop_fraction, float drop_below_rel,
-                                   float drop_max_mass_token, float substitute_rel, int32_t substitute_pool,
+                                   float drop_max_mass, float drop_max_mass_token, float substitute_rel, int32_t substitute_pool,
                                    bool drop_probe) :
     pimpl(std::make_unique<impl>(model)) {
     impl & p = *pimpl;
@@ -1680,6 +1686,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     GGML_UNUSED(split_hot);
     GGML_UNUSED(drop_fraction);
     GGML_UNUSED(drop_below_rel);
+    GGML_UNUSED(drop_max_mass);
     GGML_UNUSED(drop_max_mass_token);
     GGML_UNUSED(substitute_rel);
     GGML_UNUSED(substitute_pool);
@@ -1706,6 +1713,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     }
     p.drop_fraction  = drop_fraction;
     p.drop_below_rel = std::min(std::max(drop_below_rel, 1e-3f), 1.0f);
+    p.drop_max_mass       = std::min(std::max(drop_max_mass, 0.0f), 1.0f);
     p.drop_max_mass_token = std::min(std::max(drop_max_mass_token, 0.0f), 1.0f);
     p.substitute_rel  = std::min(std::max(substitute_rel, 0.0f), 0.999f);
     p.substitute_pool = std::min(std::max(substitute_pool, 0), 64);
@@ -3557,6 +3565,8 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
             subst_used.clear();
             double layer_subst_mass = 0.0;
             if (p.substitute_enabled() && !sppool.empty()) {
+                const bool   layer_cap    = p.drop_max_mass > 0.0f;
+                const double layer_budget = (double) p.drop_max_mass * layer_mass;
                 const bool   token_cap    = p.drop_max_mass_token > 0.0f;
                 const double token_budget = (double) p.drop_max_mass_token * (p.tok_routed_mass + layer_mass);
                 int64_t top_pos = 0;
@@ -3611,6 +3621,9 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                     }
                     const float  e       = sppool[(size_t) best].first;
                     const double perturb = std::fabs((double) cs - (double) e);
+                    if (layer_cap && layer_subst_mass + perturb > layer_budget) {
+                        continue;
+                    }
                     if (token_cap && p.tok_dropped_mass + layer_subst_mass + perturb > token_budget) {
                         continue;
                     }
@@ -3643,10 +3656,15 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                 std::sort(cold.begin(), cold.end(), [probs](int64_t a, int64_t b) {
                     return probs[a] < probs[b];
                 });
+                const bool   layer_cap    = p.drop_max_mass > 0.0f;
+                const double layer_budget = (double) p.drop_max_mass * layer_mass;
                 const bool   token_cap    = p.drop_max_mass_token > 0.0f;
                 const double token_budget = (double) p.drop_max_mass_token * (p.tok_routed_mass + layer_mass);
                 for (int32_t k = 0; k < budget; ++k) {
                     const double w = (double) probs[cold[(size_t) k]];
+                    if (layer_cap && layer_subst_mass + dropped_mass + w > layer_budget) {
+                        break;
+                    }
                     if (token_cap && p.tok_dropped_mass + layer_subst_mass + dropped_mass + w > token_budget) {
                         break;
                     }

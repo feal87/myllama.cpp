@@ -3091,6 +3091,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--disk-stage-drop-max-mass"}, "M",
+        string_format(
+            "with --disk-stage-drop-fraction or substitution, hard ceiling on\n"
+            "the score mass a single-token decode layer may perturb, as a\n"
+            "fraction of that layer's routed score mass. Same accounting as\n"
+            "--disk-stage-drop-max-mass-token, but per layer instead of per\n"
+            "token: a drop contributes the score it removes, a substitution the\n"
+            "absolute score difference. When both ceilings are set both apply.\n"
+            "0 disables the ceiling (default: %.2f)",
+            (double) params.disk_stage_drop_max_mass
+        ),
+        [](common_params & params, const std::string & value) {
+            const float v = std::stof(value);
+            if (v < 0.0f || v > 1.0f) {
+                throw std::invalid_argument("error: --disk-stage-drop-max-mass must be in [0, 1]");
+            }
+            params.disk_stage_drop_max_mass = v;
+        }
+    ));
+    add_opt(common_arg(
         {"--disk-stage-drop-max-mass-token"}, "T",
         string_format(
             "with --disk-stage-drop-fraction or substitution, hard ceiling on\n"
