@@ -262,6 +262,10 @@ public:
     // transient window, RAM-locked size), for the RAM tier report
     std::string ram_layout() const;
 
+    // calibration dump at shutdown: the cumulative probe and substitution
+    // simulation tables, printed once instead of every interval
+    void print_calibration();
+
     // true when decode is served by the internal scheduler hook instead of the
     // mid-graph eval callback (the decode cache maps each layer's expert ids)
     bool internal_decode_fill() const;

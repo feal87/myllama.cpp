@@ -1370,8 +1370,6 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     }
 
     // interval deltas against the previous report
-    const uint64_t d_hits       = p.n_l2_hits - p.prev_l2_hits;
-    const uint64_t d_look       = d_hits + (p.n_l2_misses - p.prev_l2_misses);
     const uint64_t d_evict      = p.n_l2_evictions - p.prev_l2_evictions;
     const uint64_t d_demote     = p.n_l2_demotions - p.prev_l2_demotions;
     const uint64_t d_filtered   = p.n_l2_filtered - p.prev_l2_filtered;
@@ -1444,13 +1442,11 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     const uint64_t lookups = p.n_l2_hits + p.n_l2_misses;
 
     const size_t s_b = out.size();
-    line("  fill      : %.2f ms/call over %" PRIu64 " call(s) (%.1f per decode token) | %s read"
-         " | %.2f ms/MiB | %.1f ms of reads per decode token | %s over %" PRIu64 " calls since start",
-         d_dec_calls ? (double) d_dec_us / 1000.0 / (double) d_dec_calls : 0.0, d_dec_calls,
-         d_tokens ? (double) d_dec_calls / (double) d_tokens : 0.0,
-         report_volume(d_dec_bytes).c_str(),
-         d_dec_bytes ? (double) d_dec_us / 1000.0 / ((double) d_dec_bytes / (1024.0 * 1024.0)) : 0.0,
+    line("  fill      : %.2f ms/call, %.1f ms/token | %s read, %" PRIu64 " calls",
+         d_dec_calls ? (double) d_dec_us / 1000.0 / (double) d_dec_calls : 0.0,
          d_tokens ? (double) d_dec_us / 1000.0 / (double) d_tokens : 0.0,
+         report_volume(d_dec_bytes).c_str(), d_dec_calls);
+    line("  fill total: %s over %" PRIu64 " calls",
          report_volume(p.n_dec_fill_bytes).c_str(), p.n_dec_fill_calls);
     const std::string sec_b = out.substr(s_b);
 
@@ -1495,64 +1491,186 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     }
     const std::string sec_drop = out.substr(s_drop);
 
+    const size_t s_l = out.size();
+    // the L2 rate is over the RAM misses it works on, the same base the funnel
+    // uses. The warm-phase rate excludes the lookups served before the pool
+    // warmed, so it is printed apart
+    const uint64_t l2_served = base_l2 > base_sub ? base_l2 - base_sub : 0;
+    line("  l2 hit    : %.1f%% of the base (%" PRIu64 "/%" PRIu64 ") | warm-phase %.1f%% | %" PRIu64 " skipped cold",
+         pct(l2_served, base_l2), l2_served, base_l2,
+         lookups ? 100.0 * p.n_l2_hits / lookups : 0.0, p.n_l2_cold);
+
+    line("  l2 served : %s avoided this interval (%s promoted) | %s total",
+         report_volume(d_hit_bytes + d_promo).c_str(), report_volume(d_promo).c_str(),
+         report_volume(p.n_l2_hit_bytes + p.n_l2_promo_bytes).c_str());
+
+    if (!p.evict_pools.empty()) {
+        size_t n_entries  = 0;
+        size_t n_capacity = 0;
+        for (const auto & ep : p.evict_pools) {
+            n_entries  += ep.slot_of.size();
+            n_capacity += (size_t) ep.cap;
+        }
+        line("  l2 policy : %" PRIu64 " evictions, %" PRIu64 " demotions, %" PRIu64 " ghost rejects | %zu/%zu entries live%s",
+             d_evict, d_demote, d_filtered, n_entries, n_capacity,
+             p.l2_warm ? "" : " | not warm yet");
+    }
+    const std::string sec_l = out.substr(s_l);
+
+    const size_t s_d = out.size();
+    // split hot/cold: how much of the read the hot pass actually covered. The
+    // accumulators exist for the trace, which prints them per token
+    if (split.layers > 0 && d_tokens > 0) {
+        line("  split     : %.2f ms of read per decode token, %.0f%% hidden behind the hot pass,"
+             " %.0f%% still outstanding at the cold pass | %.2f MiB per token over %d layer split(s)",
+             (double) split.read_us / 1000.0 / (double) d_tokens,
+             split.read_us > 0 ? 100.0 * (double) split.ovl_us / (double) split.read_us : 0.0,
+             split.read_us > 0 ? 100.0 * (double) split.stall_us / (double) split.read_us : 0.0,
+             (double) split.bytes / (1024.0 * 1024.0) / (double) d_tokens, split.layers);
+    }
+    const std::string sec_d = out.substr(s_d);
+
+    const size_t s_o = out.size();
+    if (!p.evict_pools.empty()) {
+        std::string row = "  pools     :";
+        for (size_t k = 0; k < p.evict_pools.size(); ++k) {
+            const impl::evict_pool & ep = p.evict_pools[k];
+            const uint64_t look = ep.hits + ep.misses;
+            snprintf(buf, sizeof(buf), " pool %zu: %zu/%d live, hit %.1f%% (%" PRIu64 "/%" PRIu64
+                     " warm), evictions %" PRIu64, k, ep.slot_of.size(), ep.cap,
+                     look ? 100.0 * (double) ep.hits / (double) look : 0.0, ep.hits, look, ep.evictions);
+            row += buf;
+            // wrap after appending: checking first lets the last entry push the
+            // row well past the width
+            if (row.size() > 110 && k + 1 < p.evict_pools.size()) {
+                out += row;
+                out += '\n';
+                row = "            ";
+            }
+        }
+        out += row;
+        out += '\n';
+    }
+    const std::string sec_o = out.substr(s_o);
+
+    // four blocks, fastest tier first. The substitution and dropping blocks only
+    // appear when their lever is on
+    const std::string rno = " report #" + std::to_string(p.n_reports + 1) + "\n";
+
+    LLAMA_LOG_INFO("%s", ("[l2-cache]" + rno + sec_base_l2 + sec_l + sec_o).c_str());
+
+    if (p.substitute_enabled()) {
+        LLAMA_LOG_INFO("%s", ("[substitution]" + rno + sec_base_sub + sec_wait + sec_sub).c_str());
+    }
+    if (p.drop_fraction > 0.0f || p.drop_probe) {
+        std::string body = sec_base_drop + sec_drop;
+        if (!p.substitute_enabled()) {
+            body = sec_wait + body;
+        }
+        LLAMA_LOG_INFO("%s", ("[drop]" + rno + body).c_str());
+    }
+
+    LLAMA_LOG_INFO("%s", ("[disk]" + rno + sec_base_disk + sec_sets + sec_b + sec_d).c_str());
+
+    p.prev_l2_hits           = p.n_l2_hits;
+    p.prev_l2_misses         = p.n_l2_misses;
+    p.prev_l2_cold           = p.n_l2_cold;
+    p.prev_l2_evictions      = p.n_l2_evictions;
+    p.prev_l2_demotions      = p.n_l2_demotions;
+    p.prev_l2_hit_bytes      = p.n_l2_hit_bytes;
+    p.prev_l2_promo_bytes    = p.n_l2_promo_bytes;
+    p.prev_l2_filtered       = p.n_l2_filtered;
+    p.prev_dec_fill_us       = p.n_dec_fill_us;
+    p.prev_dec_fill_calls    = p.n_dec_fill_calls;
+    p.prev_dec_fill_bytes    = p.n_dec_fill_bytes;
+    p.prev_dec_cache_hits    = p.n_decode_cache_hits;
+    p.prev_dec_cache_misses  = p.n_decode_cache_misses;
+    p.prev_dec_routed_routes = p.n_routed_routes;
+    p.prev_dec_cache_fills   = p.n_decode_cache_fills;
+    p.prev_dec_cache_changes = p.n_decode_cache_resident_changes;
+    p.prev_dec_dropped       = p.n_dropped_routes;
+    p.prev_dec_substituted   = p.n_subst_routes;
+    p.prev_dec_routed_mass   = p.n_routed_mass;
+    p.prev_dec_dropped_mass  = p.n_dropped_mass;
+    p.drop_worst_mass        = 0.0;
+    p.drop_worst_token_mass  = 0.0;
+    p.prev_dec_tokens        = decode_tokens;
+    p.prev_split_tot         = p.split_tot;
+    p.n_reports++;
+}
+
+// calibration dump: the cumulative probe and substitution simulation tables are
+// for tuning, so they are printed once at shutdown instead of every interval
+void llama_disk_stage::print_calibration() {
+#if defined(_WIN32)
+    impl & p = *pimpl;
+
+    if (!p.active || !p.drop_probe || !p.drop_warm) {
+        return;
+    }
+
+    std::string out;
+    char buf[1024];
+    auto line = [&out, &buf](const char * fmt, auto... args) {
+        const int n_chars = snprintf(buf, sizeof(buf), fmt, args...);
+        if (n_chars > 0) {
+            out.append(buf, (size_t) std::min((size_t) n_chars, sizeof(buf) - 1));
+        }
+        out += '\n';
+    };
     char cell[32];
 
-    const size_t s_rdrop = out.size();
-    if (p.drop_probe && p.drop_warm) {
-        // cumulative probe: the distribution is what it is over the whole run,
-        // not per interval. The quantiles are the inverse of the cold relative
-        // cumulative, so a target drop share picks the floor directly
-        const uint64_t calls = p.probe_calls;
-        const auto hist_at = [&p, calls](double f) -> uint64_t {
-            if (calls == 0) {
-                return 0;
-            }
-            const uint64_t target = (uint64_t) (f * (double) calls);
-            uint64_t acc = 0;
-            for (uint64_t c = 0; c <= 32; ++c) {
-                acc += p.probe_cold_hist[c];
-                if (acc >= target) {
-                    return c;
-                }
-            }
-            return 32;
-        };
-        const uint64_t cold         = p.probe_cold_n;
-        const uint64_t rel_n        = p.probe_rel_n;
-        const uint64_t probe_routed = p.probe_routed;
-        line("  drop probe: %" PRIu64 " routed, %" PRIu64 " cold (%.1f%% of selections, %.1f%% of score mass)"
-             " | cold/layer p50=%" PRIu64 " p90=%" PRIu64 " p99=%" PRIu64 " max=%" PRIu64,
-             probe_routed, cold,
-             probe_routed ? 100.0 * (double) cold / (double) probe_routed : 0.0,
-             p.n_routed_mass > 0.0 ? 100.0 * p.n_cold_mass / p.n_routed_mass : 0.0,
-             hist_at(0.50), hist_at(0.90), hist_at(0.99), p.probe_cold_max);
-        line("  cold rel  : q10=%.2f q25=%.2f q50=%.2f q75=%.2f q90=%.2f q95=%.2f q99=%.2f (score / layer max)",
-             (double) p.probe_rel_quantile(0.10f), (double) p.probe_rel_quantile(0.25f),
-             (double) p.probe_rel_quantile(0.50f), (double) p.probe_rel_quantile(0.75f),
-             (double) p.probe_rel_quantile(0.90f), (double) p.probe_rel_quantile(0.95f),
-             (double) p.probe_rel_quantile(0.99f));
-        static const float curve[] = { 0.10f, 0.20f, 0.30f, 0.40f, 0.50f, 0.60f, 0.70f, 0.80f, 0.90f };
-        std::string row_a = "  drop curve:  A     ";
-        std::string row_n = "               cold% ";
-        std::string row_m = "               mass% ";
-        for (const float a : curve) {
-            snprintf(cell, sizeof(cell), "%5.2f ", (double) a);
-            row_a += cell;
-            snprintf(cell, sizeof(cell), "%5.1f ",
-                     rel_n ? 100.0 * (double) p.probe_rel_below(a) / (double) rel_n : 0.0);
-            row_n += cell;
-            snprintf(cell, sizeof(cell), "%5.1f ",
-                     p.n_routed_mass > 0.0 ? 100.0 * p.probe_rel_mass_below(a) / p.n_routed_mass : 0.0);
-            row_m += cell;
+    // cumulative probe: the distribution is what it is over the whole run, not
+    // per interval. The quantiles are the inverse of the cold relative
+    // cumulative, so a target drop share picks the floor directly
+    const uint64_t calls = p.probe_calls;
+    const auto hist_at = [&p, calls](double f) -> uint64_t {
+        if (calls == 0) {
+            return 0;
         }
-        out += row_a + "\n";
-        out += row_n + "\n";
-        out += row_m + "\n";
+        const uint64_t target = (uint64_t) (f * (double) calls);
+        uint64_t acc = 0;
+        for (uint64_t c = 0; c <= 32; ++c) {
+            acc += p.probe_cold_hist[c];
+            if (acc >= target) {
+                return c;
+            }
+        }
+        return 32;
+    };
+    const uint64_t cold         = p.probe_cold_n;
+    const uint64_t rel_n        = p.probe_rel_n;
+    const uint64_t probe_routed = p.probe_routed;
+    line("  drop probe: %" PRIu64 " routed, %" PRIu64 " cold (%.1f%% of selections, %.1f%% of score mass)"
+         " | cold/layer p50=%" PRIu64 " p90=%" PRIu64 " p99=%" PRIu64 " max=%" PRIu64,
+         probe_routed, cold,
+         probe_routed ? 100.0 * (double) cold / (double) probe_routed : 0.0,
+         p.n_routed_mass > 0.0 ? 100.0 * p.n_cold_mass / p.n_routed_mass : 0.0,
+         hist_at(0.50), hist_at(0.90), hist_at(0.99), p.probe_cold_max);
+    line("  cold rel  : q10=%.2f q25=%.2f q50=%.2f q75=%.2f q90=%.2f q95=%.2f q99=%.2f (score / layer max)",
+         (double) p.probe_rel_quantile(0.10f), (double) p.probe_rel_quantile(0.25f),
+         (double) p.probe_rel_quantile(0.50f), (double) p.probe_rel_quantile(0.75f),
+         (double) p.probe_rel_quantile(0.90f), (double) p.probe_rel_quantile(0.95f),
+         (double) p.probe_rel_quantile(0.99f));
+    static const float curve[] = { 0.10f, 0.20f, 0.30f, 0.40f, 0.50f, 0.60f, 0.70f, 0.80f, 0.90f };
+    std::string row_a = "  drop curve:  A     ";
+    std::string row_n = "               cold% ";
+    std::string row_m = "               mass% ";
+    for (const float a : curve) {
+        snprintf(cell, sizeof(cell), "%5.2f ", (double) a);
+        row_a += cell;
+        snprintf(cell, sizeof(cell), "%5.1f ",
+                 rel_n ? 100.0 * (double) p.probe_rel_below(a) / (double) rel_n : 0.0);
+        row_n += cell;
+        snprintf(cell, sizeof(cell), "%5.1f ",
+                 p.n_routed_mass > 0.0 ? 100.0 * p.probe_rel_mass_below(a) / p.n_routed_mass : 0.0);
+        row_m += cell;
     }
-    const std::string sec_rdrop = out.substr(s_rdrop);
+    out += row_a + "\n";
+    out += row_n + "\n";
+    out += row_m + "\n";
 
-    const size_t s_rsub = out.size();
-    if (p.drop_probe && p.drop_warm && p.sim_cold > 0) {
+    if (p.sim_cold > 0) {
         static const int   sim_p[impl::sim_n_p] = { 2, 4, 8 };
         static const float sim_s[impl::sim_n_s] = { 0.50f, 0.70f, 0.80f, 0.90f, 0.95f };
         std::string row_s = "  subst sim :   S    ";
@@ -1601,118 +1719,12 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
              p.sim_ref_n ? med_pct : 0.0,
              p.sim_ref_n ? 100.0 * p.sim_ref_loss / (double) p.sim_ref_n : 0.0);
     }
-    const std::string sec_rsub = out.substr(s_rsub);
 
-    const size_t s_l = out.size();
-    // the L2 rate is over the RAM misses it works on, the same base the funnel
-    // uses. The warm-phase rate excludes the lookups served before the pool
-    // warmed, so it is printed apart
-    const uint64_t l2_served = base_l2 > base_sub ? base_l2 - base_sub : 0;
-    line("  l2 hit    : %.1f%% of the base (%" PRIu64 "/%" PRIu64 " cumulative)"
-         " | warm-phase %.1f%% (%" PRIu64 "/%" PRIu64 ")"
-         " | %" PRIu64 " lookups skipped while the pool was still cold",
-         pct(l2_served, base_l2), l2_served, base_l2,
-         lookups ? 100.0 * p.n_l2_hits / lookups : 0.0, p.n_l2_hits, lookups, p.n_l2_cold);
-
-    line("  l2 served : %s of disk reads avoided this interval (%s of it promoted into a resident slot)"
-         " | %s cumulative (%s promoted)",
-         report_volume(d_hit_bytes + d_promo).c_str(), report_volume(d_promo).c_str(),
-         report_volume(p.n_l2_hit_bytes + p.n_l2_promo_bytes).c_str(), report_volume(p.n_l2_promo_bytes).c_str());
-
-    if (!p.evict_pools.empty()) {
-        size_t n_entries  = 0;
-        size_t n_capacity = 0;
-        for (const auto & ep : p.evict_pools) {
-            n_entries  += ep.slot_of.size();
-            n_capacity += (size_t) ep.cap;
-        }
-        line("  l2 policy : %" PRIu64 " evictions, %" PRIu64 " demotions, %" PRIu64 " of %" PRIu64
-             " misses turned away by the ghost this interval | %zu/%zu entries live%s",
-             d_evict, d_demote, d_filtered, d_look - d_hits, n_entries, n_capacity,
-             p.l2_warm ? "" : " | not warm yet");
+    if (out.empty()) {
+        return;
     }
-    const std::string sec_l = out.substr(s_l);
-
-    const size_t s_d = out.size();
-    // split hot/cold: how much of the read the hot pass actually covered. The
-    // accumulators exist for the trace, which prints them per token
-    if (split.layers > 0 && d_tokens > 0) {
-        line("  split     : %.2f ms of read per decode token, %.0f%% hidden behind the hot pass,"
-             " %.0f%% still outstanding at the cold pass | %.2f MiB per token over %d layer split(s)",
-             (double) split.read_us / 1000.0 / (double) d_tokens,
-             split.read_us > 0 ? 100.0 * (double) split.ovl_us / (double) split.read_us : 0.0,
-             split.read_us > 0 ? 100.0 * (double) split.stall_us / (double) split.read_us : 0.0,
-             (double) split.bytes / (1024.0 * 1024.0) / (double) d_tokens, split.layers);
-    }
-    const std::string sec_d = out.substr(s_d);
-
-    const size_t s_o = out.size();
-    if (!p.evict_pools.empty()) {
-        std::string row = "  pools     :";
-        for (size_t k = 0; k < p.evict_pools.size(); ++k) {
-            const impl::evict_pool & ep = p.evict_pools[k];
-            const uint64_t look = ep.hits + ep.misses;
-            snprintf(buf, sizeof(buf), " pool %zu: %zu/%d live, hit %.1f%% (%" PRIu64 "/%" PRIu64
-                     " warm), evictions %" PRIu64, k, ep.slot_of.size(), ep.cap,
-                     look ? 100.0 * (double) ep.hits / (double) look : 0.0, ep.hits, look, ep.evictions);
-            row += buf;
-            // wrap after appending: checking first lets the last entry push the
-            // row well past the width
-            if (row.size() > 110 && k + 1 < p.evict_pools.size()) {
-                out += row;
-                out += '\n';
-                row = "            ";
-            }
-        }
-        out += row;
-        out += '\n';
-    }
-    const std::string sec_o = out.substr(s_o);
-
-    // four blocks, fastest tier first. The substitution and dropping blocks only
-    // appear when their lever is on
-    const std::string rno = " report #" + std::to_string(p.n_reports + 1) + "\n";
-
-    LLAMA_LOG_INFO("%s", ("[l2-cache]" + rno + sec_base_l2 + sec_l + sec_o).c_str());
-
-    if (p.substitute_enabled()) {
-        LLAMA_LOG_INFO("%s", ("[substitution]" + rno + sec_base_sub + sec_wait + sec_sub + sec_rsub).c_str());
-    }
-    if (p.drop_fraction > 0.0f || p.drop_probe) {
-        std::string body = sec_base_drop + sec_drop + sec_rdrop;
-        if (!p.substitute_enabled()) {
-            body = sec_wait + body;
-        }
-        LLAMA_LOG_INFO("%s", ("[drop]" + rno + body).c_str());
-    }
-
-    LLAMA_LOG_INFO("%s", ("[disk]" + rno + sec_base_disk + sec_sets + sec_b + sec_d).c_str());
-
-    p.prev_l2_hits           = p.n_l2_hits;
-    p.prev_l2_misses         = p.n_l2_misses;
-    p.prev_l2_cold           = p.n_l2_cold;
-    p.prev_l2_evictions      = p.n_l2_evictions;
-    p.prev_l2_demotions      = p.n_l2_demotions;
-    p.prev_l2_hit_bytes      = p.n_l2_hit_bytes;
-    p.prev_l2_promo_bytes    = p.n_l2_promo_bytes;
-    p.prev_l2_filtered       = p.n_l2_filtered;
-    p.prev_dec_fill_us       = p.n_dec_fill_us;
-    p.prev_dec_fill_calls    = p.n_dec_fill_calls;
-    p.prev_dec_fill_bytes    = p.n_dec_fill_bytes;
-    p.prev_dec_cache_hits    = p.n_decode_cache_hits;
-    p.prev_dec_cache_misses  = p.n_decode_cache_misses;
-    p.prev_dec_routed_routes = p.n_routed_routes;
-    p.prev_dec_cache_fills   = p.n_decode_cache_fills;
-    p.prev_dec_cache_changes = p.n_decode_cache_resident_changes;
-    p.prev_dec_dropped       = p.n_dropped_routes;
-    p.prev_dec_substituted   = p.n_subst_routes;
-    p.prev_dec_routed_mass   = p.n_routed_mass;
-    p.prev_dec_dropped_mass  = p.n_dropped_mass;
-    p.drop_worst_mass        = 0.0;
-    p.drop_worst_token_mass  = 0.0;
-    p.prev_dec_tokens        = decode_tokens;
-    p.prev_split_tot         = p.split_tot;
-    p.n_reports++;
+    LLAMA_LOG_INFO("%s", ("[calibration] final\n" + out).c_str());
+#endif
 }
 
 const llama_disk_stage_layer * llama_disk_stage::layer(int il) const {
@@ -2984,6 +2996,7 @@ void llama_disk_stage::preload_warm() {
 llama_disk_stage::~llama_disk_stage() {
 #if defined(_WIN32)
     if (pimpl) {
+        print_calibration();
         {
             std::lock_guard<std::mutex> lk(pimpl->pipe_mu);
             pimpl->pipe_stop = true;
