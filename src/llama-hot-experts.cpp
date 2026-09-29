@@ -1758,7 +1758,6 @@ void llama_hot_expert_cache::decay_counts() {
     rebuild_pinned_rank();
 
     n_decays++;
-    n_decays_prompt++;
 }
 
 // JSON string escaper for the profile writer. Byte tokens detokenize to valid
