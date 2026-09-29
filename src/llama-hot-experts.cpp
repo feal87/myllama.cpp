@@ -337,6 +337,13 @@ void llama_hot_expert_cache::print_stats(bool final_report) {
          bytes_locked / mib, budget_bytes / mib,
          budget_bytes ? 100.0 * bytes_locked / (double) budget_bytes : 0.0, n_reserved / mib);
 
+    if (disk_stage != nullptr) {
+        const std::string lay = disk_stage->ram_layout();
+        if (!lay.empty()) {
+            line("  layout   : %s", lay.c_str());
+        }
+    }
+
     if (n_pin > 0 && disk_stage == nullptr) {
         line("  locks    : %" PRIu64 " calls, %" PRIu64 " slow (over %" PRId64 " us), %" PRIu64 " failed",
              lock_calls, lock_slow, lock_slow_us, pin_failures);

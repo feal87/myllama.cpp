@@ -413,6 +413,12 @@ struct llama_disk_stage::impl {
     // every routed selection, the denominator the cache hit rate is reported
     // against: hits, misses, drops and substitutions all count
     uint64_t n_routed_routes                = 0;
+    // diagnostic: fill_cache_plan calls and the routed ids they processed, to
+    // reconcile the routed denominator with the router observation
+    uint64_t n_fill_plans                   = 0;
+    uint64_t n_fill_plan_ids                = 0;
+    uint64_t n_fill_weights                 = 0;
+    uint64_t n_fill_table                   = 0;
     uint64_t n_decode_cache_fills           = 0;
     uint64_t n_decode_cache_resident_changes = 0;
     // cache-aware opportunistic dropping: routed experts skipped instead of read
@@ -1220,6 +1226,7 @@ void llama_disk_stage::node_prepare_callback(struct ggml_tensor * node, void * u
                             t_ids->data != nullptr && t_ids->nb[0] == sizeof(int32_t) &&
                             t_ids->ne[1] == 1 && t_ids->ne[0] > 0;
                     if (ids_host && il >= 0 && il < (int) p.cache.size()) {
+                        p.n_fill_weights++;
                         if (p.split_hot_active) {
                             self->fill_cache_begin(il, (const int32_t *) t_ids->data, t_ids->ne[0], nullptr);
                         } else {
@@ -1255,6 +1262,7 @@ void llama_disk_stage::node_prepare_callback(struct ggml_tensor * node, void * u
             } else {
                 p.fs_n_all = 0;
             }
+            p.n_fill_weights++;
             if (p.split_hot_active) {
                 self->fill_cache_begin(il, idp, n_used, p.fs_probs.data());
             } else {
@@ -1296,6 +1304,7 @@ void llama_disk_stage::node_prepare_callback(struct ggml_tensor * node, void * u
         return;
     }
 
+    p.n_fill_table++;
     if (p.split_hot_active) {
         self->fill_cache_begin(it->second, (const int32_t *) t->data, n_used);
     } else {
@@ -1320,7 +1329,35 @@ static std::string report_volume(uint64_t n_bytes) {
     return buf;
 }
 
-void llama_disk_stage::print_stats(uint64_t decode_tokens) {
+std::string llama_disk_stage::ram_layout() const {
+    impl & p = *pimpl;
+
+    if (!p.active) {
+        return std::string();
+    }
+
+    std::string slots;
+    for (size_t k = 0; k < p.pools.size(); ++k) {
+        if (k > 0) {
+            slots += " + ";
+        }
+        slots += std::to_string(p.pools[k].res_cap);
+    }
+    if (p.pools.size() > 1) {
+        slots = "(" + slots + ")";
+    }
+    const size_t cache_bytes = p.cache_buf ? ggml_backend_buffer_get_size(p.cache_buf) : 0;
+
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%zu pool(s) over %zu layer(s) | %s resident slots | %d transient per layer"
+             " | decode cache %.2f MiB%s",
+             p.pools.size(), p.cache.size(), slots.c_str(), p.n_trans,
+             cache_bytes / (1024.0 * 1024.0), p.cache_lock ? " RAM-locked" : "");
+    return buf;
+}
+
+void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint64_t base_l2,
+                                   uint64_t base_sub, uint64_t base_drop, uint64_t base_disk) {
     impl & p = *pimpl;
 
     if (!p.active) {
@@ -1338,9 +1375,6 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
     const uint64_t d_dec_us     = p.n_dec_fill_us - p.prev_dec_fill_us;
     const uint64_t d_dec_calls  = p.n_dec_fill_calls - p.prev_dec_fill_calls;
     const uint64_t d_dec_bytes  = p.n_dec_fill_bytes - p.prev_dec_fill_bytes;
-    const uint64_t d_cache_hit  = p.n_decode_cache_hits - p.prev_dec_cache_hits;
-    const uint64_t d_cache_fill = p.n_decode_cache_fills - p.prev_dec_cache_fills;
-    const uint64_t d_cache_chg  = p.n_decode_cache_resident_changes - p.prev_dec_cache_changes;
     const uint64_t d_dropped    = p.n_dropped_routes - p.prev_dec_dropped;
     const uint64_t d_substituted = p.n_subst_routes - p.prev_dec_substituted;
     const double   d_routed_mass  = p.n_routed_mass - p.prev_dec_routed_mass;
@@ -1348,13 +1382,9 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
     const uint64_t d_tokens     = decode_tokens > p.prev_dec_tokens ? decode_tokens - p.prev_dec_tokens : 0;
     const impl::split_acc split = p.split_tot - p.prev_split_tot;
 
-    // one themed line each, emitted as a single write: the report used to be four
-    // writes, with the cumulative and the interval value of the same number on
-    // separate lines
-    std::string out = "[disk-stage] report #";
-    out += std::to_string(p.n_reports + 1);
-    out += "\n";
-
+    // one themed line each. The report is split in four blocks (L2, substitution,
+    // dropping, disk) and each block is emitted in one write
+    std::string out;
     char buf[1024];
     auto line = [&out, &buf](const char * fmt, auto... args) {
         const int n_chars = snprintf(buf, sizeof(buf), fmt, args...);
@@ -1363,23 +1393,32 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
         }
         out += '\n';
     };
+    const auto pct = [](uint64_t part, uint64_t whole) {
+        return whole ? 100.0 * (double) part / (double) whole : 0.0;
+    };
 
-    // each section is captured where it is emitted and reassembled in tier order
-    // at the end of the function, so the emission code keeps its physical order
-    const std::string sec_hdr = out;
+    // every block leads with the selections the previous tier passed down
+    const size_t s_bl2 = out.size();
+    line("  base      : %" PRIu64 " RAM misses (%.1f%% of %" PRIu64 " routed)",
+         base_l2, pct(base_l2, routed), routed);
+    const std::string sec_base_l2 = out.substr(s_bl2);
 
-    // resident capacity per pool, the transient window every routed non-resident
-    // expert is read into, the cache itself and the sets read into it at load
-    std::string slots;
-    for (size_t k = 0; k < p.pools.size(); ++k) {
-        if (k > 0) {
-            slots += " + ";
-        }
-        slots += std::to_string(p.pools[k].res_cap);
-    }
-    if (p.pools.size() > 1) {
-        slots = "(" + slots + ")";
-    }
+    const size_t s_bsub = out.size();
+    line("  base      : %" PRIu64 " L2 misses (%.1f%% of %" PRIu64 " routed)",
+         base_sub, pct(base_sub, routed), routed);
+    const std::string sec_base_sub = out.substr(s_bsub);
+
+    const size_t s_bdrop = out.size();
+    line("  base      : %" PRIu64 " after substitution (%.1f%% of %" PRIu64 " routed)",
+         base_drop, pct(base_drop, routed), routed);
+    const std::string sec_base_drop = out.substr(s_bdrop);
+
+    const size_t s_bdisk = out.size();
+    line("  base      : %" PRIu64 " reads (%.1f%% of %" PRIu64 " routed)",
+         base_disk, pct(base_disk, routed), routed);
+    const std::string sec_base_disk = out.substr(s_bdisk);
+
+    // the sets read into the decode cache at load and the graph split state
     size_t n_base = 0;
     size_t n_warm = 0;
     size_t n_warm_loaded = 0;
@@ -1392,50 +1431,46 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
     for (const auto & v : p.warm_loaded) {
         n_warm_loaded += v.size();
     }
-    const size_t cache_bytes = p.cache_buf ? ggml_backend_buffer_get_size(p.cache_buf) : 0;
+    const size_t s_sets = out.size();
+    line("  sets      : base %zu, warm %zu of %zu loaded | split hot/cold %s",
+         n_base, n_warm_loaded, n_warm, p.split_hot_active ? "on" : "off");
+    const std::string sec_sets = out.substr(s_sets);
 
-    const size_t s_a = out.size();
-    line("  layout    : %zu pool(s) over %zu layer(s) | %s resident slots | %d transient per layer"
-         " | decode cache %.2f MiB%s | base %zu, warm %zu of %zu loaded | split hot/cold %s",
-         p.pools.size(), p.cache.size(), slots.c_str(), p.n_trans, cache_bytes / (1024.0 * 1024.0),
-         p.cache_lock ? " RAM-locked" : "", n_base, n_warm_loaded, n_warm,
-         p.split_hot_active ? "on" : "off");
-    const std::string sec_a = out.substr(s_a);
+    const uint64_t lookups = p.n_l2_hits + p.n_l2_misses;
 
     const size_t s_b = out.size();
     line("  fill      : %.2f ms/call over %" PRIu64 " call(s) (%.1f per decode token) | %s read"
-         " | %.2f ms/MiB | %.1f ms of reads per decode token | %s over %" PRIu64 " calls since start",
+         " | %.2f ms/MiB | %.1f ms of reads per decode token | %s over %" PRIu64 " calls since start"
+         " | %" PRIu64 " plans, %.1f ids/plan, W %" PRIu64 " T %" PRIu64,
          d_dec_calls ? (double) d_dec_us / 1000.0 / (double) d_dec_calls : 0.0, d_dec_calls,
          d_tokens ? (double) d_dec_calls / (double) d_tokens : 0.0,
          report_volume(d_dec_bytes).c_str(),
          d_dec_bytes ? (double) d_dec_us / 1000.0 / ((double) d_dec_bytes / (1024.0 * 1024.0)) : 0.0,
          d_tokens ? (double) d_dec_us / 1000.0 / (double) d_tokens : 0.0,
-         report_volume(p.n_dec_fill_bytes).c_str(), p.n_dec_fill_calls);
+         report_volume(p.n_dec_fill_bytes).c_str(), p.n_dec_fill_calls,
+         p.n_fill_plans, p.n_fill_plans ? (double) p.n_fill_plan_ids / (double) p.n_fill_plans : 0.0,
+         p.n_fill_weights, p.n_fill_table);
     const std::string sec_b = out.substr(s_b);
 
-    const size_t s_c = out.size();
-    const uint64_t lookups      = p.n_l2_hits + p.n_l2_misses;
-    const uint64_t cache_look   = p.n_routed_routes;
-    const uint64_t d_look_cache = p.n_routed_routes - p.prev_dec_routed_routes;
-    line("  cache     : %.1f%% of the routed selections found a filled resident slot"
-         " (%" PRIu64 "/%" PRIu64 " this interval) | %.1f%% cumulative (%" PRIu64 "/%" PRIu64 ")"
-         " | %.1f%% dropped, %.1f%% substituted this interval"
-         " | %" PRIu64 " fills and %" PRIu64 " resident changes",
-         d_look_cache ? 100.0 * d_cache_hit / d_look_cache : 0.0, d_cache_hit, d_look_cache,
-         cache_look ? 100.0 * p.n_decode_cache_hits / cache_look : 0.0,
-         p.n_decode_cache_hits, cache_look,
-         d_look_cache ? 100.0 * (double) d_dropped / (double) d_look_cache : 0.0,
-         d_look_cache ? 100.0 * (double) d_substituted / (double) d_look_cache : 0.0,
-         d_cache_fill, d_cache_chg);
-    const std::string sec_c = out.substr(s_c);
-
-    const size_t s_p = out.size();
+    const size_t s_wait = out.size();
     if (p.drop_enabled() && !p.drop_warm) {
-        line("  drop      : waiting for the decode cache, %.1f%% full of %d%% before dropping or probing",
+        line("  warming   : decode cache %.1f%% full of %d%% before dropping or probing",
              p.resident_fill(), p.drop_min_fill_percent);
     }
+    const std::string sec_wait = out.substr(s_wait);
 
-    if ((p.drop_fraction > 0.0f || p.substitute_enabled()) && p.drop_warm) {
+    const size_t s_sub = out.size();
+    if (p.substitute_enabled() && p.drop_warm) {
+        line("  config    : window %.2f-%.2f, pool %d",
+             (double) p.substitute_rel, 1.0 / (double) p.substitute_rel, (int) p.substitute_pool);
+        line("  substituted: %" PRIu64 " this interval, %" PRIu64 " cumulative (%.1f%% of base, %s of reads skipped)",
+             d_substituted, p.n_subst_routes, pct(p.n_subst_routes, base_sub),
+             report_volume(p.n_subst_bytes).c_str());
+    }
+    const std::string sec_sub = out.substr(s_sub);
+
+    const size_t s_drop = out.size();
+    if ((p.drop_fraction > 0.0f || p.drop_probe) && p.drop_warm) {
         char layer_cap[16];
         char tok_cap[16];
         if (p.drop_max_mass > 0.0f) {
@@ -1448,23 +1483,19 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
         } else {
             snprintf(tok_cap, sizeof(tok_cap), "off");
         }
-        line("  drop      : fraction %.3f, below-rel %.2f, layer-cap %s, token-cap %s | %" PRIu64
-             " dropped, %" PRIu64 " substituted this interval (worst layer perturb %.1f%%, worst token perturb %.1f%%)"
-             " | %" PRIu64 " cumulative (%s of disk reads skipped, %.1f%% dropped mass)",
-             (double) p.drop_fraction, (double) p.drop_below_rel, layer_cap, tok_cap, d_dropped, d_substituted,
-             100.0 * p.drop_worst_mass, 100.0 * p.drop_worst_token_mass,
-             p.n_dropped_routes, report_volume(p.n_dropped_bytes).c_str(),
-             p.n_routed_mass > 0.0 ? 100.0 * p.n_dropped_mass / p.n_routed_mass : 0.0);
-        if (p.substitute_enabled()) {
-            line("  substitute: window %.2f-%.2f, pool %d | %" PRIu64 " substitutions cumulative (%s of disk reads skipped, %.1f%% score mass moved)",
-                 (double) p.substitute_rel, 1.0 / (double) p.substitute_rel, (int) p.substitute_pool,
-                 p.n_subst_routes, report_volume(p.n_subst_bytes).c_str(),
-                 p.n_routed_mass > 0.0 ? 100.0 * p.n_subst_mass / p.n_routed_mass : 0.0);
-        }
+        line("  config    : fraction %.3f, below-rel %.2f, layer-cap %s, token-cap %s",
+             (double) p.drop_fraction, (double) p.drop_below_rel, layer_cap, tok_cap);
+        line("  dropped   : %" PRIu64 " this interval, %" PRIu64 " cumulative (%.1f%% of base, %s of reads skipped)"
+             " | worst layer perturb %.1f%%, worst token perturb %.1f%%",
+             d_dropped, p.n_dropped_routes, pct(p.n_dropped_routes, base_drop),
+             report_volume(p.n_dropped_bytes).c_str(),
+             100.0 * p.drop_worst_mass, 100.0 * p.drop_worst_token_mass);
     }
-    const std::string sec_p = out.substr(s_p);
+    const std::string sec_drop = out.substr(s_drop);
 
-    const size_t s_r = out.size();
+    char cell[32];
+
+    const size_t s_rdrop = out.size();
     if (p.drop_probe && p.drop_warm) {
         // cumulative probe: the distribution is what it is over the whole run,
         // not per interval. The quantiles are the inverse of the cold relative
@@ -1484,13 +1515,13 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
             }
             return 32;
         };
-        const uint64_t cold   = p.probe_cold_n;
-        const uint64_t rel_n  = p.probe_rel_n;
-        const uint64_t routed = p.probe_routed;
+        const uint64_t cold         = p.probe_cold_n;
+        const uint64_t rel_n        = p.probe_rel_n;
+        const uint64_t probe_routed = p.probe_routed;
         line("  drop probe: %" PRIu64 " routed, %" PRIu64 " cold (%.1f%% of selections, %.1f%% of score mass)"
              " | cold/layer p50=%" PRIu64 " p90=%" PRIu64 " p99=%" PRIu64 " max=%" PRIu64,
-             routed, cold,
-             routed ? 100.0 * (double) cold / (double) routed : 0.0,
+             probe_routed, cold,
+             probe_routed ? 100.0 * (double) cold / (double) probe_routed : 0.0,
              p.n_routed_mass > 0.0 ? 100.0 * p.n_cold_mass / p.n_routed_mass : 0.0,
              hist_at(0.50), hist_at(0.90), hist_at(0.99), p.probe_cold_max);
         line("  cold rel  : q10=%.2f q25=%.2f q50=%.2f q75=%.2f q90=%.2f q95=%.2f q99=%.2f (score / layer max)",
@@ -1502,7 +1533,6 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
         std::string row_a = "  drop curve:  A     ";
         std::string row_n = "               cold% ";
         std::string row_m = "               mass% ";
-        char cell[32];
         for (const float a : curve) {
             snprintf(cell, sizeof(cell), "%5.2f ", (double) a);
             row_a += cell;
@@ -1516,57 +1546,60 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
         out += row_a + "\n";
         out += row_n + "\n";
         out += row_m + "\n";
-        if (p.sim_cold > 0) {
-            static const int   sim_p[impl::sim_n_p] = { 2, 4, 8 };
-            static const float sim_s[impl::sim_n_s] = { 0.50f, 0.70f, 0.80f, 0.90f, 0.95f };
-            std::string row_s = "  subst sim :   S    ";
-            for (const float s : sim_s) {
-                snprintf(cell, sizeof(cell), "%5.2f ", (double) s);
-                row_s += cell;
-            }
-            out += row_s + "\n";
-            for (int pi = 0; pi < impl::sim_n_p; ++pi) {
-                std::string row_p;
-                snprintf(cell, sizeof(cell), "                 P=%-2d ", sim_p[pi]);
-                row_p += cell;
-                for (int si = 0; si < impl::sim_n_s; ++si) {
-                    snprintf(cell, sizeof(cell), "%5.1f ",
-                            100.0 * (double) p.sim_fired[pi][si] / (double) p.sim_cold);
-                    row_p += cell;
-                }
-                out += row_p + "\n";
-            }
-            out += "               (% of cold with a resident spare in [S, 1/S] of the cold score)\n";
-            // median of |c - e| / layer_mass from the histogram
-            uint64_t med_bin = 0;
-            {
-                const uint64_t target = (p.sim_ref_n + 1) / 2;
-                uint64_t acc = 0;
-                for (int i = 0; i < impl::sim_rel_bins; ++i) {
-                    acc += p.sim_ref_rel_hist[i];
-                    if (acc >= target) {
-                        med_bin = (uint64_t) i;
-                        break;
-                    }
-                    med_bin = (uint64_t) i;
-                }
-            }
-            const double med_pct = 100.0 * ((double) med_bin + 0.5) / (double) impl::sim_rel_bins * impl::sim_rel_max;
-            line("  subst cost: fires (S=0.90, P=4) %" PRIu64 " of %" PRIu64 " cold | spare weaker %.1f%%, stronger/equal %.1f%%"
-                 " | top-expert substitutions %" PRIu64 " | %s of reads avoidable",
-                 p.sim_ref_n, p.sim_cold,
-                 p.sim_ref_n ? 100.0 * (double) p.sim_ref_weaker / (double) p.sim_ref_n : 0.0,
-                 p.sim_ref_n ? 100.0 * (double) p.sim_ref_stronger / (double) p.sim_ref_n : 0.0,
-                 p.sim_top_fired, report_volume(p.sim_ref_bytes).c_str());
-            line("  subst gap : (c-e) / layer mass: mean signed %+.2f%%, mean abs %.2f%%, median abs %.2f%%"
-                 " | per expert (c-e)/c: mean %+.1f%%",
-                 p.sim_ref_n ? 100.0 * p.sim_ref_rel_sum / (double) p.sim_ref_n : 0.0,
-                 p.sim_ref_n ? 100.0 * p.sim_ref_rel_abs / (double) p.sim_ref_n : 0.0,
-                 p.sim_ref_n ? med_pct : 0.0,
-                 p.sim_ref_n ? 100.0 * p.sim_ref_loss / (double) p.sim_ref_n : 0.0);
-        }
     }
-    const std::string sec_r = out.substr(s_r);
+    const std::string sec_rdrop = out.substr(s_rdrop);
+
+    const size_t s_rsub = out.size();
+    if (p.drop_probe && p.drop_warm && p.sim_cold > 0) {
+        static const int   sim_p[impl::sim_n_p] = { 2, 4, 8 };
+        static const float sim_s[impl::sim_n_s] = { 0.50f, 0.70f, 0.80f, 0.90f, 0.95f };
+        std::string row_s = "  subst sim :   S    ";
+        for (const float s : sim_s) {
+            snprintf(cell, sizeof(cell), "%5.2f ", (double) s);
+            row_s += cell;
+        }
+        out += row_s + "\n";
+        for (int pi = 0; pi < impl::sim_n_p; ++pi) {
+            std::string row_p;
+            snprintf(cell, sizeof(cell), "                 P=%-2d ", sim_p[pi]);
+            row_p += cell;
+            for (int si = 0; si < impl::sim_n_s; ++si) {
+                snprintf(cell, sizeof(cell), "%5.1f ",
+                        100.0 * (double) p.sim_fired[pi][si] / (double) p.sim_cold);
+                row_p += cell;
+            }
+            out += row_p + "\n";
+        }
+        out += "               (% of cold with a resident spare in [S, 1/S] of the cold score)\n";
+        // median of |c - e| / layer_mass from the histogram
+        uint64_t med_bin = 0;
+        {
+            const uint64_t target = (p.sim_ref_n + 1) / 2;
+            uint64_t acc = 0;
+            for (int i = 0; i < impl::sim_rel_bins; ++i) {
+                acc += p.sim_ref_rel_hist[i];
+                if (acc >= target) {
+                    med_bin = (uint64_t) i;
+                    break;
+                }
+                med_bin = (uint64_t) i;
+            }
+        }
+        const double med_pct = 100.0 * ((double) med_bin + 0.5) / (double) impl::sim_rel_bins * impl::sim_rel_max;
+        line("  subst cost: fires (S=0.90, P=4) %" PRIu64 " of %" PRIu64 " cold | spare weaker %.1f%%, stronger/equal %.1f%%"
+             " | top-expert substitutions %" PRIu64 " | %s of reads avoidable",
+             p.sim_ref_n, p.sim_cold,
+             p.sim_ref_n ? 100.0 * (double) p.sim_ref_weaker / (double) p.sim_ref_n : 0.0,
+             p.sim_ref_n ? 100.0 * (double) p.sim_ref_stronger / (double) p.sim_ref_n : 0.0,
+             p.sim_top_fired, report_volume(p.sim_ref_bytes).c_str());
+        line("  subst gap : (c-e) / layer mass: mean signed %+.2f%%, mean abs %.2f%%, median abs %.2f%%"
+             " | per expert (c-e)/c: mean %+.1f%%",
+             p.sim_ref_n ? 100.0 * p.sim_ref_rel_sum / (double) p.sim_ref_n : 0.0,
+             p.sim_ref_n ? 100.0 * p.sim_ref_rel_abs / (double) p.sim_ref_n : 0.0,
+             p.sim_ref_n ? med_pct : 0.0,
+             p.sim_ref_n ? 100.0 * p.sim_ref_loss / (double) p.sim_ref_n : 0.0);
+    }
+    const std::string sec_rsub = out.substr(s_rsub);
 
     const size_t s_l = out.size();
     line("  l2 hit    : %.1f%% of the warm lookups (%" PRIu64 "/%" PRIu64 " this interval)"
@@ -1630,11 +1663,24 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
     }
     const std::string sec_o = out.substr(s_o);
 
-    // reassemble fastest tier first: layout, RAM, L2, substitution and dropping,
-    // disk I/O, then the calibration probe
-    out = sec_hdr + sec_a + sec_c + sec_l + sec_o + sec_p + sec_b + sec_d + sec_r;
+    // four blocks, fastest tier first. The substitution and dropping blocks only
+    // appear when their lever is on
+    const std::string rno = " report #" + std::to_string(p.n_reports + 1) + "\n";
 
-    LLAMA_LOG_INFO("%s", out.c_str());
+    LLAMA_LOG_INFO("%s", ("[l2-cache]" + rno + sec_base_l2 + sec_l + sec_o).c_str());
+
+    if (p.substitute_enabled()) {
+        LLAMA_LOG_INFO("%s", ("[substitution]" + rno + sec_base_sub + sec_wait + sec_sub + sec_rsub).c_str());
+    }
+    if (p.drop_fraction > 0.0f || p.drop_probe) {
+        std::string body = sec_base_drop + sec_drop + sec_rdrop;
+        if (!p.substitute_enabled()) {
+            body = sec_wait + body;
+        }
+        LLAMA_LOG_INFO("%s", ("[drop]" + rno + body).c_str());
+    }
+
+    LLAMA_LOG_INFO("%s", ("[disk]" + rno + sec_base_disk + sec_sets + sec_b + sec_d).c_str());
 
     p.prev_l2_hits           = p.n_l2_hits;
     p.prev_l2_misses         = p.n_l2_misses;
@@ -3311,6 +3357,9 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
         return false;
     }
     impl::cache_pool & pool = p.pools[c.pool];
+
+    p.n_fill_plans++;
+    p.n_fill_plan_ids += (uint64_t) n_ids;
 
     int32_t * table = (int32_t *) c.table->data;
 

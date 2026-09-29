@@ -4225,34 +4225,33 @@ namespace {
 
 // One funnel over the expert tiers: every routed selection lands in exactly one
 // bucket, so the shares sum to 100%. `routed` is the canonical total, counted
-// once per selection by the router-observation engine. The disk stage's own
-// routed counter can count a selection more than once (split hot/cold), so its
-// buckets are scaled onto that base before use.
+// once per selection by the router-observation engine. Each tier works on the
+// miss of the tier above (VRAM, RAM, L2, substitution, dropping), so a tier that
+// would exceed the remaining selections is clamped.
 struct expert_funnel {
     uint64_t routed = 0;
     uint64_t vram = 0, ram = 0, l2 = 0, substituted = 0, dropped = 0, read = 0;
 };
 
-expert_funnel expert_funnel_from(uint64_t routed, uint64_t vram, uint64_t disk_routed,
-                                 uint64_t ram, uint64_t l2, uint64_t substituted, uint64_t dropped) {
+expert_funnel expert_funnel_from(uint64_t routed, uint64_t vram, uint64_t ram,
+                                 uint64_t l2, uint64_t substituted, uint64_t dropped) {
     expert_funnel f;
     f.routed = routed;
     if (routed == 0) {
         return f;
     }
-    const double scale = disk_routed != 0 ? (double) routed / (double) disk_routed : 1.0;
-    f.vram = std::min(vram, routed);
-    uint64_t used = f.vram;
-    const auto take = [&](uint64_t v) -> uint64_t {
-        const uint64_t c = std::min<uint64_t>((uint64_t) ((double) v * scale + 0.5), routed - used);
-        used += c;
+    uint64_t left = routed;
+    const auto take = [&left](uint64_t v) -> uint64_t {
+        const uint64_t c = std::min(v, left);
+        left -= c;
         return c;
     };
+    f.vram        = take(vram);
     f.ram         = take(ram);
     f.l2          = take(l2);
     f.substituted = take(substituted);
     f.dropped     = take(dropped);
-    f.read        = routed - used;
+    f.read        = left;
     return f;
 }
 
@@ -4269,9 +4268,8 @@ void llama_context::print_expert_report() {
     const llama_expert_stats cur = get_expert_stats();
 
     const expert_funnel tot = expert_funnel_from(
-            cur.routed_experts, cur.vram_cache.route_hits, cur.decode_cache.route_routed,
-            cur.decode_cache.route_hits, cur.disk_l2.hits,
-            cur.decode_cache.substituted_routes, cur.decode_cache.dropped_routes);
+            cur.routed_experts, cur.vram_cache.route_hits, cur.decode_cache.assigned_routes,
+            cur.disk_l2.hits, cur.decode_cache.substituted_routes, cur.decode_cache.dropped_routes);
 
     const auto pct = [](uint64_t part, uint64_t whole) {
         return whole ? 100.0 * (double) part / (double) whole : 0.0;
@@ -4302,7 +4300,12 @@ void llama_context::print_expert_report() {
         hot_experts->print_stats();
     }
     if (disk_stage) {
-        disk_stage->print_stats(hot_experts ? hot_experts->content_tokens() : 0);
+        const uint64_t base_l2   = tot.routed - tot.vram - tot.ram;
+        const uint64_t base_sub  = base_l2 - tot.l2;
+        const uint64_t base_drop = base_sub - tot.substituted;
+        const uint64_t base_disk = base_drop - tot.dropped;
+        disk_stage->print_stats(hot_experts ? hot_experts->content_tokens() : 0,
+                                tot.routed, base_l2, base_sub, base_drop, base_disk);
     }
 }
 

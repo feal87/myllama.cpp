@@ -247,14 +247,20 @@ public:
     // Aggregate DIO cache counters and current state for the server metrics exporter.
     void stats_snapshot(llama_expert_stats & out) const;
 
-    // print the stats report via LLAMA_LOG_INFO (verbosity 4): a header line plus
-    // one themed line each for the layout, the decode fill cost, the decode cache
-    // hit rate, the L2 pool (hit rate, disk bytes served, admission policy), the
-    // split-hot overlap and the per-pool breakdown. decode_tokens is the number of
-    // single-token decode ubatches seen so far (the hot cache's content_tokens()),
-    // so the fill and split costs can be reported per decode token. No-op when the
-    // decode cache is off. Called from the shared --experts-stats-interval report.
-    void print_stats(uint64_t decode_tokens);
+    // print the stats report via LLAMA_LOG_INFO (verbosity 4) as four blocks:
+    // the L2 cache (hit rate, disk bytes served, admission policy, pools), the
+    // substitution and dropping levers, and the pure disk (fill, split) block.
+    // routed is the canonical number of routed selections; base_l2/base_sub/
+    // base_drop/base_disk are the cascade bases each block works on (the miss of
+    // the tier above). decode_tokens is the number of single-token decode ubatches
+    // seen so far, so the fill and split costs can be reported per decode token.
+    // No-op when the decode cache is off. Called from the shared report.
+    void print_stats(uint64_t decode_tokens, uint64_t routed, uint64_t base_l2,
+                     uint64_t base_sub, uint64_t base_drop, uint64_t base_disk);
+
+    // one-line description of the decode cache layout (pools, resident slots,
+    // transient window, RAM-locked size), for the RAM tier report
+    std::string ram_layout() const;
 
     // true when decode is served by the internal scheduler hook instead of the
     // mid-graph eval callback (the decode cache maps each layer's expert ids)
