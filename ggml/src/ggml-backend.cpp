@@ -886,6 +886,11 @@ struct ggml_backend_sched_split {
     int inputs_capacity;
     // graph view of this split
     struct ggml_cgraph graph;
+    // wall clock of this split's last compute: blocked before its inputs were
+    // ready (wait_us) and spent running it (work_us). Filled only when the split
+    // timing is enabled, for phase accounting
+    int64_t wait_us;
+    int64_t work_us;
 };
 
 struct ggml_backend_sched {
@@ -933,6 +938,9 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_node_prepare_callback callback_node_prepare;
     void * callback_node_prepare_user_data;
+
+    // record wait_us/work_us per split during the compute loop
+    bool timing_splits;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -1435,6 +1443,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         split->i_start = 0;
         split->n_inputs = 0;
+        split->wait_us = 0;
+        split->work_us = 0;
         int cur_backend_id = split->backend_id;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
@@ -1484,6 +1494,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->backend_id = node_backend_id;
                 split->i_start = i;
                 split->n_inputs = 0;
+                split->wait_us = 0;
+                split->work_us = 0;
                 cur_backend_id = node_backend_id;
             }
 
@@ -1791,6 +1803,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
+        const int64_t t_split_in = sched->timing_splits ? ggml_time_us() : 0;
+
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
@@ -1928,6 +1942,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        const int64_t t_split_ready = sched->timing_splits ? ggml_time_us() : 0;
+
         // early launch: start the next split's independent prefix while this split blocks
         if (!sched->callback_eval && split_backend_id == sched->n_backends - 1 &&
                 split_id + 1 < sched->n_splits) {
@@ -2048,6 +2064,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         prev_backend_id = split_backend_id;
+
+        if (sched->timing_splits) {
+            const int64_t t_split_out = ggml_time_us();
+            split->wait_us = t_split_ready - t_split_in;
+            split->work_us = t_split_out - t_split_ready;
+        }
     }
 
     return GGML_STATUS_SUCCESS;
@@ -2273,6 +2295,34 @@ void ggml_backend_sched_set_node_prepare_callback(ggml_backend_sched_t sched, gg
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_splits;
+}
+
+void ggml_backend_sched_set_split_timing(ggml_backend_sched_t sched, bool enable) {
+    GGML_ASSERT(sched);
+    sched->timing_splits = enable;
+}
+
+struct ggml_cgraph * ggml_backend_sched_get_split_graph(ggml_backend_sched_t sched, int split_id) {
+    GGML_ASSERT(sched);
+    if (split_id < 0 || split_id >= sched->n_splits) {
+        return nullptr;
+    }
+    return &sched->splits[split_id].graph;
+}
+
+ggml_backend_t ggml_backend_sched_get_split_backend(ggml_backend_sched_t sched, int split_id) {
+    GGML_ASSERT(sched);
+    if (split_id < 0 || split_id >= sched->n_splits) {
+        return nullptr;
+    }
+    return sched->backends[sched->splits[split_id].backend_id];
+}
+
+void ggml_backend_sched_get_split_timing(ggml_backend_sched_t sched, int split_id, int64_t * wait_us, int64_t * work_us) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(split_id >= 0 && split_id < sched->n_splits);
+    *wait_us = sched->splits[split_id].wait_us;
+    *work_us = sched->splits[split_id].work_us;
 }
 
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {

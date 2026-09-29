@@ -385,6 +385,16 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_node_prepare_callback(ggml_backend_sched_t sched, ggml_backend_sched_node_prepare_callback callback, void * user_data);
 
     //
+    // Per-split wall clock of the last graph compute, for phase accounting.
+    // wait_us is the time blocked before the split's inputs were ready, work_us
+    // is the time spent running the split (node prepare + compute).
+    //
+    GGML_API void                 ggml_backend_sched_set_split_timing(ggml_backend_sched_t sched, bool enable);
+    GGML_API struct ggml_cgraph * ggml_backend_sched_get_split_graph(ggml_backend_sched_t sched, int split_id);
+    GGML_API ggml_backend_t       ggml_backend_sched_get_split_backend(ggml_backend_sched_t sched, int split_id);
+    GGML_API void                 ggml_backend_sched_get_split_timing(ggml_backend_sched_t sched, int split_id, int64_t * wait_us, int64_t * work_us);
+
+    //
     // Meta backend
     //
 
