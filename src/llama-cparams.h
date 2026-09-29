@@ -114,6 +114,14 @@ struct llama_cparams {
     // disk stage: only drop an expert whose score is below this times the
     // layer's highest routed score (--disk-stage-drop-below-rel)
     float   disk_stage_drop_below_rel;
+    // disk stage: hard ceiling on the score mass a single decode token may
+    // perturb, as a fraction of the token's routed score mass
+    // (--disk-stage-drop-max-mass-token, 0 = off)
+    float   disk_stage_drop_max_mass_token;
+    // disk stage: substitution of a cold routed expert by a nearby resident one
+    // (--disk-stage-drop-substitute-rel/pool, pool = 0 = off)
+    float   disk_stage_drop_substitute_rel;
+    int32_t disk_stage_drop_substitute_pool;
     // disk stage: measure and report the routed score distribution without
     // dropping anything (--disk-stage-drop-probe)
     bool    disk_stage_drop_probe;

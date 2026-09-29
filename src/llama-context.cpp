@@ -164,6 +164,9 @@ llama_context::llama_context(
     cparams.disk_stage_split_hot     = params.disk_stage_split_hot;
     cparams.disk_stage_drop_fraction  = params.disk_stage_drop_fraction;
     cparams.disk_stage_drop_below_rel = params.disk_stage_drop_below_rel;
+    cparams.disk_stage_drop_max_mass_token = params.disk_stage_drop_max_mass_token;
+    cparams.disk_stage_drop_substitute_rel  = params.disk_stage_drop_substitute_rel;
+    cparams.disk_stage_drop_substitute_pool = params.disk_stage_drop_substitute_pool;
     cparams.disk_stage_drop_probe     = params.disk_stage_drop_probe;
 
     // The hot-expert cache is the shared router-observation engine: it maintains
@@ -198,6 +201,8 @@ llama_context::llama_context(
                 cparams.pin_experts_from_profile_path, cparams.warm_experts_from_profile_path,
                 cparams.pin_experts_template_path, cparams.disk_stage_split_hot,
                 cparams.disk_stage_drop_fraction, cparams.disk_stage_drop_below_rel,
+                cparams.disk_stage_drop_max_mass_token,
+                cparams.disk_stage_drop_substitute_rel, cparams.disk_stage_drop_substitute_pool,
                 cparams.disk_stage_drop_probe);
         if (stage->is_active()) {
             disk_stage = std::move(stage);
@@ -230,6 +235,16 @@ llama_context::llama_context(
 
     if (cparams.disk_stage_drop_probe && !disk_active) {
         LLAMA_LOG_WARN("%s: --disk-stage-drop-probe has no effect without the disk decode cache "
+                       "(--load-mode dio on Windows)\n", __func__);
+    }
+
+    if (cparams.disk_stage_drop_max_mass_token > 0.0f && !disk_active) {
+        LLAMA_LOG_WARN("%s: --disk-stage-drop-max-mass-token has no effect without the disk decode cache "
+                       "(--load-mode dio on Windows)\n", __func__);
+    }
+
+    if (cparams.disk_stage_drop_substitute_pool > 0 && !disk_active) {
+        LLAMA_LOG_WARN("%s: --disk-stage-drop-substitute-pool has no effect without the disk decode cache "
                        "(--load-mode dio on Windows)\n", __func__);
     }
 
@@ -4948,6 +4963,9 @@ llama_context_params llama_context_default_params() {
         /*.disk_stage_split_hot        =*/ false,
         /*.disk_stage_drop_fraction  =*/ 0.0f,
         /*.disk_stage_drop_below_rel =*/ 0.5f,
+        /*.disk_stage_drop_max_mass_token =*/ 0.0f,
+        /*.disk_stage_drop_substitute_rel  =*/ 0.0f,
+        /*.disk_stage_drop_substitute_pool =*/ 0,
         /*.disk_stage_drop_probe     =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,

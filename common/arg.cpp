@@ -3091,19 +3091,80 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--disk-stage-drop-max-mass-token"}, "T",
+        string_format(
+            "with --disk-stage-drop-fraction or substitution, hard ceiling on\n"
+            "the score mass a single-token decode may perturb across all of its\n"
+            "MoE layers, as a fraction of the token's total routed score mass.\n"
+            "A drop contributes the score it removes; a substitution contributes\n"
+            "the absolute score difference, so a spare stronger than the cold\n"
+            "expert counts too. The budget is a running total over the token's\n"
+            "layer fills, so by the end of the token the perturbation is at most\n"
+            "T of the token total. 0 disables the ceiling (default: %.2f)",
+            (double) params.disk_stage_drop_max_mass_token
+        ),
+        [](common_params & params, const std::string & value) {
+            const float v = std::stof(value);
+            if (v < 0.0f || v > 1.0f) {
+                throw std::invalid_argument("error: --disk-stage-drop-max-mass-token must be in [0, 1]");
+            }
+            params.disk_stage_drop_max_mass_token = v;
+        }
+    ));
+    add_opt(common_arg(
+        {"--disk-stage-drop-substitute-rel"}, "S",
+        string_format(
+            "with --load-mode dio, replace a cold routed expert of a single-token\n"
+            "decode with a nearby resident expert instead of reading it from disk\n"
+            "or dropping it. The spare must be one of the pool experts ranked just\n"
+            "below the routed set and its score must sit inside [S, 1/S] times the\n"
+            "cold score, so S controls how close the stand-in has to be and a\n"
+            "spare much stronger than the cold expert is rejected. The kept weight\n"
+            "becomes the spare score, so the expert count is unchanged. The top\n"
+            "routed expert is never substituted. Set S < 1 to enable, for example\n"
+            "0.90 (default: %.2f = off)",
+            (double) params.disk_stage_drop_substitute_rel
+        ),
+        [](common_params & params, const std::string & value) {
+            const float v = std::stof(value);
+            if (v < 0.0f || v >= 1.0f) {
+                throw std::invalid_argument("error: --disk-stage-drop-substitute-rel must be in [0, 1)");
+            }
+            params.disk_stage_drop_substitute_rel = v;
+        }
+    ));
+    add_opt(common_arg(
+        {"--disk-stage-drop-substitute-pool"}, "P",
+        string_format(
+            "with --disk-stage-drop-substitute-rel, how many of the highest\n"
+            "scoring non-routed experts to consider as substitutes. The router\n"
+            "already scores every expert, so the pool costs no extra compute. 0\n"
+            "keeps substitution off (default: %d)",
+            (int) params.disk_stage_drop_substitute_pool
+        ),
+        [](common_params & params, const std::string & value) {
+            const int v = std::stoi(value);
+            if (v < 0 || v > 64) {
+                throw std::invalid_argument("error: --disk-stage-drop-substitute-pool must be in [0, 64]");
+            }
+            params.disk_stage_drop_substitute_pool = v;
+        }
+    ));
+    add_opt(common_arg(
         {"--disk-stage-drop-probe"},
         {"--no-disk-stage-drop-probe"},
         string_format(
             "with --load-mode dio, measure the router score distribution of the\n"
             "single-token decode and print a calibration block in the disk-stage\n"
             "report: the cold share of selections and of score mass, the quantiles\n"
-            "of the cold score relative to the layer max, and the count and score\n"
-            "mass below a range of --disk-stage-drop-below-rel floors. The\n"
-            "quantiles are the inverse CDF, so to drop a given share of cold reads\n"
-            "set A to the matching quantile. The probe waits for the same 90%% cache\n"
-            "fill as dropping, so the calibration excludes warm-up. Drops nothing\n"
-            "by itself, so it can run without --disk-stage-drop-fraction\n"
-            "(default: %s)",
+            "of the cold score relative to the layer max, the count and score mass\n"
+            "below a range of --disk-stage-drop-below-rel floors, and a simulation\n"
+            "of replacing a cold expert with a resident spare from just outside\n"
+            "the top-k. The quantiles are the inverse CDF, so to drop a given\n"
+            "share of cold reads set A to the matching quantile. The probe waits\n"
+            "for the same 90%% cache fill as dropping, so the calibration excludes\n"
+            "warm-up. Drops nothing by itself, so it can run without\n"
+            "--disk-stage-drop-fraction (default: %s)",
             params.disk_stage_drop_probe ? "enabled" : "disabled"
         ),
         [](common_params & params, bool value) {

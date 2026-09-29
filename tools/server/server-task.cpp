@@ -1742,6 +1742,11 @@ std::string server_task_result_metrics::to_metrics() {
                 (double) expert.decode_cache.route_misses
             },
             {
+                "moe_decode_cache_routed_total",
+                "DIO decode routes seen by the RAM cache (hits, misses, drops and substitutions)",
+                (double) expert.decode_cache.route_routed
+            },
+            {
                 "moe_decode_cache_fills_total",
                 "DIO RAM decode-cache resident fills",
                 (double) expert.decode_cache.fills

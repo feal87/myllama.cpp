@@ -527,6 +527,22 @@ extern "C" {
         // renormalized out of the expert weights. 0 = off.
         float disk_stage_drop_fraction;   // cap on the dropped fraction, [0, 1)
         float disk_stage_drop_below_rel;  // relative floor, (0, 1]
+        // hard ceiling on the score mass a single decode token may perturb
+        // (--disk-stage-drop-max-mass-token), as a fraction of the token's
+        // routed score mass. A drop contributes its removed score; a
+        // substitution contributes the absolute score difference, so a spare
+        // stronger than the cold expert counts too. The budget accumulates over
+        // the token's layer fills, so at the end the total perturbation is at
+        // most this fraction of the token total. 0 = off
+        float disk_stage_drop_max_mass_token;   // [0, 1]
+        // substitution (--disk-stage-drop-substitute-rel/pool): a cold routed
+        // expert is replaced by a nearby resident expert instead of being read
+        // or dropped. The spare must score inside [S, 1/S] times the cold score
+        // and be one of the pool experts ranked just below the routed set, so
+        // S < 1 turns it on and pool = 0 keeps it off. The kept weight becomes
+        // the spare score, so the mixture stays full
+        float   disk_stage_drop_substitute_rel;    // score window floor, (0, 1)
+        int32_t disk_stage_drop_substitute_pool;   // extra experts considered, >= 0
 
         // measure the routed score distribution and print a calibration line in
         // the disk-stage report without dropping anything (--disk-stage-drop-probe)

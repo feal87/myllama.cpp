@@ -410,6 +410,9 @@ struct llama_disk_stage::impl {
 
     uint64_t n_decode_cache_hits            = 0;
     uint64_t n_decode_cache_misses          = 0;
+    // every routed selection, the denominator the cache hit rate is reported
+    // against: hits, misses, drops and substitutions all count
+    uint64_t n_routed_routes                = 0;
     uint64_t n_decode_cache_fills           = 0;
     uint64_t n_decode_cache_resident_changes = 0;
     // cache-aware opportunistic dropping: routed experts skipped instead of read
@@ -418,9 +421,18 @@ struct llama_disk_stage::impl {
     // ones, so the report can state the share of the token's score mass removed
     uint64_t n_dropped_routes = 0;
     uint64_t n_dropped_bytes  = 0;
+    uint64_t n_subst_routes   = 0;
+    uint64_t n_subst_bytes    = 0;
     double   n_routed_mass    = 0.0;
     double   n_cold_mass      = 0.0;
     double   n_dropped_mass   = 0.0;
+    double   n_subst_mass     = 0.0; // sum |c - e| of the substitutions
+    // worst single-layer perturbation share (dropped score plus substitution
+    // |c - e|) since the last report, so an outlier layer is visible even when
+    // the interval average looks small
+    double   drop_worst_mass  = 0.0;
+    // worst whole-token perturbation share since the last report
+    double   drop_worst_token_mass = 0.0;
 
     // fill_cache() scratch: the decode fill runs once per layer per token on the
     // compute thread, so reuse these instead of reallocating per call
@@ -473,6 +485,11 @@ struct llama_disk_stage::impl {
     std::vector<uint8_t>                 fs_drop;
     // cold routed positions of the current fill, ranked by score
     std::vector<int64_t>                 fs_cold;
+    // substitution decision of the current fill, per routed position
+    std::vector<uint8_t>                 fs_subst;
+    std::vector<int32_t>                 fs_subst_slot;
+    std::vector<float>                   fs_subst_scale;
+    std::vector<int32_t>                 fs_subst_used;
     std::vector<pool_copy>               fs_copies;       // L2 hit -> transient, independent of the disk batch
     std::vector<pool_copy>               fs_copies_pre;   // L2 hit -> resident, before the disk batch
     std::vector<pool_copy>               fs_stores;       // transient -> L2, after the disk batch
@@ -497,6 +514,20 @@ struct llama_disk_stage::impl {
     // `drop_below_rel` times the layer's highest score. `drop_probe` only measures
     float   drop_fraction  = 0.0f;
     float   drop_below_rel = 0.5f;
+    // hard ceiling on the score mass a single decode token may perturb across
+    // all of its MoE layers, as a fraction of the token's routed score mass
+    // (0 = off). A drop contributes its removed score, a substitution the
+    // absolute score difference
+    float   drop_max_mass_token = 0.0f;
+    // substitution: replace a cold routed expert with a nearby resident one
+    // instead of reading or dropping it. The spare must score inside
+    // [substitute_rel, 1/substitute_rel] of the cold score. pool = 0 = off
+    float   substitute_rel  = 0.0f;
+    int32_t substitute_pool = 0;
+    // per-token accumulator for the token ceiling: reset at the token boundary
+    // in split_token_end() and fed by each layer's fill in fill_cache_plan
+    double  tok_routed_mass  = 0.0;
+    double  tok_dropped_mass = 0.0; // dropped score mass plus substitution |c - e|
     bool    drop_probe     = false;
     // dropping and the probe wait until the resident cache is this full, so the
     // warm-up cold experts (not cached yet, not weak) are not dropped
@@ -509,7 +540,12 @@ struct llama_disk_stage::impl {
     static constexpr int64_t drop_fill_check_us = 100000;
     int64_t drop_fill_check_at = 0;
 
-    bool drop_enabled() const { return drop_fraction > 0.0f || drop_probe; }
+    bool substitute_enabled() const {
+        return substitute_pool > 0 && substitute_rel > 0.0f && substitute_rel < 1.0f;
+    }
+    bool drop_enabled() const {
+        return drop_fraction > 0.0f || drop_probe || substitute_enabled();
+    }
 
     // share of the resident decode slots that hold an expert's bytes
     double resident_fill() const {
@@ -580,6 +616,36 @@ struct llama_disk_stage::impl {
     static constexpr int   probe_n_rel = 64;
     std::vector<uint64_t>  probe_rel      = std::vector<uint64_t>(probe_n_rel, 0);
     std::vector<double>    probe_rel_mass = std::vector<double>(probe_n_rel, 0.0);
+
+    // substitution simulation (--disk-stage-drop-probe): for each cold routed
+    // selection, whether a resident spare just outside the top-k is close enough
+    // in score to take its place. P is the number of non-selected experts
+    // considered by score, S the spare score floor relative to the cold expert.
+    // Accounting only, nothing is substituted
+    static constexpr int sim_n_p   = 3; // P = 2, 4, 8
+    static constexpr int sim_n_s   = 5; // S = 0.50, 0.70, 0.80, 0.90, 0.95
+    static constexpr int sim_ref_p = 1; // report reference P = 4
+    static constexpr int sim_ref_s = 3; // report reference S = 0.90
+    uint64_t sim_cold      = 0;
+    uint64_t sim_fired[sim_n_p][sim_n_s] = {};
+    uint64_t sim_top_fired = 0;
+    uint64_t sim_ref_n     = 0;
+    double   sim_ref_loss  = 0.0;
+    uint64_t sim_ref_bytes = 0;
+    // gap of the reference firings: (c - e), signed. Positive = the spare is
+    // weaker than the cold expert it would replace. The absolute gap is taken
+    // against the layer's score mass, so a tiny cold score cannot dominate
+    uint64_t sim_ref_weaker   = 0;
+    uint64_t sim_ref_stronger = 0;
+    double   sim_ref_rel_sum  = 0.0; // signed (c - e) / layer_mass
+    double   sim_ref_rel_abs  = 0.0; // |c - e| / layer_mass
+    static constexpr double sim_rel_max  = 0.20;
+    static constexpr int    sim_rel_bins = 100;
+    uint64_t sim_ref_rel_hist[sim_rel_bins] = {};
+    // full router distribution of the current decode fill, for the simulation
+    std::vector<float>                    fs_all;
+    int64_t                               fs_n_all = 0;
+    std::vector<std::pair<float,int32_t>> fs_pool;
 
     static int probe_rel_bin(float r) {
         if (!(r > 0.0f)) {
@@ -721,9 +787,11 @@ struct llama_disk_stage::impl {
     // interval hit rate and the per-token fill cost
     uint64_t prev_dec_cache_hits    = 0;
     uint64_t prev_dec_cache_misses  = 0;
+    uint64_t prev_dec_routed_routes = 0;
     uint64_t prev_dec_cache_fills   = 0;
     uint64_t prev_dec_cache_changes = 0;
     uint64_t prev_dec_dropped       = 0;
+    uint64_t prev_dec_substituted   = 0;
     uint64_t prev_dec_tokens        = 0;
     double   prev_dec_routed_mass   = 0.0;
     double   prev_dec_dropped_mass  = 0.0;
@@ -1050,6 +1118,7 @@ void llama_disk_stage::stats_snapshot(llama_expert_stats & out) const {
     std::lock_guard<std::mutex> lock(p.cache_mu);
     out.decode_cache.route_hits       = p.n_decode_cache_hits;
     out.decode_cache.route_misses     = p.n_decode_cache_misses;
+    out.decode_cache.route_routed     = p.n_routed_routes;
     out.decode_cache.fills            = p.n_decode_cache_fills;
     out.decode_cache.resident_changes = p.n_decode_cache_resident_changes;
     out.decode_cache.dropped_routes   = p.n_dropped_routes;
@@ -1172,6 +1241,18 @@ void llama_disk_stage::node_prepare_callback(struct ggml_tensor * node, void * u
                 p.fs_probs[(size_t) i] = (id >= 0 && id < (int32_t) t_prob->ne[1])
                         ? *(const float *) (base + (int64_t) id * t_prob->nb[1]) : 1.0f;
             }
+            // the substitution simulation and the substitution pass need the
+            // whole distribution, not just the routed scores
+            if (p.drop_probe || p.substitute_enabled()) {
+                const int64_t n_all = t_prob->ne[1];
+                p.fs_all.resize((size_t) n_all);
+                for (int64_t e = 0; e < n_all; ++e) {
+                    p.fs_all[(size_t) e] = *(const float *) (base + e * t_prob->nb[1]);
+                }
+                p.fs_n_all = n_all;
+            } else {
+                p.fs_n_all = 0;
+            }
             if (p.split_hot_active) {
                 self->fill_cache_begin(il, idp, n_used, p.fs_probs.data());
             } else {
@@ -1256,10 +1337,10 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
     const uint64_t d_dec_calls  = p.n_dec_fill_calls - p.prev_dec_fill_calls;
     const uint64_t d_dec_bytes  = p.n_dec_fill_bytes - p.prev_dec_fill_bytes;
     const uint64_t d_cache_hit  = p.n_decode_cache_hits - p.prev_dec_cache_hits;
-    const uint64_t d_cache_miss = p.n_decode_cache_misses - p.prev_dec_cache_misses;
     const uint64_t d_cache_fill = p.n_decode_cache_fills - p.prev_dec_cache_fills;
     const uint64_t d_cache_chg  = p.n_decode_cache_resident_changes - p.prev_dec_cache_changes;
     const uint64_t d_dropped    = p.n_dropped_routes - p.prev_dec_dropped;
+    const uint64_t d_substituted = p.n_subst_routes - p.prev_dec_substituted;
     const double   d_routed_mass  = p.n_routed_mass - p.prev_dec_routed_mass;
     const double   d_dropped_mass = p.n_dropped_mass - p.prev_dec_dropped_mass;
     const uint64_t d_tokens     = decode_tokens > p.prev_dec_tokens ? decode_tokens - p.prev_dec_tokens : 0;
@@ -1323,27 +1404,44 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
          report_volume(p.n_dec_fill_bytes).c_str(), p.n_dec_fill_calls);
 
     const uint64_t lookups      = p.n_l2_hits + p.n_l2_misses;
-    const uint64_t cache_look   = p.n_decode_cache_hits + p.n_decode_cache_misses;
-    const uint64_t d_look_cache = d_cache_hit + d_cache_miss;
+    const uint64_t cache_look   = p.n_routed_routes;
+    const uint64_t d_look_cache = p.n_routed_routes - p.prev_dec_routed_routes;
     line("  cache     : %.1f%% of the routed selections found a filled resident slot"
          " (%" PRIu64 "/%" PRIu64 " this interval) | %.1f%% cumulative (%" PRIu64 "/%" PRIu64 ")"
-         " | %" PRIu64 " fills and %" PRIu64 " resident changes this interval",
+         " | %.1f%% dropped, %.1f%% substituted this interval"
+         " | %" PRIu64 " fills and %" PRIu64 " resident changes",
          d_look_cache ? 100.0 * d_cache_hit / d_look_cache : 0.0, d_cache_hit, d_look_cache,
          cache_look ? 100.0 * p.n_decode_cache_hits / cache_look : 0.0,
-         p.n_decode_cache_hits, cache_look, d_cache_fill, d_cache_chg);
+         p.n_decode_cache_hits, cache_look,
+         d_look_cache ? 100.0 * (double) d_dropped / (double) d_look_cache : 0.0,
+         d_look_cache ? 100.0 * (double) d_substituted / (double) d_look_cache : 0.0,
+         d_cache_fill, d_cache_chg);
 
     if (p.drop_enabled() && !p.drop_warm) {
         line("  drop      : waiting for the decode cache, %.1f%% full of %d%% before dropping or probing",
              p.resident_fill(), p.drop_min_fill_percent);
     }
 
-    if (p.drop_fraction > 0.0f && p.drop_warm) {
-        line("  drop      : fraction %.3f, below-rel %.2f | %" PRIu64 " routed selections dropped this interval (%.1f%% of score mass)"
-             " | %" PRIu64 " cumulative (%s of disk reads skipped, %.1f%% mass)",
-             (double) p.drop_fraction, (double) p.drop_below_rel, d_dropped,
-             d_routed_mass > 0.0 ? 100.0 * d_dropped_mass / d_routed_mass : 0.0,
+    if ((p.drop_fraction > 0.0f || p.substitute_enabled()) && p.drop_warm) {
+        char tok_cap[16];
+        if (p.drop_max_mass_token > 0.0f) {
+            snprintf(tok_cap, sizeof(tok_cap), "%.1f%%", 100.0 * (double) p.drop_max_mass_token);
+        } else {
+            snprintf(tok_cap, sizeof(tok_cap), "off");
+        }
+        line("  drop      : fraction %.3f, below-rel %.2f, token-cap %s | %" PRIu64
+             " dropped, %" PRIu64 " substituted this interval (worst layer perturb %.1f%%, worst token perturb %.1f%%)"
+             " | %" PRIu64 " cumulative (%s of disk reads skipped, %.1f%% dropped mass)",
+             (double) p.drop_fraction, (double) p.drop_below_rel, tok_cap, d_dropped, d_substituted,
+             100.0 * p.drop_worst_mass, 100.0 * p.drop_worst_token_mass,
              p.n_dropped_routes, report_volume(p.n_dropped_bytes).c_str(),
              p.n_routed_mass > 0.0 ? 100.0 * p.n_dropped_mass / p.n_routed_mass : 0.0);
+        if (p.substitute_enabled()) {
+            line("  substitute: window %.2f-%.2f, pool %d | %" PRIu64 " substitutions cumulative (%s of disk reads skipped, %.1f%% score mass moved)",
+                 (double) p.substitute_rel, 1.0 / (double) p.substitute_rel, (int) p.substitute_pool,
+                 p.n_subst_routes, report_volume(p.n_subst_bytes).c_str(),
+                 p.n_routed_mass > 0.0 ? 100.0 * p.n_subst_mass / p.n_routed_mass : 0.0);
+        }
     }
 
     if (p.drop_probe && p.drop_warm) {
@@ -1397,6 +1495,55 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
         out += row_a + "\n";
         out += row_n + "\n";
         out += row_m + "\n";
+        if (p.sim_cold > 0) {
+            static const int   sim_p[impl::sim_n_p] = { 2, 4, 8 };
+            static const float sim_s[impl::sim_n_s] = { 0.50f, 0.70f, 0.80f, 0.90f, 0.95f };
+            std::string row_s = "  subst sim :   S    ";
+            for (const float s : sim_s) {
+                snprintf(cell, sizeof(cell), "%5.2f ", (double) s);
+                row_s += cell;
+            }
+            out += row_s + "\n";
+            for (int pi = 0; pi < impl::sim_n_p; ++pi) {
+                std::string row_p;
+                snprintf(cell, sizeof(cell), "                 P=%-2d ", sim_p[pi]);
+                row_p += cell;
+                for (int si = 0; si < impl::sim_n_s; ++si) {
+                    snprintf(cell, sizeof(cell), "%5.1f ",
+                            100.0 * (double) p.sim_fired[pi][si] / (double) p.sim_cold);
+                    row_p += cell;
+                }
+                out += row_p + "\n";
+            }
+            out += "               (% of cold with a resident spare in [S, 1/S] of the cold score)\n";
+            // median of |c - e| / layer_mass from the histogram
+            uint64_t med_bin = 0;
+            {
+                const uint64_t target = (p.sim_ref_n + 1) / 2;
+                uint64_t acc = 0;
+                for (int i = 0; i < impl::sim_rel_bins; ++i) {
+                    acc += p.sim_ref_rel_hist[i];
+                    if (acc >= target) {
+                        med_bin = (uint64_t) i;
+                        break;
+                    }
+                    med_bin = (uint64_t) i;
+                }
+            }
+            const double med_pct = 100.0 * ((double) med_bin + 0.5) / (double) impl::sim_rel_bins * impl::sim_rel_max;
+            line("  subst cost: fires (S=0.90, P=4) %" PRIu64 " of %" PRIu64 " cold | spare weaker %.1f%%, stronger/equal %.1f%%"
+                 " | top-expert substitutions %" PRIu64 " | %s of reads avoidable",
+                 p.sim_ref_n, p.sim_cold,
+                 p.sim_ref_n ? 100.0 * (double) p.sim_ref_weaker / (double) p.sim_ref_n : 0.0,
+                 p.sim_ref_n ? 100.0 * (double) p.sim_ref_stronger / (double) p.sim_ref_n : 0.0,
+                 p.sim_top_fired, report_volume(p.sim_ref_bytes).c_str());
+            line("  subst gap : (c-e) / layer mass: mean signed %+.2f%%, mean abs %.2f%%, median abs %.2f%%"
+                 " | per expert (c-e)/c: mean %+.1f%%",
+                 p.sim_ref_n ? 100.0 * p.sim_ref_rel_sum / (double) p.sim_ref_n : 0.0,
+                 p.sim_ref_n ? 100.0 * p.sim_ref_rel_abs / (double) p.sim_ref_n : 0.0,
+                 p.sim_ref_n ? med_pct : 0.0,
+                 p.sim_ref_n ? 100.0 * p.sim_ref_loss / (double) p.sim_ref_n : 0.0);
+        }
     }
 
     line("  l2 hit    : %.1f%% of the warm lookups (%" PRIu64 "/%" PRIu64 " this interval)"
@@ -1470,11 +1617,15 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens) {
     p.prev_dec_fill_bytes    = p.n_dec_fill_bytes;
     p.prev_dec_cache_hits    = p.n_decode_cache_hits;
     p.prev_dec_cache_misses  = p.n_decode_cache_misses;
+    p.prev_dec_routed_routes = p.n_routed_routes;
     p.prev_dec_cache_fills   = p.n_decode_cache_fills;
     p.prev_dec_cache_changes = p.n_decode_cache_resident_changes;
     p.prev_dec_dropped       = p.n_dropped_routes;
+    p.prev_dec_substituted   = p.n_subst_routes;
     p.prev_dec_routed_mass   = p.n_routed_mass;
     p.prev_dec_dropped_mass  = p.n_dropped_mass;
+    p.drop_worst_mass        = 0.0;
+    p.drop_worst_token_mass  = 0.0;
     p.prev_dec_tokens        = decode_tokens;
     p.prev_split_tot         = p.split_tot;
     p.n_reports++;
@@ -1511,6 +1662,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                    int32_t pool_layers_max, const char * base_experts_path,
                                    const char * warm_experts_path, const char * base_template_path,
                                    bool split_hot, float drop_fraction, float drop_below_rel,
+                                   float drop_max_mass_token, float substitute_rel, int32_t substitute_pool,
                                    bool drop_probe) :
     pimpl(std::make_unique<impl>(model)) {
     impl & p = *pimpl;
@@ -1528,6 +1680,9 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     GGML_UNUSED(split_hot);
     GGML_UNUSED(drop_fraction);
     GGML_UNUSED(drop_below_rel);
+    GGML_UNUSED(drop_max_mass_token);
+    GGML_UNUSED(substitute_rel);
+    GGML_UNUSED(substitute_pool);
     GGML_UNUSED(drop_probe);
     return;
 #else
@@ -1542,15 +1697,19 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     // SOFTMAX_WEIGHT scales the selected weights, so the multiplicative keep
     // mask the graph applies is wrong there: drop nothing for that gating
     if (model.hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
-        if (drop_fraction > 0.0f || drop_probe) {
-            LLAMA_LOG_WARN("%s: dropping disabled: SOFTMAX_WEIGHT gating is not supported\n", __func__);
+        if (drop_fraction > 0.0f || drop_probe || substitute_pool > 0) {
+            LLAMA_LOG_WARN("%s: dropping and substitution disabled: SOFTMAX_WEIGHT gating is not supported\n", __func__);
         }
-        drop_fraction = 0.0f;
-        drop_probe    = false;
+        drop_fraction   = 0.0f;
+        drop_probe      = false;
+        substitute_pool = 0;
     }
     p.drop_fraction  = drop_fraction;
     p.drop_below_rel = std::min(std::max(drop_below_rel, 1e-3f), 1.0f);
-    p.drop_probe     = drop_probe;
+    p.drop_max_mass_token = std::min(std::max(drop_max_mass_token, 0.0f), 1.0f);
+    p.substitute_rel  = std::min(std::max(substitute_rel, 0.0f), 0.999f);
+    p.substitute_pool = std::min(std::max(substitute_pool, 0), 64);
+    p.drop_probe      = drop_probe;
     p.drop_active    = p.drop_enabled();
 
     // split the host decode MoE into a hot and a cold pass so the cold disk read
@@ -2049,8 +2208,8 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                             // split-hot: the hot and cold slot tables
                             cache_bytes += 2 * align_up((size_t) (n_pool_slots + 1) * sizeof(int32_t), disk_stage_align);
                         }
-                        if (p.drop_fraction > 0.0f) {
-                            // cache-aware dropping: the per-expert keep table
+                        if (p.drop_fraction > 0.0f || p.substitute_enabled()) {
+                            // cache-aware dropping / substitution: the per-expert keep table
                             cache_bytes += align_up((size_t) n_expert * sizeof(float), disk_stage_align);
                         }
                     }
@@ -2186,7 +2345,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                 // threshold). The graph multiplies the weights by
                                 // get_rows(keep, selected_experts) before norm_w
                                 ggml_tensor * keep = nullptr;
-                                if (p.drop_fraction > 0.0f) {
+                                if (p.drop_fraction > 0.0f || p.substitute_enabled()) {
                                     keep = ggml_new_tensor_2d(p.cache_ctx, GGML_TYPE_F32, 1, n_expert);
                                     ggml_format_name(keep, "disk_cache_keep.%d", il);
                                     ggml_backend_tensor_alloc(p.cache_buf, keep, cbase + off);
@@ -3196,7 +3355,11 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
         // skip. The fraction cap and the relative floor need all scores at once,
         // so the decision is a pre-pass over the (small) routed set; the main
         // loop only honors it. The probe records the distribution
-        std::vector<uint8_t> & drop = p.fs_drop;
+        std::vector<uint8_t> & drop        = p.fs_drop;
+        std::vector<uint8_t> & subst       = p.fs_subst;
+        std::vector<int32_t> & subst_slot  = p.fs_subst_slot;
+        std::vector<float>   & subst_scale = p.fs_subst_scale;
+        std::vector<int32_t> & subst_used  = p.fs_subst_used;
         bool drop_planned = false;
         if (p.drop_enabled() && probs != nullptr && p.resident_warm()) {
             drop.assign((size_t) n_ids, 0);
@@ -3215,6 +3378,7 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
             // score is never below A * max, so the top expert is always kept
             std::vector<int64_t> & cold = p.fs_cold;
             uint32_t n_cold_all = 0;
+            double   layer_mass = 0.0;
             cold.clear();
             for (int64_t i = 0; i < n_ids; ++i) {
                 const int32_t id = ids[i];
@@ -3227,6 +3391,7 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                         (c.resident_slot[id] >= 0 && c.resident_filled[id] != 0) ||
                         (epid >= 0 && p.evict_has(epid, ((int64_t) il << 32) | (uint32_t) id));
                 p.n_routed_mass += (double) probs[i];
+                layer_mass      += (double) probs[i];
                 if (p.drop_probe) {
                     p.probe_routed++;
                     if (!available) {
@@ -3254,18 +3419,251 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                 p.probe_cold_max = std::max<uint64_t>(p.probe_cold_max, n_cold_all);
                 p.probe_calls++;
             }
+            // a pool of the highest scoring non-routed experts: the substitution
+            // source, and what the probe simulation measures. The router already
+            // scores every expert, so the pool costs no extra compute
+            std::vector<std::pair<float,int32_t>> & sppool = p.fs_pool;
+            if ((p.drop_probe || p.substitute_enabled()) &&
+                    p.fs_n_all > 0 && p.fs_n_all <= (int64_t) p.fs_all.size()) {
+                sppool.clear();
+                for (int64_t e = 0; e < p.fs_n_all; ++e) {
+                    bool selected = false;
+                    for (int64_t i = 0; i < n_ids; ++i) {
+                        if ((int32_t) e == ids[i]) {
+                            selected = true;
+                            break;
+                        }
+                    }
+                    if (!selected) {
+                        sppool.emplace_back(p.fs_all[(size_t) e], (int32_t) e);
+                    }
+                }
+                const auto by_score = [](const std::pair<float,int32_t> & a, const std::pair<float,int32_t> & b) {
+                    return a.first > b.first;
+                };
+                const size_t p_max = (size_t) std::max(8, (int) p.substitute_pool);
+                if (sppool.size() > p_max) {
+                    std::partial_sort(sppool.begin(), sppool.begin() + p_max, sppool.end(), by_score);
+                    sppool.resize(p_max);
+                } else {
+                    std::sort(sppool.begin(), sppool.end(), by_score);
+                }
+            } else {
+                sppool.clear();
+            }
+            // substitution simulation: over the layer's cold selections, does a
+            // resident spare from just outside the top-k come close enough in
+            // score to stand in? Accounting only, the routing is untouched
+            if (p.drop_probe) {
+                static const int   sim_p[impl::sim_n_p] = { 2, 4, 8 };
+                static const float sim_s[impl::sim_n_s] = { 0.50f, 0.70f, 0.80f, 0.90f, 0.95f };
+                const auto spare_available = [&](int32_t sid) {
+                    // the table+keep substitution can only point at a host
+                    // resident slot, so vram and l2-only spares do not count
+                    return sid >= 0 && sid < (int32_t) c.resident_slot.size() &&
+                            c.resident_slot[sid] >= 0 && c.resident_filled[sid] != 0;
+                };
+                for (int64_t i = 0; i < n_ids; ++i) {
+                    const int32_t id = ids[i];
+                    if (id < 0 || id >= (int32_t) c.resident_slot.size()) {
+                        continue;
+                    }
+                    const bool is_cold = !(c.vram[id] || c.base[id] ||
+                            (c.resident_slot[id] >= 0 && c.resident_filled[id] != 0) ||
+                            (epid >= 0 && p.evict_has(epid, ((int64_t) il << 32) | (uint32_t) id)));
+                    if (!is_cold || !(probs[i] > 0.0f)) {
+                        continue;
+                    }
+                    p.sim_cold++;
+                    const float cs = probs[i];
+                    // two-sided window: the spare must sit inside the ratio
+                    // [S, 1/S] of the cold score. A spare that is much stronger
+                    // is not a stand-in, so the highest resident spare inside
+                    // the window wins, not the highest overall
+                    float e_best[impl::sim_n_p][impl::sim_n_s];
+                    for (auto & e_row : e_best) {
+                        for (float & e_val : e_row) {
+                            e_val = -1.0f;
+                        }
+                    }
+                    for (int pi = 0; pi < impl::sim_n_p; ++pi) {
+                        for (int k = 0; k < sim_p[pi] && k < (int) sppool.size(); ++k) {
+                            if (!spare_available(sppool[(size_t) k].second)) {
+                                continue;
+                            }
+                            const float e = sppool[(size_t) k].first;
+                            for (int si = 0; si < impl::sim_n_s; ++si) {
+                                if (e_best[pi][si] >= 0.0f) {
+                                    continue;
+                                }
+                                const float s = sim_s[si];
+                                if (e > cs / s || e < s * cs) {
+                                    continue;
+                                }
+                                e_best[pi][si] = e;
+                            }
+                        }
+                    }
+                    for (int pi = 0; pi < impl::sim_n_p; ++pi) {
+                        for (int si = 0; si < impl::sim_n_s; ++si) {
+                            if (e_best[pi][si] >= 0.0f) {
+                                p.sim_fired[pi][si]++;
+                            }
+                        }
+                    }
+                    const float ref = e_best[impl::sim_ref_p][impl::sim_ref_s];
+                    if (ref >= 0.0f) {
+                        p.sim_ref_n++;
+                        p.sim_ref_loss += (double) (cs - ref) / (double) cs;
+                        const double gap = (double) cs - (double) ref;
+                        if (gap > 0.0) {
+                            p.sim_ref_weaker++;
+                        } else {
+                            p.sim_ref_stronger++;
+                        }
+                        if (layer_mass > 0.0) {
+                            const double rel = gap / layer_mass;
+                            p.sim_ref_rel_sum += rel;
+                            p.sim_ref_rel_abs += std::fabs(rel);
+                            int bi = (int) (std::fabs(rel) / impl::sim_rel_max * impl::sim_rel_bins);
+                            if (bi < 0) {
+                                bi = 0;
+                            }
+                            if (bi >= impl::sim_rel_bins) {
+                                bi = impl::sim_rel_bins - 1;
+                            }
+                            p.sim_ref_rel_hist[bi]++;
+                        }
+                        for (int r = 0; r < 3; ++r) {
+                            if (regions[r].stride != 0) {
+                                p.sim_ref_bytes += regions[r].stride;
+                            }
+                        }
+                        if (cs == max_score) {
+                            p.sim_top_fired++;
+                        }
+                    }
+                }
+            }
+            // substitution: replace a cold routed expert with a nearby resident
+            // one, so neither the read nor the renormalization is paid. The top
+            // expert is never substituted, the spare must sit inside the score
+            // window [S, 1/S] and be host-resident, and the table points the
+            // cold id at the spare slot while keep scales its weight to the
+            // spare score
+            subst.assign((size_t) n_ids, 0);
+            subst_slot.assign((size_t) n_ids, -1);
+            subst_scale.assign((size_t) n_ids, 1.0f);
+            subst_used.clear();
+            double layer_subst_mass = 0.0;
+            if (p.substitute_enabled() && !sppool.empty()) {
+                const bool   token_cap    = p.drop_max_mass_token > 0.0f;
+                const double token_budget = (double) p.drop_max_mass_token * (p.tok_routed_mass + layer_mass);
+                int64_t top_pos = 0;
+                for (int64_t i = 1; i < n_ids; ++i) {
+                    if (probs[i] > probs[top_pos]) {
+                        top_pos = i;
+                    }
+                }
+                for (int64_t i = 0; i < n_ids; ++i) {
+                    const int32_t id = ids[i];
+                    if (i == top_pos || id < 0 || id >= (int32_t) c.resident_slot.size() || !(probs[i] > 0.0f)) {
+                        continue;
+                    }
+                    const bool available = c.vram[id] || c.base[id] ||
+                            (c.resident_slot[id] >= 0 && c.resident_filled[id] != 0) ||
+                            (epid >= 0 && p.evict_has(epid, ((int64_t) il << 32) | (uint32_t) id));
+                    if (available) {
+                        continue;
+                    }
+                    const float cs = probs[i];
+                    int32_t best = -1;
+                    for (int k = 0; k < (int) sppool.size() && k < (int) p.substitute_pool; ++k) {
+                        const float   e   = sppool[(size_t) k].first;
+                        const int32_t bid = sppool[(size_t) k].second;
+                        if (e > cs / p.substitute_rel) {
+                            continue; // stronger than the window, not a stand-in
+                        }
+                        if (e < p.substitute_rel * cs) {
+                            break; // sorted, everything after is weaker
+                        }
+                        if (bid < 0 || bid >= (int32_t) c.resident_slot.size()) {
+                            continue;
+                        }
+                        if (c.resident_slot[bid] < 0 || c.resident_filled[bid] == 0) {
+                            continue; // only host residents can be pointed at
+                        }
+                        bool used = false;
+                        for (const int32_t u : subst_used) {
+                            if (u == bid) {
+                                used = true;
+                                break;
+                            }
+                        }
+                        if (used) {
+                            continue;
+                        }
+                        best = k;
+                        break;
+                    }
+                    if (best < 0) {
+                        continue;
+                    }
+                    const float  e       = sppool[(size_t) best].first;
+                    const double perturb = std::fabs((double) cs - (double) e);
+                    if (token_cap && p.tok_dropped_mass + layer_subst_mass + perturb > token_budget) {
+                        continue;
+                    }
+                    subst[(size_t) i]       = 1;
+                    subst_slot[(size_t) i]  = c.resident_slot[sppool[(size_t) best].second];
+                    subst_scale[(size_t) i] = e / cs;
+                    subst_used.push_back(sppool[(size_t) best].second);
+                    layer_subst_mass += perturb;
+                }
+            }
+            // a substituted expert is already handled, so it is not a drop
+            // candidate
+            {
+                size_t w = 0;
+                for (size_t r = 0; r < cold.size(); ++r) {
+                    if (subst[(size_t) cold[r]] == 0) {
+                        cold[w++] = cold[r];
+                    }
+                }
+                cold.resize(w);
+            }
             // drop the lowest-score candidates, up to round(Q * n_expert_used):
-            // the floor decides which experts are weak, Q caps how many of them
-            // are dropped
+            // the floor decides which experts are weak and Q caps how many of
+            // them are dropped. The token ceiling is a running budget over the
+            // token's layer fills, so the final perturbation is bounded
+            double dropped_mass = 0.0;
             if (p.drop_fraction > 0.0f) {
                 int32_t budget = (int32_t) std::llround((double) p.drop_fraction * (double) n_ids);
                 budget = std::min<int32_t>(budget, (int32_t) cold.size());
                 std::sort(cold.begin(), cold.end(), [probs](int64_t a, int64_t b) {
                     return probs[a] < probs[b];
                 });
+                const bool   token_cap    = p.drop_max_mass_token > 0.0f;
+                const double token_budget = (double) p.drop_max_mass_token * (p.tok_routed_mass + layer_mass);
                 for (int32_t k = 0; k < budget; ++k) {
+                    const double w = (double) probs[cold[(size_t) k]];
+                    if (token_cap && p.tok_dropped_mass + layer_subst_mass + dropped_mass + w > token_budget) {
+                        break;
+                    }
                     drop[(size_t) cold[(size_t) k]] = 1;
+                    dropped_mass += w;
                 }
+            }
+            // token ceiling accounting: the running budget the next layer sees.
+            // The per-layer worst tracks the same combined perturbation as the
+            // cap, so a substitution-only run is not reported as 0%
+            if (p.drop_fraction > 0.0f || p.substitute_enabled()) {
+                const double layer_perturb = layer_subst_mass + dropped_mass;
+                if (layer_mass > 0.0 && layer_perturb / layer_mass > p.drop_worst_mass) {
+                    p.drop_worst_mass = layer_perturb / layer_mass;
+                }
+                p.tok_routed_mass  += layer_mass;
+                p.tok_dropped_mass += layer_perturb;
             }
         }
 
@@ -3274,13 +3672,32 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
             if (id < 0 || id >= (int32_t) c.resident_slot.size()) {
                 continue;
             }
+            p.n_routed_routes++;
 
             // cache-aware dropping: a dropped expert points at the sentinel, so
             // the host mul_mat_id skips it and nothing is read. keep[id] feeds
             // the graph's weight renormalization
-            const bool dropped = drop_planned && i < (int64_t) drop.size() && drop[(size_t) i] != 0;
+            const bool dropped     = drop_planned && i < (int64_t) drop.size()  && drop[(size_t) i]  != 0;
+            const bool substituted = drop_planned && i < (int64_t) subst.size() && subst[(size_t) i] != 0;
             if (c.keep != nullptr) {
-                ((float *) c.keep->data)[id] = dropped ? 0.0f : 1.0f;
+                ((float *) c.keep->data)[id] = dropped ? 0.0f : (substituted ? subst_scale[(size_t) i] : 1.0f);
+            }
+            if (substituted) {
+                // the position reads the spare's resident slot instead of a
+                // transient read for this id; keep scaled the gathered weight
+                // from the cold score to the spare score
+                table[id] = subst_slot[(size_t) i];
+                p.n_subst_routes++;
+                if (probs != nullptr) {
+                    const double cw = (double) probs[i];
+                    p.n_subst_mass += std::fabs(cw - cw * (double) subst_scale[(size_t) i]);
+                }
+                for (int r = 0; r < 3; ++r) {
+                    if (regions[r].stride != 0) {
+                        p.n_subst_bytes += regions[r].stride;
+                    }
+                }
+                continue;
             }
             if (dropped) {
                 table[id] = pool.sentinel;
@@ -3839,6 +4256,16 @@ void llama_disk_stage::split_token_end() {
 #if defined(_WIN32)
     impl & p = *pimpl;
     split_cold_end();
+    // close the token ceiling budget: keep the worst token share of the interval
+    // for the report, then reset for the next token
+    if (p.tok_routed_mass > 0.0) {
+        const double frac = p.tok_dropped_mass / p.tok_routed_mass;
+        if (frac > p.drop_worst_token_mass) {
+            p.drop_worst_token_mass = frac;
+        }
+    }
+    p.tok_routed_mass  = 0.0;
+    p.tok_dropped_mass = 0.0;
     const impl::split_acc & a = p.trace_split_tok;
     if (a.layers == 0) {
         return;

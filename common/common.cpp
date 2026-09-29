@@ -1733,6 +1733,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.disk_stage_split_hot     = params.disk_stage_split_hot;
     cparams.disk_stage_drop_fraction  = params.disk_stage_drop_fraction;
     cparams.disk_stage_drop_below_rel = params.disk_stage_drop_below_rel;
+    cparams.disk_stage_drop_max_mass_token = params.disk_stage_drop_max_mass_token;
+    cparams.disk_stage_drop_substitute_rel  = params.disk_stage_drop_substitute_rel;
+    cparams.disk_stage_drop_substitute_pool = params.disk_stage_drop_substitute_pool;
     cparams.disk_stage_drop_probe     = params.disk_stage_drop_probe;
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;

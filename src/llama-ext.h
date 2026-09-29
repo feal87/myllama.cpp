@@ -111,6 +111,7 @@ struct llama_expert_cache_stats {
     uint64_t budget_bytes     = 0;
     uint64_t route_hits       = 0;
     uint64_t route_misses     = 0;
+    uint64_t route_routed     = 0;
     uint64_t assigned_routes  = 0;
     uint64_t unassigned_routes = 0;
     uint64_t fills            = 0;

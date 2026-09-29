@@ -1182,6 +1182,7 @@ These metrics are for the direct-I/O MoE path (`--load-mode dio` on supported sy
 | `llamacpp:moe_decode_cache_base_routes_total` | Counter | Decode routes whose expert belongs to the base set. |
 | `llamacpp:moe_decode_cache_base_experts_used_total` | Counter | Base experts that have been routed at least once. |
 | `llamacpp:moe_decode_cache_dropped_routes_total` | Counter | Decode routes dropped by cache-aware opportunistic dropping. |
+| `llamacpp:moe_decode_cache_routed_total` | Counter | Decode routes seen by the RAM decode cache (hits, misses, drops and substitutions). |
 | `llamacpp:moe_decode_cache_dropped_bytes_total` | Counter | Disk read bytes skipped by cache-aware opportunistic dropping. |
 | `llamacpp:moe_disk_l2_hits_total` | Counter | All disk-stage L2 lookup hits. |
 | `llamacpp:moe_disk_l2_misses_total` | Counter | All disk-stage L2 lookup misses. |
