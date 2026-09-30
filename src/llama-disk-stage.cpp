@@ -3455,6 +3455,15 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
     const std::vector<impl::region> & regions = p.layer_regions[il];
     const int epid = p.evict_pool_for(il);
 
+    // an id needs no disk read this token: VRAM, a permanent base resident, an
+    // existing RAM slot (filled or still waiting for its fill), or an L2 entry.
+    // A reserved slot counts even before its fill, so the tier never wastes the
+    // slot by dropping the read that would fill it
+    const auto available_id = [&](int32_t id) {
+        return c.vram[id] || c.base[id] || c.resident_slot[id] >= 0 ||
+                (epid >= 0 && p.evict_has(epid, ((int64_t) il << 32) | (uint32_t) id));
+    };
+
     // the decode worker owns its own read queue, so it reads through the decode
     // handle when one exists
     const auto job_handle = [&p](const impl::region & r) {
@@ -3538,11 +3547,9 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                 if (id < 0 || id >= (int32_t) c.resident_slot.size()) {
                     continue;
                 }
-                // served without a disk read: VRAM, filled RAM resident, L2 pool,
-                // or a permanent base resident. A base expert is never dropped
-                const bool available = c.vram[id] || c.base[id] ||
-                        (c.resident_slot[id] >= 0 && c.resident_filled[id] != 0) ||
-                        (epid >= 0 && p.evict_has(epid, ((int64_t) il << 32) | (uint32_t) id));
+                // a reserved RAM slot counts even before its fill. A base
+                // expert is never dropped
+                const bool available = available_id(id);
                 p.n_routed_mass += (double) probs[i];
                 layer_mass      += (double) probs[i];
                 if (p.drop_probe) {
@@ -3621,9 +3628,7 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                     if (id < 0 || id >= (int32_t) c.resident_slot.size()) {
                         continue;
                     }
-                    const bool is_cold = !(c.vram[id] || c.base[id] ||
-                            (c.resident_slot[id] >= 0 && c.resident_filled[id] != 0) ||
-                            (epid >= 0 && p.evict_has(epid, ((int64_t) il << 32) | (uint32_t) id)));
+                    const bool is_cold = !available_id(id);
                     if (!is_cold || !(probs[i] > 0.0f)) {
                         continue;
                     }
@@ -3725,10 +3730,7 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                     if (i == top_pos || id < 0 || id >= (int32_t) c.resident_slot.size() || !(probs[i] > 0.0f)) {
                         continue;
                     }
-                    const bool available = c.vram[id] || c.base[id] ||
-                            (c.resident_slot[id] >= 0 && c.resident_filled[id] != 0) ||
-                            (epid >= 0 && p.evict_has(epid, ((int64_t) il << 32) | (uint32_t) id));
-                    if (available) {
+                    if (available_id(id)) {
                         continue;
                     }
                     const float cs = probs[i];
@@ -4710,6 +4712,28 @@ bool llama_disk_stage::resident_filled(int il, int32_t id) const {
     GGML_UNUSED(il);
     GGML_UNUSED(id);
     return false;
+#endif
+}
+
+size_t llama_disk_stage::resident_held_unfilled() const {
+#if defined(_WIN32)
+    impl & p = *pimpl;
+    if (!p.active) {
+        return 0;
+    }
+
+    std::lock_guard<std::mutex> lock(p.cache_mu);
+    size_t n = 0;
+    for (const impl::cache_layer & c : p.cache) {
+        for (size_t id = 0; id < c.resident_slot.size(); ++id) {
+            if (c.resident_slot[id] >= 0 && c.resident_filled[id] == 0) {
+                n++;
+            }
+        }
+    }
+    return n;
+#else
+    return 0;
 #endif
 }
 

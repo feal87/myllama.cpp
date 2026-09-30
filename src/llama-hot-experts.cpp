@@ -192,6 +192,7 @@ void llama_hot_expert_cache::print_stats(bool final_report, uint64_t ram_hit, ui
     uint64_t n_prompt_decays     = 0;
     size_t   n_inflight          = 0;
     size_t   n_queued            = 0;
+    size_t   n_held_unfilled     = 0;
     size_t   n_moe_layers        = 0;
     uint32_t n_reports           = 0;
     bool     prefetch_active     = false;
@@ -307,6 +308,12 @@ void llama_hot_expert_cache::print_stats(bool final_report, uint64_t ram_hit, ui
     const size_t n_free      = (size_t) std::max((int32_t) n_pin_total - (int32_t) total_pinned, 0);
     const double mib         = 1024.0 * 1024.0;
 
+    // resident slots without bytes in them: a promotion whose expert has not
+    // been routed again yet, so its fill has not run
+    if (disk_stage != nullptr) {
+        n_held_unfilled = disk_stage->resident_held_unfilled();
+    }
+
     // per-layer breakdown, already in layer order
     size_t n_layers_used = 0;
     for (const size_t c : per_layer) {
@@ -329,9 +336,9 @@ void llama_hot_expert_cache::print_stats(bool final_report, uint64_t ram_hit, ui
         out += '\n';
     };
 
-    line("  slots    : %zu/%d residents (dynamic %zu, base %zu ram + %d vram) | free %zu"
+    line("  slots    : %zu/%d residents (dynamic %zu, base %zu ram + %d vram) | free %zu | unfilled %zu"
          " | pools %d | layers %zu/%zu | min-count %" PRIu64 " | in flight %zu, queued %zu",
-         total_pinned, n_pin_total, n_dynamic, n_base_ram, n_base_vram, n_free, n_pools,
+         total_pinned, n_pin_total, n_dynamic, n_base_ram, n_base_vram, n_free, n_held_unfilled, n_pools,
          n_layers_used, n_moe_layers ? n_moe_layers : per_layer.size(), min_pin_count, n_inflight,
          n_queued);
 

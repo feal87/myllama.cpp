@@ -201,6 +201,11 @@ public:
     void base_remove(int il, int32_t id);
     bool resident_slot_held(int il, int32_t id) const;
 
+    // resident slots with no bytes in them yet: a promotion reserved the slot
+    // but its fill has not run. The RAM tier report prints this so held capacity
+    // that is not serving reads is visible
+    size_t resident_held_unfilled() const;
+
     // set selected by the last base_set_by_name() lookup, for logs and stats
     const std::string & active_base_set() const;
 
