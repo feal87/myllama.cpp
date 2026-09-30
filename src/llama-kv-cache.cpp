@@ -1801,6 +1801,10 @@ uint32_t llama_kv_cache::get_size_target() const {
     return target.size;
 }
 
+uint32_t llama_kv_cache::get_n_seq_max() const {
+    return n_seq_max;
+}
+
 uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }

@@ -177,6 +177,7 @@ public:
 
     uint32_t get_size()     const;
     uint32_t get_size_target() const;  // final cell capacity after a lazy in-flight downshift (== get_size() otherwise)
+    uint32_t get_n_seq_max() const;
     uint32_t get_n_stream() const;
 
     bool get_has_shift() const;
