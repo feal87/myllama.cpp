@@ -99,12 +99,14 @@ static ggml_backend_buffer_t disk_buft_alloc_buffer(ggml_backend_buffer_type_t b
 ggml_backend_buffer_type_t llama_disk_buft(void) {
     static struct ggml_backend_buffer_type buft = {
         /* .iface = */ {
-            /* .get_name       = */ disk_buft_get_name,
-            /* .alloc_buffer   = */ disk_buft_alloc_buffer,
-            /* .get_alignment  = */ disk_buft_get_alignment,
-            /* .get_max_size   = */ nullptr,
-            /* .get_alloc_size = */ disk_buft_get_alloc_size,
-            /* .is_host        = */ disk_buft_is_host,
+            /* .get_name         = */ disk_buft_get_name,
+            /* .alloc_buffer     = */ disk_buft_alloc_buffer,
+            /* .alloc_buffer_n   = */ nullptr,
+            /* .get_alignment    = */ disk_buft_get_alignment,
+            /* .get_max_size     = */ nullptr,
+            /* .get_alloc_size   = */ disk_buft_get_alloc_size,
+            /* .get_alloc_size_n = */ nullptr,
+            /* .is_host          = */ disk_buft_is_host,
         },
         /* .device  = */ nullptr,
         /* .context = */ nullptr,

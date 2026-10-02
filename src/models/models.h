@@ -351,6 +351,12 @@ struct llama_model_modern_bert : public llama_model_base {
 
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);
+
+        ggml_tensor * build_decision_head(
+                const llama_model & model,
+                ggml_tensor * inp,
+                llm_graph_input_attn_no_cache * inp_attn,
+                ggml_tensor * inp_out_ids);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
@@ -2389,7 +2395,7 @@ struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params);
     ~llama_model_qwen4exp() override;
 
-    class llm_graph_input_qsa;
+    class llm_graph_input_kpool;
 
     // --lazy-mode on-direct: read the lazy PLE table rows with explicit offsets
     // host-side instead of faulting them in through the mmap; see qwen4exp.cpp
@@ -2402,7 +2408,12 @@ struct llama_model_qwen4exp : public llama_model_base {
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
-    private:
+    protected:
+        // the helpers alone, graph_mtp builds its own body
+        struct no_build {};
+        graph(const llama_model & model, const llm_graph_params & params, no_build) :
+            llm_build_delta_net_base(params), model(model) {}
+
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         ggml_tensor * build_hc_mix(
                     ggml_tensor * x,
@@ -2422,36 +2433,35 @@ struct llama_model_qwen4exp : public llama_model_base {
         ggml_tensor * build_layer_attn(
               llm_graph_input_attn_kv * inp_attn,
   const llama_memory_hybrid_idx_context * mctx_hyb,
+          llm_graph_input_kpool * inp_kpool,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                             int * sections,
                             int   il);
 
-        // dense self-attention restricted to the cells that top_k names
+        // dense self-attention over the cells the QSA mask keeps
         ggml_tensor * build_attn_qsa(
         llm_graph_input_attn_kv * inp,
                     ggml_tensor * q_cur,
                     ggml_tensor * k_cur,
                     ggml_tensor * v_cur,
-                    ggml_tensor * top_k,
-                    ggml_tensor * qsa_bias,
+                    ggml_tensor * sel,
+                        int64_t   n_sel,
                           float   kq_scale,
-                            int   il,
-                           bool   gather = false);
+                            int   il);
 
-        // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
-        // so the layers sharing a ratio share one input set
-        std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
+        // the QSA layers share one set of k-pool inputs, see llama_memory_hybrid_idx
+        llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb);
 
-        // QSA: token indices this layer's queries may attend to, or nullptr for dense
-        ggml_tensor * build_qsa_top_k(
+        // QSA: the additive mask [n_kv, n_tokens] of the top blocks and the tail, kq_mask included
+        ggml_tensor * build_qsa_sel(
   const llama_memory_hybrid_idx_context * mctx_hyb,
+          llm_graph_input_kpool * inp_kpool,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                     ggml_tensor * kq_mask,
                             int * sections,
-                            int   il,
-                           bool   gather = false);
+                            int   il);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,
@@ -2495,6 +2505,11 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int   il);
 
         const llama_model & model;
+    };
+
+    // MTP draft head: one QSA block after the trunk, fed by the trunk's hc-wide residual
+    struct graph_mtp : public graph {
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

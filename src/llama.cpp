@@ -75,7 +75,7 @@ enum llama_load_mode llama_load_mode_from_str(const char * str) {
     if (std::strcmp(str, "mmap+mlock") == 0) { return LLAMA_LOAD_MODE_MMAP_MLOCK; }
     if (std::strcmp(str, "dio")        == 0) { return LLAMA_LOAD_MODE_DIRECT_IO;  }
     if (std::strcmp(str, "mmap+pin") == 0)    { return LLAMA_LOAD_MODE_MMAP_PIN;    }
-    throw std::invalid_argument(std::string("unknown load mode: ") + str);
+    GGML_ABORT("unknown load mode: %s", str);
 }
 
 struct llama_sampler_chain_params llama_sampler_chain_default_params() {
