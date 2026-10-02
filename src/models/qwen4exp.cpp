@@ -724,12 +724,13 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         if (r == 0) {
             continue;
         }
-        if (hparams.indexer_kpool != 0 && r != hparams.indexer_kpool) {
+        // full attention never reads the pools, so only the sparse path needs the ratios to agree
+        if (hparams.sparse_attn && hparams.indexer_kpool != 0 && r != hparams.indexer_kpool) {
             throw std::runtime_error(format("QSA layers must share one compress ratio, got %u and %u", hparams.indexer_kpool, r));
         }
         hparams.indexer_kpool = r;
     }
-    if (hparams.indexer_kpool == 1 || (hparams.indexer_kpool > 0 && hparams.indexer_top_k % hparams.indexer_kpool != 0)) {
+    if (hparams.sparse_attn && (hparams.indexer_kpool == 1 || (hparams.indexer_kpool > 0 && hparams.indexer_top_k % hparams.indexer_kpool != 0))) {
         throw std::runtime_error(format("QSA needs a compress ratio above 1 that divides the budget, got %u and %u",
                                         hparams.indexer_kpool, hparams.indexer_top_k));
     }
