@@ -316,6 +316,10 @@ public:
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
 
+    // reset the lazy KV ladder to its first (highest precision) rung and drop
+    // the cached graphs, since the cache layout changed outside of a decode
+    bool reset_lazy_quant();
+
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 

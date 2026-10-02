@@ -5571,6 +5571,37 @@ bool llama_memory_reset_lazy_quant(llama_memory_t mem) {
     return mem->reset_lazy_quant();
 }
 
+// reset the ladder through the context so that the cached graph results are
+// dropped as well: reset_lazy_quant() changes the active rung and resizes the
+// cells outside of a decode, so a graph built for the previous rung must not be
+// reused
+bool llama_context::reset_lazy_quant() {
+    if (!memory) {
+        return false;
+    }
+
+    const bool res = memory->reset_lazy_quant();
+
+    sched_need_reserve = true;
+
+    for (auto & r : gf_res_prev) {
+        if (r) {
+            r->reset();
+        }
+    }
+    gf_res_prev_active = nullptr;
+
+    return res;
+}
+
+bool llama_context_reset_lazy_quant(llama_context * ctx) {
+    if (!ctx) {
+        return false;
+    }
+
+    return ctx->reset_lazy_quant();
+}
+
 // llama state API
 
 // deprecated

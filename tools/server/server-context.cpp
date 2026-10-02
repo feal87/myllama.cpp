@@ -457,9 +457,9 @@ struct server_slot {
         prompt.clear();
 
         // an empty cache can go back to the lazy overlay
-        llama_memory_reset_lazy_quant(llama_get_memory(ctx_tgt));
+        llama_context_reset_lazy_quant(ctx_tgt);
         if (ctx_dft != nullptr) {
-            llama_memory_reset_lazy_quant(llama_get_memory(ctx_dft));
+            llama_context_reset_lazy_quant(ctx_dft);
         }
     }
 
@@ -4106,9 +4106,9 @@ private:
                                 llama_memory_t mem = llama_get_memory(ctx_tgt);
                                 if (n_past > 0 && n_past <= reset_max && llama_memory_can_reset_lazy_quant(mem)) {
                                     slot.mem.seq_rm(slot.id, -1, -1);
-                                    llama_memory_reset_lazy_quant(mem);
+                                    llama_context_reset_lazy_quant(ctx_tgt);
                                     if (ctx_dft != nullptr) {
-                                        llama_memory_reset_lazy_quant(llama_get_memory(ctx_dft));
+                                        llama_context_reset_lazy_quant(ctx_dft);
                                     }
 
                                     n_past   = 0;

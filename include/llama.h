@@ -969,6 +969,12 @@ extern "C" {
     // Only effective when the memory is empty, returns true if it was reset
     LLAMA_API bool llama_memory_reset_lazy_quant(llama_memory_t mem);
 
+    // Reset a lazy-quantized memory to its higher-precision overlay type and
+    // invalidate the cached compute graphs, so the next decode rebuilds them
+    // for the restored rung. Use this instead of llama_memory_reset_lazy_quant
+    // when the reset happens outside of a decode.
+    LLAMA_API bool llama_context_reset_lazy_quant(llama_context * ctx);
+
     //
     // State / sessions
     //
