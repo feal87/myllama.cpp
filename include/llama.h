@@ -973,7 +973,7 @@ extern "C" {
     // invalidate the cached compute graphs, so the next decode rebuilds them
     // for the restored rung. Use this instead of llama_memory_reset_lazy_quant
     // when the reset happens outside of a decode.
-    LLAMA_API bool llama_context_reset_lazy_quant(llama_context * ctx);
+    LLAMA_API bool llama_context_reset_lazy_quant(struct llama_context * ctx);
 
     //
     // State / sessions
