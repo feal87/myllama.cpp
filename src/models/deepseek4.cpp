@@ -1291,6 +1291,19 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
             exp_probs_b = nullptr;
         }
 
+        // build the shared expert inside build_moe_ffn so it is emitted
+        // between the host expert chain and the VRAM cache chain: the GPU
+        // can launch it while the host experts (and their disk reads) run
+        llm_graph_build_shexp_fn build_shexp = [this, il, &layer](ggml_tensor * inp) -> ggml_tensor * {
+            ggml_tensor * ffn_shexp = build_ffn(inp,
+                    layer.ffn_up_shexp,   nullptr, nullptr,
+                    layer.ffn_gate_shexp, nullptr, nullptr,
+                    layer.ffn_down_shexp, nullptr, nullptr,
+                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+            cb(ffn_shexp, "ffn_shexp", il);
+            return ffn_shexp;
+        };
+
         ggml_tensor * moe_out = build_moe_ffn(cur,
                 layer.ffn_gate_inp,
                 layer.ffn_up_exps,
@@ -1307,17 +1320,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 nullptr,
                 nullptr,
                 nullptr,
-                selected_experts);
-        cb(moe_out, "ffn_moe_out", il);
-
-        ggml_tensor * ffn_shexp = build_ffn(cur,
-                layer.ffn_up_shexp, nullptr, nullptr,
-                layer.ffn_gate_shexp, nullptr, nullptr,
-                layer.ffn_down_shexp, nullptr, nullptr,
-                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
-        cb(ffn_shexp, "ffn_shexp", il);
-
-        cur = ggml_add(ctx0, moe_out, ffn_shexp);
+                selected_experts,
+                build_shexp);
+        cur = moe_out;
         cb(cur, "ffn_out", il);
 
         inpL = build_hc_post(cur, residual, post, comb, il);
