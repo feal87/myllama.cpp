@@ -288,6 +288,9 @@ struct llama_disk_stage::impl {
     // resolved --disk-stage-sparse-max: multi-token ubatches below this read
     // only their routed experts
     int32_t sparse_max = 32;
+    // roles whose expert stride differs across layers: their shared region can
+    // hold another layer's data at a different alignment
+    bool region_mixed[3] = { false, false, false };
 
 #if defined(_WIN32)
     HANDLE iocp     = nullptr; // one completion port, every staging file associated with it
@@ -2055,6 +2058,22 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
         }
     }
 
+    // a role is mixed when layers disagree on the expert stride, so a layer's
+    // non-routed experts can hold another layer's bytes on a block boundary
+    {
+        size_t first_stride[3] = { 0, 0, 0 };
+        for (int il = 0; il < n_layer; ++il) {
+            if (!src[il].ok) { continue; }
+            for (const auto & role : roles) {
+                const size_t s = src[il].r[role.slot].stride;
+                if (first_stride[role.slot] == 0) {
+                    first_stride[role.slot] = s;
+                } else if (first_stride[role.slot] != s) {
+                    p.region_mixed[role.slot] = true;
+                }
+            }
+        }
+    }
     size_t region_off[3] = { 0, 0, 0 };
     size_t per_buffer = 0; // one layer's worth, all roles
     for (const auto & role : roles) {
@@ -2102,6 +2121,11 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     ggml_backend_buffer_set_usage(p.pool, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
     p.base = (char *) align_up((uintptr_t) ggml_backend_buffer_get_base(p.pool), disk_stage_align);
+
+    // some kernels read a few blocks past an expert's last row into the next
+    // one; the sparse fill leaves the non-routed experts unwritten, so start the
+    // whole pool finite
+    ggml_backend_buffer_clear(p.pool, 0);
 
     // alternate the staging buffer along the order of stageable layers, so a
     // layer and its read-ahead target never share one
@@ -3430,6 +3454,28 @@ void llama_disk_stage::fill_selected(int il, const int32_t * ids, int64_t n_ids)
     }
 
     fill_run(il, used.data());
+
+    // Mixed-stride roles share one region across layers with different expert
+    // strides, so a hole can hold another layer's bytes on a block boundary. If
+    // a kernel over-reads past an expert it then sees a NaN/Inf block scale that
+    // the zero tail cannot hide (0*NaN=NaN); zero the head of each hole.
+    for (int role = 0; role < (int) p.layer_regions[il].size() && role < 3; ++role) {
+        if (!p.region_mixed[role]) { continue; }
+        const impl::region & r = p.layer_regions[il][role];
+        if (r.file == nullptr || r.stride == 0) { continue; }
+        char * slab = p.base + r.pool_off + r.head;
+        const size_t head = std::min(r.stride, disk_stage_align);
+        for (int32_t e = 0; e < n_expert; ++e) {
+            if (used[(size_t) e]) { continue; }
+            std::memset(slab + (size_t) e * r.stride, 0, head);
+        }
+        // the last expert's over-read runs past its own data
+        const size_t cap = r.read_len >= r.head ? r.read_len - r.head : 0;
+        const size_t end = (size_t) n_expert * r.stride;
+        if (end < cap) {
+            std::memset(slab + end, 0, std::min(cap - end, head));
+        }
+    }
 #else
     GGML_UNUSED(il);
     GGML_UNUSED(ids);
