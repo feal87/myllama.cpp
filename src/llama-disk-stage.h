@@ -70,6 +70,19 @@ struct llama_disk_stage_cache_layer {
     bool force_weights_host = false;
 };
 
+// L2 view of one MoE layer: the second-level pool the staging slabs hold during
+// decode. A routed expert that the RAM cache missed executes here in place, so
+// `table` maps expert id -> L2 slot and `skip` marks the pool's sentinel (an
+// expert not in the L2 falls through to the disk read path). One pool serves
+// several layers, so the tensors are shared and only table/skip are per layer.
+struct llama_disk_stage_l2_layer {
+    ggml_tensor * gate  = nullptr; // [n_ff, n_embd, n_slots]
+    ggml_tensor * up    = nullptr;
+    ggml_tensor * down  = nullptr;
+    ggml_tensor * table = nullptr; // I32 [n_expert], expert id -> L2 slot
+    ggml_tensor * skip  = nullptr; // I32 [n_slots], 1 at the sentinel
+};
+
 class llama_disk_stage {
 public:
     // staging is Windows-only and requires the unbuffered read path
@@ -123,6 +136,9 @@ public:
 
     // persistent decode cache of layer il, or null when the cache is off
     const llama_disk_stage_cache_layer * cache_layer(int il) const;
+
+    // L2 pool view of layer il, or null when the layer has no L2 pool
+    const llama_disk_stage_l2_layer * l2_layer(int il) const;
 
     // ensure the routed experts of layer il are in the cache and update the
     // layer's id table; reads the non-resident ones into transient slots.

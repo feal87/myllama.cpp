@@ -2071,6 +2071,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // input row: the last layer drops its non-output rows, which can leave the
     // input empty (n_tokens == 0) and must fall back to the plain weights
     const llama_disk_stage_cache_layer * dc = nullptr;
+    const llama_disk_stage_l2_layer *    lc = nullptr;
     if (disk_stage != nullptr && il >= 0 &&
             gate_up_exps == nullptr && gate_up_exps_b == nullptr &&
             gate_exps != nullptr && up_exps != nullptr && down_exps != nullptr &&
@@ -2091,6 +2092,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 up_exps   = dc->up;
                 down_exps = dc->down;
             }
+            // the L2 pool executes the experts the RAM cache missed, in place
+            lc = disk_stage->l2_layer(il);
         }
     }
 
@@ -2195,6 +2198,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         selected_experts_c = ggml_reshape_2d(ctx0,
                 ggml_get_rows(ctx0, dc->table, selected_experts), n_expert_used, n_tokens);
         cb(selected_experts_c, "ffn_moe_topk_cached", il);
+    }
+
+    // L2 pool: the cold pass reads its own slot space, so it needs its own remap
+    ggml_tensor * selected_experts_l2 = selected_experts;
+    if (lc != nullptr) {
+        selected_experts_l2 = ggml_reshape_2d(ctx0,
+                ggml_get_rows(ctx0, lc->table, selected_experts), n_expert_used, n_tokens);
+        cb(selected_experts_l2, "ffn_moe_topk_l2", il);
     }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
@@ -2313,8 +2324,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // the plain separate gate/up SILU layout is handled, and the cold pass
     // mirrors the host activation, swiglu clamp included.
     const bool split_host =
-        dc != nullptr && dc->slot_skip_hot != nullptr && dc->slot_skip_cold != nullptr &&
-        backend_cpu_split != nullptr && !weight_before_ffn && type_op == LLM_FFN_SILU;
+        dc != nullptr && lc != nullptr && backend_cpu_split != nullptr && !weight_before_ffn && type_op == LLM_FFN_SILU;
 
     // the decode fill picks the split or the synchronous path from this, so a
     // layer that gets no cold pass never hands a batch to the worker
@@ -2323,7 +2333,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (!split_host && dc != nullptr && llama_disk_stage::split_trace_once()) {
             LLAMA_LOG_INFO("%s: layer %d has no split-hot cold pass (split_host): %s%s%s%s\n",
                     __func__, il,
-                    dc->slot_skip_hot == nullptr ? "no hot/cold skip tables " : "",
+                    lc == nullptr ? "no L2 pool " : "",
                     backend_cpu_split == nullptr ? "no split backend " : "",
                     weight_before_ffn ? "weights before ffn " : "",
                     type_op != LLM_FFN_SILU ? "not a silu expert ffn " : "");
@@ -2363,7 +2373,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
 
         if (mc || split_host) {
-            up->src[3]       = dc != nullptr ? (split_host ? dc->slot_skip_hot : dc->slot_skip) : mc->host_table;
+            up->src[3]       = dc != nullptr ? dc->slot_skip : mc->host_table;
             up->op_params[0] = dc != nullptr ? 0 : mc->n_slots;
         }
 
@@ -2381,7 +2391,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(cur, "ffn_moe_gate", il);
 
             if (mc || split_host) {
-                cur->src[3]       = dc != nullptr ? (split_host ? dc->slot_skip_hot : dc->slot_skip) : mc->host_table;
+                cur->src[3]       = dc != nullptr ? dc->slot_skip : mc->host_table;
                 cur->op_params[0] = dc != nullptr ? 0 : mc->n_slots;
             }
         } else {
@@ -2491,7 +2501,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(experts, "ffn_moe_down", il);
 
     if (mc || split_host) {
-        experts->src[3]       = dc != nullptr ? (split_host ? dc->slot_skip_hot : dc->slot_skip) : mc->host_table;
+        experts->src[3]       = dc != nullptr ? dc->slot_skip : mc->host_table;
         experts->op_params[0] = dc != nullptr ? 0 : mc->n_slots;
         // this is the final host projection: its cached rows feed the add with
         // the device result, so they must be zeroed. Gate/up rows are dead
@@ -2591,12 +2601,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // launch overlap). The scheduler gives the cold pass its own split and
         // the node-prepare hook waits there for the disk batch that the get_rows
         // handed to the worker, i.e. after the hot compute
-        ggml_tensor * c_up   = build_lora_mm_id(up_exps,   mc_inp, selected_experts_c, nullptr);
-        ggml_tensor * c_gate = build_lora_mm_id(gate_exps, mc_inp, selected_experts_c, nullptr);
+        ggml_tensor * c_up   = build_lora_mm_id(lc->up,   mc_inp, selected_experts_l2, nullptr);
+        ggml_tensor * c_gate = build_lora_mm_id(lc->gate, mc_inp, selected_experts_l2, nullptr);
         cb(c_up,   "ffn_moe_cold_up",   il);
         cb(c_gate, "ffn_moe_cold_gate", il);
-        c_up->src[3]         = dc->slot_skip_cold;
-        c_gate->src[3]       = dc->slot_skip_cold;
+        c_up->src[3]         = lc->skip;
+        c_gate->src[3]       = lc->skip;
         c_up->op_params[0]   = 0;
         c_gate->op_params[0] = 0;
 
@@ -2626,9 +2636,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             c_act = ggml_mul(ctx0, c_g_a, c_up_c);
             cb(c_act, "ffn_moe_cold_act", il);
         }
-        ggml_tensor * c_down = build_lora_mm_id(down_exps, c_act, selected_experts_c, nullptr);
+        ggml_tensor * c_down = build_lora_mm_id(lc->down, c_act, selected_experts_l2, nullptr);
         cb(c_down, "ffn_moe_cold_down", il);
-        c_down->src[3]       = dc->slot_skip_cold;
+        c_down->src[3]       = lc->skip;
         c_down->op_params[0] = 0;
         c_down->op_params[2] = 1;
 
@@ -2642,6 +2652,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_backend_sched_set_tensor_backend(sched, c_act,    backend_cpu_split);
         ggml_backend_sched_set_tensor_backend(sched, c_down,   backend_cpu_split);
         ggml_backend_sched_set_tensor_backend(sched, experts,  backend_cpu_split);
+        // the L2 remap is tiny and feeds the cold split; keep it off the hot
+        // chain so it does not force an extra split of its own
+        ggml_backend_sched_set_tensor_backend(sched, selected_experts_l2, backend_cpu);
+        if (selected_experts_l2->src[0] != nullptr) {
+            ggml_backend_sched_set_tensor_backend(sched, selected_experts_l2->src[0], backend_cpu);
+        }
     }
 
     if (down_exps_s) {
