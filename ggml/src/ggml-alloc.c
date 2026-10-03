@@ -524,6 +524,16 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
         if (galloc->buf_tallocs[i] == NULL) {
             size_t alignment = ggml_backend_buft_get_alignment(bufts[i]);
             size_t max_size = ggml_backend_buft_get_max_size(bufts[i]);
+            // optional cap (MiB) on a single allocation chunk: smaller chunks keep
+            // large short-lived tensors (the MoE expert weight copies) from
+            // fragmenting the rest of the compute buffer
+            const char * chunk_env = getenv("GGML_ALLOC_MAX_CHUNK");
+            if (chunk_env != NULL) {
+                const long long chunk_mib = atoll(chunk_env);
+                if (chunk_mib > 0) {
+                    max_size = (size_t) chunk_mib * 1024 * 1024;
+                }
+            }
             galloc->buf_tallocs[i] = ggml_dyn_tallocr_new(alignment, max_size);
         }
     }
