@@ -162,6 +162,7 @@ llama_context::llama_context(
     cparams.n_moe_cache_drift_percent = params.n_moe_cache_drift_percent;
     cparams.hot_experts_prefetch     = params.hot_experts_prefetch;
     cparams.disk_stage_split_hot     = params.disk_stage_split_hot;
+    cparams.disk_stage_sparse_max    = params.disk_stage_sparse_max;
     cparams.disk_stage_drop_fraction  = params.disk_stage_drop_fraction;
     cparams.disk_stage_drop_below_rel = params.disk_stage_drop_below_rel;
     cparams.disk_stage_drop_max_mass = params.disk_stage_drop_max_mass;
@@ -201,6 +202,7 @@ llama_context::llama_context(
                 cparams.n_pin_hot_experts_pool_layers,
                 cparams.pin_experts_from_profile_path, cparams.warm_experts_from_profile_path,
                 cparams.pin_experts_template_path, cparams.disk_stage_split_hot,
+                cparams.disk_stage_sparse_max,
                 cparams.disk_stage_drop_fraction, cparams.disk_stage_drop_below_rel,
                 cparams.disk_stage_drop_max_mass,
                 cparams.disk_stage_drop_max_mass_token,
@@ -5111,6 +5113,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.hot_experts_prefetch        =*/ false,
         /*.disk_stage_split_hot        =*/ false,
+        /*.disk_stage_sparse_max       =*/ -1,
         /*.disk_stage_drop_fraction  =*/ 0.0f,
         /*.disk_stage_drop_below_rel =*/ 0.5f,
         /*.disk_stage_drop_max_mass =*/ 0.0f,

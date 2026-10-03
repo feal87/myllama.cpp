@@ -3050,6 +3050,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--disk-stage-sparse-max"}, "N",
+        "with --load-mode dio, read only the routed experts of a multi-token\n"
+        "ubatch smaller than N tokens instead of the whole layer slab. Small\n"
+        "ubatches route few experts, so the sparse read wins; large ones touch\n"
+        "almost every expert and the sequential slab read wins. N is compared\n"
+        "against the ubatch size, not the prompt length, so 0 always streams\n"
+        "the slab and a value above --ubatch-size always reads sparse. Default:\n"
+        "32, or LLAMA_DISK_STAGE_SPARSE_MAX when that is set",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --disk-stage-sparse-max must be >= 0");
+            }
+            params.disk_stage_sparse_max = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--disk-stage-drop-fraction"}, "Q",
         string_format(
             "with --load-mode dio, drop the lowest Q fraction of the experts a\n"

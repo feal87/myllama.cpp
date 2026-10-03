@@ -530,6 +530,10 @@ struct common_params {
     // (disk) pass on a second CPU backend, so the cold read overlaps the hot
     // compute. Requires --load-mode dio. See --disk-stage-split-hot.
     bool     disk_stage_split_hot  =    false;
+    // disk stage: multi-token ubatches smaller than this read only their routed
+    // experts instead of the whole slab. -1 = unset: fall back to
+    // LLAMA_DISK_STAGE_SPARSE_MAX, then 32. See --disk-stage-sparse-max.
+    int32_t  disk_stage_sparse_max =    -1;
     // disk stage: drop the lowest fraction of the routed experts of a decode
     // token when they would need a disk read (0 = off). Requires --load-mode dio.
     // See --disk-stage-drop-fraction.

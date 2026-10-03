@@ -515,6 +515,15 @@ extern "C" {
         // gate/up Silu layout is split; other layers use the single pass.
         bool disk_stage_split_hot;
 
+        // a multi-token ubatch smaller than this many tokens reads only the
+        // routed experts (fill_selected) instead of the whole layer slab (fill).
+        // Small ubatches route few experts, so the sparse read wins; large ones
+        // touch almost every expert and the sequential slab read wins. Compared
+        // against the ubatch size, not the prompt length. 0 always streams the
+        // slab. Resolved from --disk-stage-sparse-max, then the
+        // LLAMA_DISK_STAGE_SPARSE_MAX environment variable, then 32.
+        int32_t disk_stage_sparse_max;
+
         // cache-aware opportunistic dropping (--load-mode dio, Windows). On a
         // single-token decode layer a routed expert is dropped when it would
         // need a disk read (not in VRAM, a filled RAM resident or the L2 pool)

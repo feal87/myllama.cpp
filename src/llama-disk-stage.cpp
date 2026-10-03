@@ -49,10 +49,16 @@ static const size_t disk_stage_align = 4096;
 static const size_t disk_stage_chunk = 1u << 20;
 // below this many bytes a concurrent copy does not pay for a worker thread
 static const size_t disk_stage_copy_thread_min = 256 * 1024;
-// below this ubatch size the routed experts are few enough that reading only
-// them beats streaming the whole slab; the same cut makes the CUDA mul_mat_id
-// fall back to the CPU, which reads only the routed rows anyway
-static const int64_t disk_stage_sparse_tokens = 32;
+// --disk-stage-sparse-max wins; without it the LLAMA_DISK_STAGE_SPARSE_MAX
+// environment variable, then 32. A multi-token ubatch below the value reads only
+// its routed experts, larger ones stream the whole slab
+static int32_t disk_stage_sparse_max_resolve(int32_t flag) {
+    if (flag >= 0) {
+        return flag;
+    }
+    const char * s = std::getenv("LLAMA_DISK_STAGE_SPARSE_MAX");
+    return s != nullptr && s[0] != '\0' ? (int32_t) atoll(s) : 32;
+}
 
 static size_t align_up(size_t v, size_t a) {
     return (v + a - 1) & ~(a - 1);
@@ -279,6 +285,9 @@ struct llama_disk_stage::impl {
 
     const llama_model & model;
     bool active = false;
+    // resolved --disk-stage-sparse-max: multi-token ubatches below this read
+    // only their routed experts
+    int32_t sparse_max = 32;
 
 #if defined(_WIN32)
     HANDLE iocp     = nullptr; // one completion port, every staging file associated with it
@@ -1171,7 +1180,7 @@ void llama_disk_stage::stats_snapshot(llama_expert_stats & out) const {
 }
 
 bool llama_disk_stage::sparse_ubatch(int64_t n_tokens) const {
-    return n_tokens > 1 && n_tokens < disk_stage_sparse_tokens;
+    return n_tokens > 1 && n_tokens < (int64_t) pimpl->sparse_max;
 }
 
 bool llama_disk_stage::internal_decode_fill() const {
@@ -1811,7 +1820,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                    int32_t n_pin_experts, uint64_t cache_budget_bytes,
                                    int32_t pool_layers_max, const char * base_experts_path,
                                    const char * warm_experts_path, const char * base_template_path,
-                                   bool split_hot, float drop_fraction, float drop_below_rel,
+                                   bool split_hot, int32_t sparse_max, float drop_fraction, float drop_below_rel,
                                    float drop_max_mass, float drop_max_mass_token, float substitute_rel, int32_t substitute_pool,
                                    bool drop_probe) :
     pimpl(std::make_unique<impl>(model)) {
@@ -1828,6 +1837,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     GGML_UNUSED(warm_experts_path);
     GGML_UNUSED(base_template_path);
     GGML_UNUSED(split_hot);
+    GGML_UNUSED(sparse_max);
     GGML_UNUSED(drop_fraction);
     GGML_UNUSED(drop_below_rel);
     GGML_UNUSED(drop_max_mass);
@@ -1867,6 +1877,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     // split the host decode MoE into a hot and a cold pass so the cold disk read
     // overlaps the hot compute
     p.split_hot_active = split_hot;
+    p.sparse_max = disk_stage_sparse_max_resolve(sparse_max);
 
     p.iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
     if (p.iocp == nullptr) {

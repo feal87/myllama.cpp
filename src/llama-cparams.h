@@ -109,6 +109,11 @@ struct llama_cparams {
     // compute (--disk-stage-split-hot)
     bool disk_stage_split_hot;
 
+    // disk stage: multi-token ubatches smaller than this read only their routed
+    // experts instead of the whole slab (--disk-stage-sparse-max). 0 always
+    // streams the slab; resolved from the flag, then the environment, then 32
+    int32_t disk_stage_sparse_max;
+
     // disk stage: drop the lowest fraction of the routed experts of a decode
     // token when they would need a disk read (--disk-stage-drop-fraction, 0 = off)
     float   disk_stage_drop_fraction;
