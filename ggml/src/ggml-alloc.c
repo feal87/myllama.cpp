@@ -121,6 +121,9 @@ struct tallocr_chunk {
 struct ggml_dyn_tallocr {
     size_t alignment;
     size_t max_chunk_size;
+    // no backend-imposed max size: the interval allocator may build the layout
+    // for this buffer type instead of the incremental best-fit
+    bool unlimited;
     struct tallocr_chunk * chunks[GGML_VBUFFER_MAX_CHUNKS];
     int n_chunks;
 
@@ -363,12 +366,13 @@ static void ggml_dyn_tallocr_reset(struct ggml_dyn_tallocr * alloc) {
 #endif
 }
 
-static struct ggml_dyn_tallocr * ggml_dyn_tallocr_new(size_t alignment, size_t max_buffer_size) {
+static struct ggml_dyn_tallocr * ggml_dyn_tallocr_new(size_t alignment, size_t max_buffer_size, bool unlimited) {
     struct ggml_dyn_tallocr * alloc = (struct ggml_dyn_tallocr *)malloc(sizeof(struct ggml_dyn_tallocr));
 
     *alloc = (struct ggml_dyn_tallocr) {
         /*.alignment      = */ alignment,
         /*.max_chunk_size = */ MIN(max_buffer_size, SIZE_MAX/2), // clamp to avoid overflows
+        /*.unlimited      = */ unlimited,
         /*.chunks         = */ {NULL},
         /*.n_chunks       = */ 0,
 #ifdef GGML_ALLOCATOR_DEBUG
@@ -460,6 +464,7 @@ struct hash_node {
     int n_children;
     int n_views;
     int buffer_id;
+    int unit; // index into galloc->units for the interval layout, -1 for views/external
     struct buffer_address addr;
     bool allocated;
 };
@@ -480,6 +485,21 @@ struct node_alloc {
     struct tensor_alloc src[GGML_MAX_SRC];
 };
 
+// one entry of the interval layout: a contiguous allocation valid for the
+// inclusive step range [birth, death]. In-place reuse chains several units at
+// the same offset (head -> next), each smaller or equal, so the tail of a
+// larger source is free from the step the next unit is born
+struct gallocr_unit {
+    struct ggml_tensor * tensor;
+    int      buffer_id;
+    size_t   size;
+    int      birth;
+    int      death;
+    int      head;  // first unit of the alias chain
+    int      next;  // next unit of the chain, or -1
+    size_t   offset;
+};
+
 struct ggml_gallocr {
     ggml_backend_buffer_type_t * bufts; // [n_buffers]
     struct vbuffer ** buffers; // [n_buffers]
@@ -494,6 +514,14 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    // interval layout state, used only while a reserve is planned
+    struct gallocr_unit * units;
+    int n_units;
+    int units_cap;
+    int plan_step;
+    bool planning;
+    bool alloc_logged;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -524,17 +552,10 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
         if (galloc->buf_tallocs[i] == NULL) {
             size_t alignment = ggml_backend_buft_get_alignment(bufts[i]);
             size_t max_size = ggml_backend_buft_get_max_size(bufts[i]);
-            // optional cap (MiB) on a single allocation chunk: smaller chunks keep
-            // large short-lived tensors (the MoE expert weight copies) from
-            // fragmenting the rest of the compute buffer
-            const char * chunk_env = getenv("GGML_ALLOC_MAX_CHUNK");
-            if (chunk_env != NULL) {
-                const long long chunk_mib = atoll(chunk_env);
-                if (chunk_mib > 0) {
-                    max_size = (size_t) chunk_mib * 1024 * 1024;
-                }
-            }
-            galloc->buf_tallocs[i] = ggml_dyn_tallocr_new(alignment, max_size);
+            // a buffer type without a max size uses the interval allocator; one
+            // with a max size keeps the incremental chunked allocator
+            const bool unlimited = (max_size == SIZE_MAX);
+            galloc->buf_tallocs[i] = ggml_dyn_tallocr_new(alignment, max_size, unlimited);
         }
     }
     galloc->n_buffers = n_bufs;
@@ -587,6 +608,7 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->buf_tallocs);
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
+    free(galloc->units);
     free(galloc);
 }
 
@@ -631,8 +653,112 @@ static void ggml_gallocr_free_extra_space(ggml_gallocr_t galloc, struct ggml_ten
     }
 }
 
+// interval layout: record an allocation unit, growing the unit array as needed
+static int ggml_gallocr_unit_new(ggml_gallocr_t galloc, struct ggml_tensor * tensor, int buffer_id,
+        size_t size, int birth, int head) {
+    if (galloc->n_units >= galloc->units_cap) {
+        galloc->units_cap = galloc->units_cap > 0 ? galloc->units_cap * 2 : 256;
+        galloc->units = realloc(galloc->units, (size_t) galloc->units_cap * sizeof(struct gallocr_unit));
+        GGML_ASSERT(galloc->units != NULL);
+    }
+    const int u = galloc->n_units++;
+    galloc->units[u] = (struct gallocr_unit) {
+        /*.tensor    =*/ tensor,
+        /*.buffer_id =*/ buffer_id,
+        /*.size      =*/ size,
+        /*.birth     =*/ birth,
+        /*.death     =*/ INT_MAX,
+        /*.head      =*/ head,
+        /*.next      =*/ -1,
+        /*.offset    =*/ 0,
+    };
+    return u;
+}
+
+// record the unit for `node` during the plan pass. Mirrors the in-place checks in
+// ggml_gallocr_allocate_node, but chains units instead of copying a runtime address
+static void ggml_gallocr_plan_node(ggml_gallocr_t galloc, struct ggml_tensor * node, int buffer_id) {
+    struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
+
+    if (ggml_gallocr_is_allocated(galloc, node) || ggml_impl_is_view(node)) {
+        return;
+    }
+    hn->allocated = true;
+
+    const size_t size = ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], node);
+
+    // try to reuse a parent's buffer (inplace)
+    if (ggml_op_can_inplace(node->op)) {
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            struct ggml_tensor * parent = node->src[i];
+            if (parent == NULL) {
+                continue;
+            }
+            if (!ggml_gallocr_is_own(galloc, parent)) {
+                continue;
+            }
+            if (parent->flags & GGML_TENSOR_FLAG_OUTPUT || (parent->view_src != NULL && parent->view_src->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                continue;
+            }
+            if (!ggml_are_same_layout(node, parent)) {
+                continue;
+            }
+            struct hash_node * p_hn = ggml_gallocr_hash_get(galloc, parent);
+            if (p_hn->n_children != 1 || p_hn->n_views != 0) {
+                continue;
+            }
+            // only a view at the start of its source is reused, and only when the
+            // source has no other views. A nested view source has no unit here
+            struct hash_node * tail_hn = p_hn;
+            if (ggml_impl_is_view(parent)) {
+                if (parent->view_offs != 0) {
+                    continue;
+                }
+                struct ggml_tensor * view_src = parent->view_src;
+                struct hash_node * view_src_hn = ggml_gallocr_hash_get(galloc, view_src);
+                if (view_src_hn->n_views != 1 || view_src_hn->n_children != 0 || view_src_hn->unit < 0) {
+                    continue;
+                }
+                p_hn->allocated = false; // the view itself is not freed
+                tail_hn = view_src_hn;
+            }
+            const int tail = tail_hn->unit;
+            const int head = galloc->units[tail].head;
+            galloc->units[tail].death = galloc->plan_step;
+            const int u = ggml_gallocr_unit_new(galloc, node, galloc->units[tail].buffer_id, size, galloc->plan_step, head);
+            galloc->units[tail].next = u;
+            hn->unit = u;
+            hn->buffer_id = galloc->units[tail].buffer_id;
+            tail_hn->allocated = false; // avoid freeing the tail, its death is set above
+            return;
+        }
+    }
+
+    hn->unit = ggml_gallocr_unit_new(galloc, node, buffer_id, size, galloc->plan_step, -1);
+    galloc->units[hn->unit].head = hn->unit;
+    hn->buffer_id = buffer_id;
+}
+
+static void ggml_gallocr_plan_free_node(ggml_gallocr_t galloc, struct ggml_tensor * node) {
+    // graph outputs are never freed
+    if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+        return;
+    }
+    struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
+    if (hn->unit >= 0) {
+        galloc->units[hn->unit].death = galloc->plan_step;
+    }
+    hn->allocated = false;
+}
+
 static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor * node, int buffer_id) {
     GGML_ASSERT(buffer_id >= 0);
+
+    if (galloc->planning) {
+        ggml_gallocr_plan_node(galloc, node, buffer_id);
+        return;
+    }
+
     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
 
     if (!ggml_gallocr_is_allocated(galloc, node) && !ggml_impl_is_view(node)) {
@@ -700,6 +826,11 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
 }
 
 static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * node) {
+    if (galloc->planning) {
+        ggml_gallocr_plan_free_node(galloc, node);
+        return;
+    }
+
     // graph outputs are never freed
     if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
         AT_PRINTF("not freeing output %s\n", node->name);
@@ -726,10 +857,246 @@ static int get_node_buffer_id(const int * node_buffer_ids, int i) {
     return node_buffer_ids ? node_buffer_ids[i] : 0;
 }
 
+// interval layout: place every unit of one address space in decreasing size order.
+// Two units share memory iff their live intervals are disjoint; each unit gets the
+// lowest offset that does not conflict with an already placed unit it overlaps in time
+struct gallocr_range {
+    size_t begin;
+    size_t end;
+};
+
+static int gallocr_range_cmp(const void * va, const void * vb) {
+    const struct gallocr_range * a = (const struct gallocr_range *) va;
+    const struct gallocr_range * b = (const struct gallocr_range *) vb;
+    if (a->begin != b->begin) {
+        return a->begin < b->begin ? -1 : 1;
+    }
+    return a->end < b->end ? -1 : (a->end > b->end ? 1 : 0);
+}
+
+struct gallocr_unit_order {
+    size_t size;
+    int    unit;
+};
+
+static int gallocr_unit_order_cmp(const void * va, const void * vb) {
+    const struct gallocr_unit_order * a = (const struct gallocr_unit_order *) va;
+    const struct gallocr_unit_order * b = (const struct gallocr_unit_order *) vb;
+    if (a->size != b->size) {
+        return a->size > b->size ? -1 : 1; // largest first
+    }
+    return a->unit < b->unit ? -1 : (a->unit > b->unit ? 1 : 0);
+}
+
+static void ggml_gallocr_place_talloc(ggml_gallocr_t galloc, struct ggml_dyn_tallocr * talloc,
+        const int * unit_ids, int n_units) {
+    const size_t alignment = talloc->alignment;
+
+    int n_steps = 1;
+    for (int i = 0; i < n_units; i++) {
+        const struct gallocr_unit * u = &galloc->units[unit_ids[i]];
+        if (u->birth + 1 > n_steps) {
+            n_steps = u->birth + 1;
+        }
+        if (u->death != INT_MAX && u->death + 1 > n_steps) {
+            n_steps = u->death + 1;
+        }
+    }
+
+    int * step_head = (int *) malloc((size_t) n_steps * sizeof(int));
+    GGML_ASSERT(step_head != NULL);
+    for (int i = 0; i < n_steps; i++) {
+        step_head[i] = -1;
+    }
+
+    int entries_cap = 1024;
+    int n_entries = 0;
+    int * entry_unit = (int *) malloc((size_t) entries_cap * sizeof(int));
+    int * entry_next = (int *) malloc((size_t) entries_cap * sizeof(int));
+    GGML_ASSERT(entry_unit != NULL && entry_next != NULL);
+
+    struct gallocr_unit_order * order = (struct gallocr_unit_order *) malloc((size_t) n_units * sizeof(*order));
+    GGML_ASSERT(order != NULL);
+    int n_heads = 0;
+    for (int i = 0; i < n_units; i++) {
+        const struct gallocr_unit * u = &galloc->units[unit_ids[i]];
+        if (u->head == unit_ids[i]) {
+            order[n_heads].size = u->size;
+            order[n_heads].unit = unit_ids[i];
+            n_heads++;
+        }
+    }
+    qsort(order, (size_t) n_heads, sizeof(*order), gallocr_unit_order_cmp);
+
+    int * stamp = (int *) malloc((size_t) galloc->n_units * sizeof(int));
+    GGML_ASSERT(stamp != NULL);
+    for (int i = 0; i < galloc->n_units; i++) {
+        stamp[i] = 0;
+    }
+    int visit = 0;
+
+    struct gallocr_range * forb = NULL;
+    int forb_cap = 0;
+
+    for (int h = 0; h < n_heads; h++) {
+        const struct gallocr_unit * head = &galloc->units[order[h].unit];
+
+        // the whole in-place chain shares the offset, so the head must be placed
+        // clear of conflicts over every segment's interval, not just its own
+        int chain_death = head->death;
+        for (int v = head->next; v >= 0; v = galloc->units[v].next) {
+            chain_death = galloc->units[v].death;
+        }
+
+        // collect the ranges of already placed units whose interval overlaps the head
+        visit++;
+        int n_forb = 0;
+        const int last = chain_death == INT_MAX ? n_steps - 1 : chain_death;
+        for (int s = head->birth; s <= last; s++) {
+            for (int e = step_head[s]; e != -1; e = entry_next[e]) {
+                const int v = entry_unit[e];
+                if (stamp[v] == visit) {
+                    continue;
+                }
+                stamp[v] = visit;
+                if (n_forb == forb_cap) {
+                    forb_cap = forb_cap > 0 ? forb_cap * 2 : 64;
+                    forb = (struct gallocr_range *) realloc(forb, (size_t) forb_cap * sizeof(*forb));
+                    GGML_ASSERT(forb != NULL);
+                }
+                forb[n_forb].begin = galloc->units[v].offset;
+                forb[n_forb].end   = galloc->units[v].offset + galloc->units[v].size;
+                n_forb++;
+            }
+        }
+
+        qsort(forb, (size_t) n_forb, sizeof(*forb), gallocr_range_cmp);
+        size_t cur = 0;
+        for (int i = 0; i < n_forb; i++) {
+            cur = aligned_offset(NULL, cur, alignment);
+            if (cur + head->size <= forb[i].begin) {
+                break;
+            }
+            if (forb[i].end > cur) {
+                cur = forb[i].end;
+            }
+        }
+        cur = aligned_offset(NULL, cur, alignment);
+
+        // the head and every in-place unit chained to it share the offset
+        for (int u = order[h].unit; u >= 0; u = galloc->units[u].next) {
+            const int d = galloc->units[u].death == INT_MAX ? n_steps - 1 : galloc->units[u].death;
+            galloc->units[u].offset = cur;
+            for (int s = galloc->units[u].birth; s <= d; s++) {
+                if (n_entries == entries_cap) {
+                    entries_cap *= 2;
+                    entry_unit = (int *) realloc(entry_unit, (size_t) entries_cap * sizeof(int));
+                    entry_next = (int *) realloc(entry_next, (size_t) entries_cap * sizeof(int));
+                    GGML_ASSERT(entry_unit != NULL && entry_next != NULL);
+                }
+                entry_unit[n_entries] = u;
+                entry_next[n_entries] = step_head[s];
+                step_head[s] = n_entries;
+                n_entries++;
+            }
+        }
+    }
+
+    // one chunk per address space: the interval layout is already tight
+    for (int c = 0; c < talloc->n_chunks; c++) {
+        free(talloc->chunks[c]);
+        talloc->chunks[c] = NULL;
+    }
+    talloc->n_chunks = 0;
+
+    size_t high_water = 0;
+    for (int i = 0; i < n_units; i++) {
+        const struct gallocr_unit * u = &galloc->units[unit_ids[i]];
+        const size_t end = u->offset + u->size;
+        if (end > high_water) {
+            high_water = end;
+        }
+    }
+    struct tallocr_chunk * chunk = (struct tallocr_chunk *) calloc(1, sizeof(struct tallocr_chunk));
+    GGML_ASSERT(chunk != NULL);
+    chunk->n_free_blocks = 0;
+    // keep a zero-size address space allocatable (only zero-sized tensors)
+    chunk->max_size = high_water > 0 ? high_water : alignment;
+    talloc->chunks[0] = chunk;
+    talloc->n_chunks = 1;
+
+    free(forb);
+    free(stamp);
+    free(order);
+    free(entry_next);
+    free(entry_unit);
+    free(step_head);
+}
+
+static void ggml_gallocr_interval_place(ggml_gallocr_t galloc) {
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        struct ggml_dyn_tallocr * talloc = galloc->buf_tallocs[i];
+
+        // skip a tallocr already processed through an earlier buffer id
+        bool seen = false;
+        for (int j = 0; j < i; j++) {
+            if (galloc->buf_tallocs[j] == talloc) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) {
+            continue;
+        }
+
+        int n = 0;
+        for (int u = 0; u < galloc->n_units; u++) {
+            if (galloc->buf_tallocs[galloc->units[u].buffer_id] == talloc) {
+                n++;
+            }
+        }
+        if (n == 0) {
+            continue;
+        }
+        int * ids = (int *) malloc((size_t) n * sizeof(int));
+        GGML_ASSERT(ids != NULL);
+        int k = 0;
+        for (int u = 0; u < galloc->n_units; u++) {
+            if (galloc->buf_tallocs[galloc->units[u].buffer_id] == talloc) {
+                ids[k++] = u;
+            }
+        }
+        ggml_gallocr_place_talloc(galloc, talloc, ids, n);
+        free(ids);
+    }
+}
+
 static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
     // clear hash tables
     ggml_hash_set_reset(&galloc->hash_set);
     memset(galloc->hash_values, 0, sizeof(struct hash_node) * galloc->hash_set.size);
+    for (size_t i = 0; i < galloc->hash_set.size; i++) {
+        galloc->hash_values[i].unit = -1;
+    }
+
+    // the interval layout needs a single unbounded address space per buffer type;
+    // a buffer type with a max size keeps the incremental chunked allocator
+    bool interval = true;
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        if (!galloc->buf_tallocs[i]->unlimited) {
+            interval = false;
+            break;
+        }
+    }
+    if (!galloc->alloc_logged) {
+        galloc->alloc_logged = true;
+        GGML_LOG_INFO("%s: compute buffer allocator: %s\n", __func__, interval ? "interval" : "incremental");
+    }
+    if (interval) {
+        galloc->planning = true;
+        galloc->n_units = 0;
+        galloc->plan_step = 0;
+    }
 
     // allocate leafs
     // these may be tensors that the application is not using in the graph, but may still want to allocate for other purposes
@@ -775,6 +1142,8 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         int buffer_id = get_node_buffer_id(node_buffer_ids, i);
+
+        galloc->plan_step = i + 1;
 
         // allocate parents (only leafs need to be allocated at this point)
         for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -829,6 +1198,16 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
                 }
             }
             AT_PRINTF("\n");
+        }
+    }
+
+    if (interval) {
+        galloc->planning = false;
+        ggml_gallocr_interval_place(galloc);
+        for (int u = 0; u < galloc->n_units; u++) {
+            struct hash_node * hn = ggml_gallocr_hash_get(galloc, galloc->units[u].tensor);
+            hn->addr.chunk = 0;
+            hn->addr.offset = galloc->units[u].offset;
         }
     }
 }
