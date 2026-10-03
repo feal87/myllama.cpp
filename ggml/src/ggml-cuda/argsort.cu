@@ -1,5 +1,7 @@
 #include "argsort.cuh"
 
+#include <cstdlib>
+
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
 #    if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 1)
@@ -31,9 +33,17 @@ static __global__ void init_offsets(int * offsets, const int ncols, const int nr
 
 // returns the suggested maximum number of rows to process during one argsort_f32_i32_cuda_cub() call
 int argsort_f32_i32_cuda_cub_chunk_nrows(const size_t nb01, const int64_t nrows) {
-    // perform argsort in chunks up to approximately this size (currently 64MB)
-    // to avoid excessive temporary buffers memory usage
-    const int chunk_bytes = 1 << 26;
+    // four ncols*nrows buffers are live at once, so cap the chunk to bound the
+    // workspace. Batching only changes the row split, the result is identical.
+    static const int chunk_bytes = [] {
+        if (const char * env = getenv("GGML_CUDA_ARGSORT_CHUNK_MB")) {
+            const int mb = atoi(env);
+            if (mb > 0) {
+                return mb << 20;
+            }
+        }
+        return 1 << 23;
+    }();
 
     // calculate how many rows will fit in one chunk (must be at least one)
     const int chunk_nrows = std::max((int) (chunk_bytes / nb01), 1);
