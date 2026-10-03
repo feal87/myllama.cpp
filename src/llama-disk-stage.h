@@ -105,14 +105,11 @@ public:
     // that names the base set, the per-mode sets and the tool conditions that
     // select between them. It replaces base_experts_path (which is then
     // ignored) and the mode is switched at runtime through select_base_set()
-    // split_hot: split the host decode MoE into a hot (resident) and a cold
-    // (disk) pass on a second CPU backend, so the cold read overlaps the hot
-    // compute
     llama_disk_stage(const llama_model & model, ggml_backend_dev_t dev,
                      int32_t n_pin_experts, uint64_t cache_budget_bytes,
                      int32_t pool_layers_max, const char * base_experts_path,
                      const char * warm_experts_path, const char * base_template_path,
-                     bool split_hot, int32_t sparse_max, float drop_fraction, float drop_below_rel,
+                     int32_t sparse_max, float drop_fraction, float drop_below_rel,
                      float drop_max_mass, float drop_max_mass_token, float substitute_rel, int32_t substitute_pool,
                      bool drop_probe);
     ~llama_disk_stage();
@@ -146,16 +143,11 @@ public:
     // order), used by cache-aware dropping (--disk-stage-drop-fraction)
     void fill_cache(int il, const int32_t * ids, int64_t n_ids, const float * probs = nullptr);
 
-    // split-hot variant: fill_cache_begin() sets the tables and hands the disk
-    // batch to a worker, then returns so the hot pass computes; fill_cache_wait()
-    // waits for the read phase, which the cold pass needs. Only used when
-    // split_hot() is on (--disk-stage-split-hot, Windows). The cache
-    // then carries two static skip tables that split its resident slots from the
-    // transient ones, so the decoder can run the hot (resident) experts and the
-    // cold (disk) experts as two host passes: the disk read overlaps the hot
-    // compute. The worker keeps storing the transient slots into the L2 pool
-    // while the cold pass computes, and the next fill drains it before the
-    // window is reused.
+    // split-hot: fill_cache_begin() sets the tables and hands the disk batch to
+    // a worker, then returns so the hot pass computes; fill_cache_wait() waits
+    // for the read phase, which the cold pass needs. The worker keeps running the
+    // resident promotions while the cold pass computes, and the next fill drains
+    // them before it reuses a slot.
     void fill_cache_begin(int il, const int32_t * ids, int64_t n_ids, const float * probs = nullptr);
     void fill_cache_wait(int il);
 
@@ -163,10 +155,7 @@ public:
     // pass no later split reported and prints the token totals
     void split_token_end();
 
-    // true when the split-hot decode path is active (Windows + env opt-in)
-    bool split_hot() const;
-
-    // the graph records, per layer, whether it emitted a cold pass for it. The
+    // the graph records, per layer, whether it emitted a cold pass for it. The The
     // decode fill consults this to pick the split or the synchronous path, so a
     // layer without a cold pass never hands a batch to the worker
     void set_split_cold(int il, bool cold) const;

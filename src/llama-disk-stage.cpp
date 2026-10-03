@@ -1804,7 +1804,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                    int32_t n_pin_experts, uint64_t cache_budget_bytes,
                                    int32_t pool_layers_max, const char * base_experts_path,
                                    const char * warm_experts_path, const char * base_template_path,
-                                   bool split_hot, int32_t sparse_max, float drop_fraction, float drop_below_rel,
+                                   int32_t sparse_max, float drop_fraction, float drop_below_rel,
                                    float drop_max_mass, float drop_max_mass_token, float substitute_rel, int32_t substitute_pool,
                                    bool drop_probe) :
     pimpl(std::make_unique<impl>(model)) {
@@ -1820,7 +1820,6 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     GGML_UNUSED(base_experts_path);
     GGML_UNUSED(warm_experts_path);
     GGML_UNUSED(base_template_path);
-    GGML_UNUSED(split_hot);
     GGML_UNUSED(sparse_max);
     GGML_UNUSED(drop_fraction);
     GGML_UNUSED(drop_below_rel);
@@ -1860,7 +1859,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
 
     // split the host decode MoE into a hot and a cold pass so the cold disk read
     // overlaps the hot compute
-    p.split_hot_active = split_hot;
+    p.split_hot_active = true;
     p.sparse_max = disk_stage_sparse_max_resolve(sparse_max);
 
     p.iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
@@ -3109,10 +3108,6 @@ llama_disk_stage::~llama_disk_stage() {
         }
     }
 #endif
-}
-
-bool llama_disk_stage::split_hot() const {
-    return pimpl->split_hot_active;
 }
 
 void llama_disk_stage::set_split_cold(int il, bool cold) const {

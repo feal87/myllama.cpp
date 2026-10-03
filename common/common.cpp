@@ -1721,7 +1721,6 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_moe_cache_inserts      = params.n_moe_cache_inserts;
     cparams.n_moe_cache_drift_percent = params.n_moe_cache_drift_percent;
     cparams.hot_experts_prefetch     = params.hot_experts_prefetch;
-    cparams.disk_stage_split_hot     = params.disk_stage_split_hot;
     cparams.disk_stage_sparse_max    = params.disk_stage_sparse_max;
     cparams.disk_stage_drop_fraction  = params.disk_stage_drop_fraction;
     cparams.disk_stage_drop_below_rel = params.disk_stage_drop_below_rel;

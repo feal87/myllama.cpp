@@ -161,7 +161,6 @@ llama_context::llama_context(
     cparams.n_moe_cache_inserts      = params.n_moe_cache_inserts;
     cparams.n_moe_cache_drift_percent = params.n_moe_cache_drift_percent;
     cparams.hot_experts_prefetch     = params.hot_experts_prefetch;
-    cparams.disk_stage_split_hot     = params.disk_stage_split_hot;
     cparams.disk_stage_sparse_max    = params.disk_stage_sparse_max;
     cparams.disk_stage_drop_fraction  = params.disk_stage_drop_fraction;
     cparams.disk_stage_drop_below_rel = params.disk_stage_drop_below_rel;
@@ -201,7 +200,7 @@ llama_context::llama_context(
                 cparams.n_pin_hot_experts, cparams.n_pin_hot_experts_budget_bytes,
                 cparams.n_pin_hot_experts_pool_layers,
                 cparams.pin_experts_from_profile_path, cparams.warm_experts_from_profile_path,
-                cparams.pin_experts_template_path, cparams.disk_stage_split_hot,
+                cparams.pin_experts_template_path,
                 cparams.disk_stage_sparse_max,
                 cparams.disk_stage_drop_fraction, cparams.disk_stage_drop_below_rel,
                 cparams.disk_stage_drop_max_mass,
@@ -226,11 +225,6 @@ llama_context::llama_context(
     require_disk(cparams.pin_experts_template_path,      "--pin-experts-template");
 
     const bool disk_active = disk_stage != nullptr;
-
-    if (cparams.disk_stage_split_hot && !disk_active) {
-        LLAMA_LOG_WARN("%s: --disk-stage-split-hot has no effect without the disk decode cache "
-                       "(--load-mode dio on Windows)\n", __func__);
-    }
 
     if (cparams.disk_stage_drop_fraction > 0.0f && !disk_active) {
         LLAMA_LOG_WARN("%s: --disk-stage-drop-fraction has no effect without the disk decode cache "
@@ -562,7 +556,7 @@ llama_context::llama_context(
         // the hot compute. Registered BEFORE the main CPU backend so the latter
         // stays the scheduler's last backend: the prefill VRAM/host overlap is an
         // early launch gated on the last backend
-        if (disk_stage != nullptr && disk_stage->split_hot()) {
+        if (disk_stage != nullptr) {
             backend_cpu_split = ggml_backend_cpu_init();
             if (backend_cpu_split == nullptr) {
                 throw std::runtime_error("failed to initialize the split CPU backend");
@@ -5112,7 +5106,6 @@ llama_context_params llama_context_default_params() {
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.hot_experts_prefetch        =*/ false,
-        /*.disk_stage_split_hot        =*/ false,
         /*.disk_stage_sparse_max       =*/ -1,
         /*.disk_stage_drop_fraction  =*/ 0.0f,
         /*.disk_stage_drop_below_rel =*/ 0.5f,

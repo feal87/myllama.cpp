@@ -2086,14 +2086,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 down_exps = ds->down;
             }
         } else if (n_tokens == 1) {
-            dc = disk_stage->cache_layer(il);
+            // the decode cache needs the cold/hot split, and the split only
+            // handles the plain separate gate/up SILU layout. A layer that cannot
+            // split keeps the original weights, so no routed expert is silently
+            // dropped from the MoE
+            const bool split_ok = backend_cpu_split != nullptr && !weight_before_ffn &&
+                                  type_op == LLM_FFN_SILU;
+            lc = split_ok ? disk_stage->l2_layer(il) : nullptr;
+            dc = lc != nullptr ? disk_stage->cache_layer(il) : nullptr;
             if (dc != nullptr) {
                 gate_exps = dc->gate;
                 up_exps   = dc->up;
                 down_exps = dc->down;
             }
-            // the L2 pool executes the experts the RAM cache missed, in place
-            lc = disk_stage->l2_layer(il);
         }
     }
 

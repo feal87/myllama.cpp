@@ -526,10 +526,6 @@ struct common_params {
     // toggle: off by default; on its own (no pinning, no MoE cache) it still
     // starts the hot-expert ranking engine. See --hot-experts-prefetch.
     bool     hot_experts_prefetch  =    false;
-    // disk stage: split the host decode MoE into a hot (resident) and a cold
-    // (disk) pass on a second CPU backend, so the cold read overlaps the hot
-    // compute. Requires --load-mode dio. See --disk-stage-split-hot.
-    bool     disk_stage_split_hot  =    false;
     // disk stage: multi-token ubatches smaller than this read only their routed
     // experts instead of the whole slab. -1 = unset: fall back to
     // LLAMA_DISK_STAGE_SPARSE_MAX, then 32. See --disk-stage-sparse-max.

@@ -104,11 +104,6 @@ struct llama_cparams {
     // engine on its own, so it works standalone (no pin, no MoE tier)
     bool hot_experts_prefetch;
 
-    // disk stage: split the host decode MoE into a hot (resident) and a cold
-    // (disk) pass on a second CPU backend, so the cold read overlaps the hot
-    // compute (--disk-stage-split-hot)
-    bool disk_stage_split_hot;
-
     // disk stage: multi-token ubatches smaller than this read only their routed
     // experts instead of the whole slab (--disk-stage-sparse-max). 0 always
     // streams the slab; resolved from the flag, then the environment, then 32
