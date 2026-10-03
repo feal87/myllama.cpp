@@ -148,6 +148,21 @@ gh pr comment
 gh issue create
 ```
 
+Windows / Git Bash:
+
+The agent shell is Git Bash (MSYS), which rewrites arguments that look like paths. This breaks `cmd.exe /c ...`: `/c` becomes a path, so cmd starts interactive and the command never runs. Double the slash so MSYS converts it back to `/c`.
+
+```sh
+# GOOD: run a .bat with args and capture the output
+cmd //c "_build.bat llama-server llama-cli" > build.log 2>&1
+
+# BAD: /c is rewritten to a path, cmd starts interactive and nothing runs
+cmd /c "_build.bat llama-server llama-cli"
+
+# BAD: keeps //c, which cmd rejects
+MSYS_NO_PATHCONV=1 cmd //c "_build.bat llama-server llama-cli"
+```
+
 ## Useful Resources
 
 To conserve context space, load these resources as needed:
