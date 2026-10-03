@@ -568,6 +568,9 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     }
 };
 
+// debug: name of the node whose op is allocating, for GGML_CUDA_POOL_TRACE
+static const char * g_cuda_curr_node = "";
+
 // pool with virtual memory
 #if defined(GGML_USE_VMM)
 struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
@@ -720,8 +723,8 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         size = alignment * ((size + alignment - 1) / alignment);
 
         if (!grow(size)) {
-            GGML_ABORT(GGML_CUDA_NAME " pool[%d]: out of device memory growing by %.2f MiB\n",
-                       device, size/1024.0/1024.0);
+            GGML_ABORT(GGML_CUDA_NAME " pool[%d]: out of device memory growing by %.2f MiB (op %s)\n",
+                       device, size/1024.0/1024.0, g_cuda_curr_node);
         }
 
         GGML_ASSERT(pool_addr != 0);
@@ -730,12 +733,12 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         *actual_size = size;
         pool_used += size;
         if (pool_used > pool_used_max) {
-            // opt-in: report what sets the pool high-water mark, to attribute
-            // the scratch peak to an op (GGML_CUDA_POOL_TRACE=1)
+            // opt-in: report what sets the pool high-water mark and the op that
+            // owns it (GGML_CUDA_POOL_TRACE=1)
             static const bool trace = getenv("GGML_CUDA_POOL_TRACE") != nullptr;
             if (trace) {
-                GGML_LOG_INFO("cuda scratch pool[%d]: new peak %.2f MiB (last alloc %.2f MiB, reserved %.2f MiB)\n",
-                        device, pool_used/1024.0/1024.0, size/1024.0/1024.0, pool_size/1024.0/1024.0);
+                GGML_LOG_INFO("cuda scratch pool[%d]: new peak %.2f MiB (last alloc %.2f MiB, reserved %.2f MiB, op %s)\n",
+                        device, pool_used/1024.0/1024.0, size/1024.0/1024.0, pool_size/1024.0/1024.0, g_cuda_curr_node);
             }
             pool_used_max = pool_used;
         }
@@ -2242,6 +2245,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    g_cuda_curr_node = dst->name;
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
