@@ -1812,8 +1812,9 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
 
     llama_mem_tag_scope mem_scope("disk");
 
-#if !defined(_WIN32)
     GGML_UNUSED(dev);
+
+#if !defined(_WIN32)
     GGML_UNUSED(n_pin_experts);
     GGML_UNUSED(cache_budget_bytes);
     GGML_UNUSED(pool_layers_max);
@@ -2076,18 +2077,12 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
         return;
     }
 
-    // LLAMA_DISK_STAGE_PAGEABLE=1 forces plain CPU memory for the staging, to
-    // measure the host->VRAM offload copy against the pinned host buffer
-    const char * s_pageable = std::getenv("LLAMA_DISK_STAGE_PAGEABLE");
-    const bool   pageable   = s_pageable != nullptr && s_pageable[0] != '0';
-
-    // one staging buffer, aliased by every layer's staging tensors. Prefer the
-    // device's pinned host buffer so the host->VRAM offload copy reads from
-    // page-locked memory; fall back to plain CPU memory
-    ggml_backend_buffer_type_t buft = pageable ? nullptr : ggml_backend_dev_host_buffer_type(dev);
-    if (buft == nullptr) {
-        buft = ggml_backend_cpu_buffer_type();
-    }
+    // one staging buffer, aliased by every layer's staging tensors. Plain CPU
+    // memory: the host mul_mat_id addresses the L2 slots the pool holds during
+    // decode, so it must live on the CPU backend. A pinned device host buffer
+    // would move the L2 tensors onto the device, and the scheduler would then
+    // copy the whole pool for the cold pass
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
     p.pool = ggml_backend_buft_alloc_buffer(buft, total);
     if (p.pool == nullptr && p.n_buf > 1) {
@@ -2885,8 +2880,6 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     }
 
     p.active = true;
-    LLAMA_LOG_INFO("%s: staging memory %s (%s)\n", __func__,
-                   ggml_backend_buft_name(buft), pageable ? "pageable" : "pinned");
     LLAMA_LOG_INFO("%s: disk staging active for %d layer(s), %.1f MiB pool, %d buffer(s), %zu-byte aligned unbuffered reads\n",
                    __func__, n_staged, total / (1024.0 * 1024.0), p.n_buf, disk_stage_align);
 
