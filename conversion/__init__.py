@@ -42,6 +42,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "ChameleonForConditionalGeneration": "chameleon",
     "ChatGLMForConditionalGeneration": "chatglm",
     "ChatGLMModel": "chatglm",
+    "ClefModel": "clef",
     "CodeShellForCausalLM": "codeshell",
     "CogVLMForCausalLM": "cogvlm",
     "Cohere2MoeForCausalLM": "command_r",
@@ -49,6 +50,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "CohereForCausalLM": "command_r",
     "DbrxForCausalLM": "dbrx",
     "DeciLMForCausalLM": "deci",
+    "PplxDeciderModel": "pplx_decider",
     "DeepseekForCausalLM": "deepseek",
     "DeepseekOCRForCausalLM": "deepseek",
     "DeepseekV2ForCausalLM": "deepseek",
@@ -154,6 +156,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "LevModel": "lev",
     "NimbleModel": "lev",
     "Lfm25AudioTokenizer": "lfm2",
+    "Lfm2BidirectionalForMaskedLM": "lfm2",
     "Lfm2BidirectionalModel": "lfm2",
     "Lfm2ForCausalLM": "lfm2",
     "Lfm2Model": "lfm2",
@@ -296,7 +299,9 @@ TEXT_MODEL_MAP: dict[str, str] = {
 
 MMPROJ_MODEL_MAP: dict[str, str] = {
     "AudioFlamingo3ForConditionalGeneration": "ultravox",
+    "ClefModel": "clef",
     "CogVLMForCausalLM": "cogvlm",
+    "PplxDeciderModel": "pplx_decider",
     "DeepseekOCR2ForCausalLM": "deepseek",
     "DeepseekOCRForCausalLM": "deepseek",
     "DeepseekV4ForCausalLM": "deepseek",
