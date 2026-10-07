@@ -9,6 +9,23 @@
 >
 > Read more: [CONTRIBUTING.md](CONTRIBUTING.md)
 
+## Fork merge policy
+
+This fork carries features upstream does not have. To keep upstream merges cheap, do not carry two
+implementations of the same feature: keep the fork one and drop the upstream one, including its
+leftovers.
+
+Known duplicate:
+
+- Upstream `src/llama-moe-cache.cpp` / `src/llama-moe-cache.h` is a separate GPU cache for MoE
+experts kept in host memory. The fork already has `src/llama-moecache.cpp` /
+`src/llama-moecache.h`, driven by the hot-expert ranking (`src/llama-hot-experts.cpp`) and the
+direct-read disk stage. Keep the fork version. After each upstream merge run
+`scripts/fork-post-merge.sh`: it removes the upstream files and fails if the `moe_cache_size`
+leftovers (`include/llama.h`, `src/llama-cparams.h`, `src/llama-context.cpp`,
+`common/{common.h,common.cpp,arg.cpp,speculative.cpp}`, `src/CMakeLists.txt`,
+`tests/test-llama-archs.cpp`) are still there.
+
 > [!NOTE]
 > These apply to ggml-org/llama.cpp, ignore these if you are operating in a different repository or fork.
 

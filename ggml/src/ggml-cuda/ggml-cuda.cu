@@ -890,7 +890,8 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
 
         if (padded_size > original_size) {
             ggml_cuda_set_device(ctx->device);
-            CUDA_CHECK(cudaMemset((char *)tensor->data + original_size, 0, padded_size - original_size));
+            CUDA_CHECK(cudaMemsetAsync((char *)tensor->data + original_size, 0, padded_size - original_size, cudaStreamPerThread));
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
         }
     }
     return GGML_STATUS_SUCCESS;
@@ -5442,9 +5443,6 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 case GGML_UNARY_OP_CEIL:
                 case GGML_UNARY_OP_ROUND:
                 case GGML_UNARY_OP_TRUNC:
-                    if (op->src[0]->type == GGML_TYPE_BF16 && ggml_get_unary_op(op) == GGML_UNARY_OP_XIELU) {
-                        return false;
-                    }
                     // TODO: should become:
                     //return ggml_is_contiguous_rows(op->src[0]);
                     return ggml_is_contiguous(op->src[0]);
