@@ -166,6 +166,12 @@ public:
     // back to host, so a decode store cannot clobber the restored weights
     void dec_io_drain();
 
+    // drop every L2 entry and reset the per-layer tables to their sentinel. The
+    // context calls this right after the dense demotion, when the host bytes the
+    // extra L2 regions sit on become weights again, so a stale slot can never be
+    // read once its contents changed
+    void evict_invalidate();
+
     // the graph records, per layer, whether it emitted a cold pass for it. The The
     // decode fill consults this to pick the split or the synchronous path, so a
     // layer without a cold pass never hands a batch to the worker

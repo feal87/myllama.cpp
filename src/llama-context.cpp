@@ -4859,6 +4859,11 @@ void llama_context::vram_swap(bool to_prefill) {
                 disk_stage->dec_io_drain();
             }
             dense_vram->demote();
+            // the extra L2 regions just became weights again: drop the entries
+            // now, before any prefill path can serve one
+            if (disk_stage) {
+                disk_stage->evict_invalidate();
+            }
         }
         moe_cache->suspend();
         ggml_backend_sched_release_buffers(sched.get());

@@ -1010,6 +1010,24 @@ struct llama_disk_stage::impl {
         }
     }
 
+    // evict_clear plus a reset of every per-layer table. Used when the memory the
+    // extra L2 regions sit on changes identity (the dense host regions become
+    // weights again), so no slot can be read after its contents changed
+    void evict_invalidate() {
+        evict_clear();
+        for (l2_layer & L : l2) {
+            if (L.table == nullptr || L.pool < 0 || L.pool >= (int) evict_pools.size()) {
+                continue;
+            }
+            const int32_t sentinel = evict_pools[(size_t) L.pool].sentinel;
+            int32_t * t = (int32_t *) L.table->data;
+            for (int64_t e = 0; e < (int64_t) L.table->ne[0] * L.table->ne[1]; ++e) {
+                t[e] = sentinel;
+            }
+        }
+        evict_populated = false;
+    }
+
     // double-buffered staging pipeline: one reader thread reads the next
     // stageable layer while the current layer computes. n_buf == 1 disables it
     // (a read-ahead would clobber the buffer in use)
@@ -4308,6 +4326,12 @@ void llama_disk_stage::dec_io_drain() {
     p.fs_res_pending.clear();
     p.fs_l2_consume.clear();
 #endif
+}
+
+void llama_disk_stage::evict_invalidate() {
+    impl & p = *pimpl;
+    std::lock_guard<std::mutex> lock(p.cache_mu);
+    p.evict_invalidate();
 }
 
 void llama_disk_stage::fill_cache_begin(int il, const int32_t * ids, int64_t n_ids, const float * probs) {
