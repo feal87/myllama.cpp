@@ -340,6 +340,7 @@ struct llama_disk_stage::impl {
     ggml_backend_buffer_t cache_buf  = nullptr;
     ggml_context *        cache_ctx  = nullptr;
     std::unique_ptr<llama_mlock> cache_lock; // decode cache held in RAM for the process lifetime
+    std::vector<std::unique_ptr<llama_mlock>> l2_locks; // L2 pool held in RAM (staging slabs + dense host regions)
     std::vector<cache_pool>  pools;
     std::vector<cache_layer> cache;
     // base-expert set from --pin-experts-from-profile: [layer] -> expert ids,
@@ -416,6 +417,15 @@ struct llama_disk_stage::impl {
     std::vector<l2_layer> l2;
     ggml_backend_buffer_t l2_buf = nullptr; // tables only; the weights live on the staging slabs
     ggml_context *        l2_ctx = nullptr;
+
+    // an external region the L2 pool may lay slots over during decode (e.g. the
+    // host memory of the decode-promoted dense weights)
+    struct l2_region {
+        ggml_backend_buffer_t buf;
+        char *  base;
+        size_t  size;
+    };
+    std::vector<ggml_backend_buffer_t> extra_l2_bufs; // wrapped external regions, freed with the stage
 
     uint64_t n_l2_hits        = 0;
     uint64_t n_l2_misses      = 0;
@@ -1017,6 +1027,11 @@ struct llama_disk_stage::impl {
     std::vector<int8_t>  layer_buf;  // layer -> staging buffer index
 
     ~impl() {
+        // the external L2 regions belong to the model, so release their locks
+        for (auto & ml : l2_locks) {
+            ml->unlock();
+        }
+        l2_locks.clear();
         if (pool) {
             ggml_backend_buffer_free(pool);
         }
@@ -1028,6 +1043,9 @@ struct llama_disk_stage::impl {
         }
         if (cache_ctx) {
             ggml_free(cache_ctx);
+        }
+        for (ggml_backend_buffer_t b : extra_l2_bufs) {
+            ggml_backend_buffer_free(b);
         }
 #if defined(_WIN32)
         if (iocp != nullptr) {
@@ -1076,6 +1094,53 @@ struct llama_disk_stage::impl {
         LLAMA_LOG_INFO("%s: decode cache held in RAM: %.2f GiB locked, touched in %.0f ms\n",
                        __func__, bytes / (1024.0 * 1024.0 * 1024.0), (ggml_time_us() - t0) / 1000.0);
 
+        return true;
+    }
+
+    // Hold the L2 pool's RAM for real, like the decode cache. The L2 slots back
+    // the decode hits, so a page that can be paged out turns a hit into a
+    // pagefile read. `ranges` are the byte runs the pool uses; the working set
+    // is raised to cover them plus the decode cache, then each run is locked.
+    // False when a run cannot be pinned, so the caller can refuse to start
+    bool lock_l2_regions(const std::vector<std::pair<void *, size_t>> & ranges) {
+        if (ranges.empty()) {
+            return true;
+        }
+        if (!llama_mlock::SUPPORTED) {
+            LLAMA_LOG_ERROR("%s: the L2 pool cannot be held in RAM on this platform\n", __func__);
+            return false;
+        }
+
+        size_t l2_bytes = 0;
+        for (const auto & r : ranges) {
+            l2_bytes += r.second;
+        }
+        // the working set is the quota VirtualLock is measured against; the
+        // decode cache is already locked, so reserve the sum of both
+        const size_t ws = (cache_lock ? cache_lock->size() : 0) + l2_bytes;
+        if (!llama_mlock::reserve_working_set(ws + 64 * 1024 * 1024)) {
+            LLAMA_LOG_ERROR("%s: could not reserve a working set for the %.2f GiB L2 pool; "
+                            "lower --pin-hot-experts-budget-mib\n",
+                            __func__, l2_bytes / (1024.0 * 1024.0 * 1024.0));
+            return false;
+        }
+
+        for (const auto & r : ranges) {
+            auto ml = std::make_unique<llama_mlock>();
+            ml->init(r.first);
+            ml->grow_to(r.second);
+            if (ml->size() < r.second) {
+                LLAMA_LOG_ERROR("%s: only %.2f of the %.2f GiB L2 pool could be held in RAM; "
+                                "lower --pin-hot-experts-budget-mib\n",
+                                __func__, ml->size() / (1024.0 * 1024.0 * 1024.0),
+                                r.second / (1024.0 * 1024.0 * 1024.0));
+                return false;
+            }
+            l2_locks.push_back(std::move(ml));
+        }
+
+        LLAMA_LOG_INFO("%s: L2 pool held in RAM: %.2f GiB locked\n",
+                       __func__, l2_bytes / (1024.0 * 1024.0 * 1024.0));
         return true;
     }
 
@@ -1809,7 +1874,8 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                    const char * warm_experts_path, const char * base_template_path,
                                    int32_t sparse_max, float drop_fraction, float drop_below_rel,
                                    float drop_max_mass, float drop_max_mass_token, float substitute_rel, int32_t substitute_pool,
-                                   bool drop_probe) :
+                                   bool drop_probe,
+                                   const std::vector<std::pair<void *, size_t>> & extra_l2_regions) :
     pimpl(std::make_unique<impl>(model)) {
     impl & p = *pimpl;
 
@@ -2568,6 +2634,30 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                         // with cheaper experts than the region budget fits more
                         // slots
                         if (all_aligned && p.n_buf >= 2) {
+                            // the L2 pool lives on the prefill staging slabs during
+                            // decode; external regions (the decode-promoted dense
+                            // weights' host memory) become extra slabs, wrapped in
+                            // CPU buffers so the scheduler keeps the L2 tensors on
+                            // the host backend instead of copying the pool
+                            std::vector<impl::l2_region> l2_regions;
+                            for (int b = 0; b < p.n_buf; ++b) {
+                                l2_regions.push_back({ p.pool, p.base + (size_t) b * per_buffer, per_buffer });
+                            }
+                            for (const auto & r : extra_l2_regions) {
+                                if (r.first == nullptr || r.second < (size_t) 4 * disk_stage_align) {
+                                    continue;
+                                }
+                                ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr(r.first, r.second);
+                                if (buf == nullptr) {
+                                    continue;
+                                }
+                                // same usage as the staging pool, so the scheduler treats
+                                // the L2 tensors as weights and keeps them on the host
+                                ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                                p.extra_l2_bufs.push_back(buf);
+                                l2_regions.push_back({ buf, (char *) r.first, r.second });
+                            }
+
                             // group the stageable layers by expert-bundle type: a
                             // slot stride is fixed per tensor, so only identical
                             // tensors can share one pool. Start with one pool per
@@ -2607,15 +2697,15 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                             // types that cover the most layers, the remaining
                             // layers keep streaming (a prefill clears the pools
                             // anyway, so a partial pool is safe)
-                            if ((int) l2_groups.size() > p.n_buf) {
+                            if ((int) l2_groups.size() > (int) l2_regions.size()) {
                                 std::stable_sort(l2_groups.begin(), l2_groups.end(),
                                                  [](const std::vector<int> & a, const std::vector<int> & b) {
                                                      return a.size() > b.size();
                                                  });
-                                l2_groups.resize((size_t) p.n_buf);
+                                l2_groups.resize(l2_regions.size());
                             }
 
-                            while ((int) l2_groups.size() < p.n_buf) {
+                            while ((int) l2_groups.size() < (int) l2_regions.size()) {
                                 size_t best = l2_groups.size();
                                 for (size_t k = 0; k < l2_groups.size(); ++k) {
                                     if (l2_groups[k].size() < 2) {
@@ -2636,6 +2726,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
 
                             p.evict_pool_id.assign(n_layer, -1);
                             p.l2.resize(n_layer);
+                            std::vector<char> region_used(l2_regions.size(), 0);
 
                             // the L2 tables and skip tables are tiny CPU tensors; the
                             // pool weights themselves live on the staging slabs
@@ -2657,8 +2748,12 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                             };
 
                             for (size_t g = 0; g < l2_groups.size(); ++g) {
+                                if (g >= l2_regions.size()) {
+                                    break;
+                                }
                                 const int il  = l2_groups[g][0];
                                 const int pid = (int) p.evict_pools.size();
+                                const impl::l2_region & reg = l2_regions[g];
 
                                 size_t per_slot = 0;
                                 int    n_role   = 0;
@@ -2669,13 +2764,14 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                         n_role++;
                                     }
                                 }
-                                if (per_slot == 0 || per_buffer <= (size_t) n_role * disk_stage_align) {
+                                if (per_slot == 0 || reg.size <= (size_t) n_role * disk_stage_align) {
                                     continue;  // cannot size this type; leave the L2 off
                                 }
-                                const int32_t cap = (int32_t) ((per_buffer - (size_t) n_role * disk_stage_align) / per_slot);
+                                const int32_t cap = (int32_t) ((reg.size - (size_t) n_role * disk_stage_align) / per_slot);
                                 if (cap <= 1) {
                                     continue;
                                 }
+                                region_used[g] = 1;
 
                                 impl::evict_pool ep;
                                 ep.cap      = cap;
@@ -2689,7 +2785,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                     if (stride == 0) {
                                         continue;
                                     }
-                                    ep.data[role.slot]   = p.base + (size_t) pid * per_buffer + off;
+                                    ep.data[role.slot]   = reg.base + off;
                                     ep.stride[role.slot] = align_up(stride, disk_stage_align);
                                     off += (size_t) ep.cap * ep.stride[role.slot] + disk_stage_align;
                                 }
@@ -2705,7 +2801,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                     ggml_tensor * t = ggml_new_tensor_3d(p.ctx, s->type, s->ne[0], s->ne[1], ep.cap);
                                     ggml_format_name(t, "disk_l2_%s.%d", role.suffix, pid);
                                     t->nb[2] = ep.stride[role.slot];
-                                    ggml_backend_tensor_alloc(p.pool, t, ep.data[role.slot]);
+                                    ggml_backend_tensor_alloc(reg.buf, t, ep.data[role.slot]);
                                     tensors[role.slot] = t;
                                 }
                                 ep.gate = tensors[0];
@@ -2744,6 +2840,31 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                     L.pub.down  = pool.down;
                                     L.pub.table = L.table;
                                     L.pub.skip  = pool.skip;
+                                }
+                            }
+
+                            // the L2 slots must not be paged out: a swapped slot turns
+                            // a decode hit into a pagefile read. Pin the staging pool the
+                            // slabs live in once, plus every dense host region in use
+                            if (!p.evict_pools.empty()) {
+                                std::vector<std::pair<void *, size_t>> l2_pin;
+                                bool pin_pool = false;
+                                for (size_t g = 0; g < l2_regions.size(); ++g) {
+                                    if (region_used[g] == 0) {
+                                        continue;
+                                    }
+                                    if (g < (size_t) p.n_buf) {
+                                        pin_pool = true;
+                                    } else {
+                                        l2_pin.push_back({ l2_regions[g].base, l2_regions[g].size });
+                                    }
+                                }
+                                if (pin_pool) {
+                                    l2_pin.insert(l2_pin.begin(), { ggml_backend_buffer_get_base(p.pool),
+                                                                    ggml_backend_buffer_get_size(p.pool) });
+                                }
+                                if (!p.lock_l2_regions(l2_pin)) {
+                                    throw std::runtime_error("failed to hold the MoE L2 pool in RAM");
                                 }
                             }
 

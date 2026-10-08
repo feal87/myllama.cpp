@@ -7,6 +7,7 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <regex>
@@ -27,6 +28,10 @@ struct llama_dense_vram::impl {
     ggml_backend_buffer_t buf_dev = nullptr;
 
     uint64_t nbytes = 0;
+
+    // contiguous host byte runs of the promoted set, aligned for the disk stage
+    // L2 slot layout
+    std::vector<std::pair<void *, size_t>> regions;
 
     bool armed  = false; // patterns matched at least one promotable tensor
     bool active = false; // model tensors currently repointed at the copies
@@ -59,15 +64,8 @@ struct llama_dense_vram::impl {
     }
 };
 
-llama_dense_vram::llama_dense_vram(const llama_model & model, const std::string & patterns, ggml_backend_dev_t dev)
-    : pimpl(new impl) {
-    auto & p = *pimpl;
-    p.dev = dev;
-
-    if (dev == nullptr || patterns.empty()) {
-        return;
-    }
-
+// parse the comma-separated regex list; an invalid entry is skipped with a warning
+static std::vector<std::regex> dense_parse_patterns(const char * func, const std::string & patterns) {
     std::vector<std::regex> res;
     size_t start = 0;
     while (start <= patterns.size()) {
@@ -81,7 +79,7 @@ llama_dense_vram::llama_dense_vram(const llama_model & model, const std::string 
             try {
                 res.emplace_back(token);
             } catch (const std::regex_error & err) {
-                LLAMA_LOG_WARN("%s: ignoring invalid regex '%s': %s\n", __func__, token.c_str(), err.what());
+                LLAMA_LOG_WARN("%s: ignoring invalid regex '%s': %s\n", func, token.c_str(), err.what());
             }
         }
         if (comma == std::string::npos) {
@@ -89,10 +87,15 @@ llama_dense_vram::llama_dense_vram(const llama_model & model, const std::string 
         }
         start = comma + 1;
     }
-    if (res.empty()) {
-        return;
-    }
+    return res;
+}
 
+static std::vector<ggml_tensor *> dense_match_tensors(const llama_model & model, const std::string & patterns) {
+    std::vector<ggml_tensor *> hosts;
+    const std::vector<std::regex> res = dense_parse_patterns(__func__, patterns);
+    if (res.empty()) {
+        return hosts;
+    }
     for (const auto & entry : model.tensors_by_name) {
         ggml_tensor * t = entry.second;
         if (t == nullptr || t->buffer == nullptr) {
@@ -106,21 +109,78 @@ llama_dense_vram::llama_dense_vram(const llama_model & model, const std::string 
         if (t->view_src != nullptr) {
             continue;
         }
-        bool match = false;
         for (const auto & re : res) {
             if (std::regex_search(entry.first, re)) {
-                match = true;
+                hosts.push_back(t);
                 break;
             }
         }
-        if (!match) {
+    }
+    return hosts;
+}
+
+// group the matched tensors into contiguous byte runs. Two runs merge only when
+// the gap is within one allocator alignment step; a larger gap means another
+// tensor (e.g. token_embd) sits between them and must not be covered. Each run
+// is aligned up for the disk stage slot layout
+static std::vector<std::pair<void *, size_t>> dense_regions_from(std::vector<ggml_tensor *> hosts) {
+    std::vector<std::pair<void *, size_t>> runs;
+    std::sort(hosts.begin(), hosts.end(), [](const ggml_tensor * a, const ggml_tensor * b) {
+        return (uintptr_t) a->data < (uintptr_t) b->data;
+    });
+    const uintptr_t gap_max = 4096;
+    for (const ggml_tensor * t : hosts) {
+        if (t->data == nullptr) {
             continue;
         }
-        p.hosts.push_back(t);
-        p.nbytes += ggml_nbytes(t);
+        const uintptr_t b = (uintptr_t) t->data;
+        const uintptr_t e = b + ggml_nbytes(t);
+        if (!runs.empty()) {
+            auto & r = runs.back();
+            const uintptr_t rb = (uintptr_t) r.first;
+            const uintptr_t re = rb + r.second;
+            if (b >= rb && b <= re + gap_max && e > re) {
+                r.second = (size_t) (e - rb);
+                continue;
+            }
+        }
+        runs.push_back({ (void *) b, (size_t) (e - b) });
+    }
+    std::vector<std::pair<void *, size_t>> out;
+    for (const auto & r : runs) {
+        const uintptr_t a = ((uintptr_t) r.first + 4095) & ~(uintptr_t) 4095;
+        const uintptr_t e = (uintptr_t) r.first + r.second;
+        if (e <= a) {
+            continue;
+        }
+        out.push_back({ (void *) a, (size_t) (e - a) });
+    }
+    return out;
+}
+
+std::vector<std::pair<void *, size_t>> llama_dense_vram::find_host_regions(const llama_model & model, const std::string & patterns) {
+    return dense_regions_from(dense_match_tensors(model, patterns));
+}
+
+llama_dense_vram::llama_dense_vram(const llama_model & model, const std::string & patterns, ggml_backend_dev_t dev)
+    : pimpl(new impl) {
+    auto & p = *pimpl;
+    p.dev = dev;
+
+    if (dev == nullptr || patterns.empty()) {
+        return;
     }
 
-    p.armed = !p.hosts.empty();
+    p.hosts = dense_match_tensors(model, patterns);
+    for (ggml_tensor * t : p.hosts) {
+        p.nbytes += ggml_nbytes(t);
+    }
+    p.armed   = !p.hosts.empty();
+    p.regions = dense_regions_from(p.hosts);
+}
+
+const std::vector<std::pair<void *, size_t>> & llama_dense_vram::host_regions() const {
+    return pimpl->regions;
 }
 
 llama_dense_vram::~llama_dense_vram() = default;
@@ -210,6 +270,11 @@ void llama_dense_vram::demote() {
     auto & p = *pimpl;
     if (!p.active) {
         return;
+    }
+    // the host originals may have been reused by an extra L2 pool, so copy the
+    // device copies back before repointing
+    for (size_t i = 0; i < p.hosts.size(); ++i) {
+        ggml_backend_tensor_get(p.devs[i], p.orig_data[i], 0, ggml_nbytes(p.hosts[i]));
     }
     p.release();
     LLAMA_LOG_INFO("%s: restored %zu dense tensor(s) to host memory\n", __func__, p.hosts.size());

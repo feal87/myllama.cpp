@@ -17,6 +17,8 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 struct llama_model;
 struct ggml_tensor;
@@ -36,6 +38,13 @@ class llama_dense_vram {
     bool is_active()  const; // device copies currently bound to the model tensors
     uint64_t bytes()  const; // total device bytes of the promoted set (0 when disabled or failed)
     ggml_backend_dev_t device() const;
+
+    // contiguous host byte runs (base, size, 4096-aligned) of the promoted set.
+    // The bytes hold the weights until promote() and are free for a decode-only
+    // expert L2 pool while the promotion is active. Static so the disk stage can
+    // size its L2 pool before the context builds this object
+    static std::vector<std::pair<void *, size_t>> find_host_regions(const llama_model & model, const std::string & patterns);
+    const std::vector<std::pair<void *, size_t>> & host_regions() const;
 
     // allocate the device copies, upload and repoint the model tensors. Returns
     // false (and disarms the feature) when the device buffer cannot be allocated

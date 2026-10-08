@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct llama_model;
@@ -105,13 +106,18 @@ public:
     // that names the base set, the per-mode sets and the tool conditions that
     // select between them. It replaces base_experts_path (which is then
     // ignored) and the mode is switched at runtime through select_base_set()
+    // extra_l2_regions: optional external 4096-aligned CPU byte runs (base, size)
+    // the L2 pool may lay slots over during decode instead of the prefill staging
+    // slabs. The caller guarantees the bytes are free while the decode graph runs
+    // (the decode-promoted dense weights' host memory)
     llama_disk_stage(const llama_model & model, ggml_backend_dev_t dev,
                      int32_t n_pin_experts, uint64_t cache_budget_bytes,
                      int32_t pool_layers_max, const char * base_experts_path,
                      const char * warm_experts_path, const char * base_template_path,
                      int32_t sparse_max, float drop_fraction, float drop_below_rel,
                      float drop_max_mass, float drop_max_mass_token, float substitute_rel, int32_t substitute_pool,
-                     bool drop_probe);
+                     bool drop_probe,
+                     const std::vector<std::pair<void *, size_t>> & extra_l2_regions);
     ~llama_disk_stage();
 
     // staging tensors of MoE layer il, or null when the layer is not stageable
@@ -154,6 +160,11 @@ public:
     // end of a decode step, from the graph compute: closes the layer whose cold
     // pass no later split reported and prints the token totals
     void split_token_end();
+
+    // wait out the decode I/O worker and publish the L2 slots its stores filled.
+    // The context calls this before the dense demotion copies the device weights
+    // back to host, so a decode store cannot clobber the restored weights
+    void dec_io_drain();
 
     // the graph records, per layer, whether it emitted a cold pass for it. The The
     // decode fill consults this to pick the split or the synchronous path, so a
@@ -308,11 +319,6 @@ private:
     // layer's id table and collects the disk jobs, the independent copies and
     // the miss copies. false when the layer has no cache or no routed ids
     bool fill_cache_plan(int il, const int32_t * ids, int64_t n_ids, const float * probs);
-
-    // wait out the decode I/O worker and publish the L2 slots its stores
-    // filled, so the next plan can hit them. Also called before a prefill
-    // clobbers the staging slabs the L2 pool lives on
-    void dec_io_drain();
 
     // split-hot trace hooks, called from the node-prepare callback
     void split_cold_end();  // the cold pass of the pending layer computed

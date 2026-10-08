@@ -209,7 +209,10 @@ llama_context::llama_context(
                 cparams.disk_stage_drop_max_mass,
                 cparams.disk_stage_drop_max_mass_token,
                 cparams.disk_stage_drop_substitute_rel, cparams.disk_stage_drop_substitute_pool,
-                cparams.disk_stage_drop_probe);
+                cparams.disk_stage_drop_probe,
+                params.dense_vram_tensors != nullptr && params.dense_vram_tensors[0] != '\0'
+                    ? llama_dense_vram::find_host_regions(model, params.dense_vram_tensors)
+                    : std::vector<std::pair<void *, size_t>>());
         if (stage->is_active()) {
             disk_stage = std::move(stage);
         }
@@ -4850,6 +4853,11 @@ void llama_context::vram_swap(bool to_prefill) {
         // grow back)
         const bool dense_changed = dense_vram && dense_vram->is_active();
         if (dense_changed) {
+            // the extra L2 pool may alias the dense host memory, so finish any
+            // decode store still in flight before the weights are copied back
+            if (disk_stage) {
+                disk_stage->dec_io_drain();
+            }
             dense_vram->demote();
         }
         moe_cache->suspend();
