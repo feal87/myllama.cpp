@@ -561,6 +561,12 @@ struct common_params {
     int32_t  n_moe_cache_inserts    = 2;   // max expert uploads queued to the upload worker at once, across all cached layers
     float    n_moe_cache_drift_percent = 0.0f; // rebuild the layout when it drifts more than this percent from the ideal composition (0 = disabled)
 
+    // decode-only promotion of host-resident dense weights into the VRAM the MoE
+    // cache reclaims from the prefill compute buffer. Comma-separated std::regex
+    // over model tensor names (e.g. "blk\\.\\d+\\.attn_output\\.weight,output\\.weight");
+    // empty = disabled. See --dense-vram-tensors
+    std::string dense_vram_tensors;
+
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 

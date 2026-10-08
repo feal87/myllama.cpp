@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-hot-experts.h"
 #include "llama-moecache.h"
+#include "llama-dense-vram.h"
 #include "llama-disk-stage.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -699,6 +700,20 @@ llama_context::llama_context(
         moe_cache->reserve();
     }
 
+    // decode-only promotion of host-resident dense weights into the MoE cache
+    // VRAM pool (--dense-vram-tensors). Only meaningful with the VRAM swap, so it
+    // needs the expert cache pool's device
+    if (params.dense_vram_tensors != nullptr && params.dense_vram_tensors[0] != '\0' &&
+            moe_cache && cparams.n_ubatch > 1 && moe_cache->device() != nullptr) {
+        dense_vram = std::make_unique<llama_dense_vram>(model, params.dense_vram_tensors, moe_cache->device());
+        if (dense_vram->is_enabled()) {
+            LLAMA_LOG_INFO("%s: dense VRAM promotion armed: %.1f MiB (decode only)\n",
+                    __func__, dense_vram->bytes()/(1024.0*1024.0));
+        } else {
+            dense_vram.reset();
+        }
+    }
+
     // VRAM swap: when a MoE cache is active, prefill keeps the compute buffers
     // and decode hands them over to the cache. The pool reserved above is the
     // user's prefill-safe base; the reclaimed prefill compute bytes are added to
@@ -731,6 +746,13 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    // restore the dense host originals and free the device pool while the model
+    // buffers and the device backends are still alive
+    if (dense_vram) {
+        dense_vram->demote();
+        dense_vram.reset();
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -4751,7 +4773,10 @@ uint64_t llama_context::vram_reclaim_bytes(const std::vector<size_t> & tg_sizes)
         // the CUDA scratch and cuBLAS workspaces live outside the scheduler
         // buffers, so leave their share of the reclaimed bytes aside, plus the
         // measured-vs-actual decode graph slack
-        const uint64_t reserve = moe_scratch_charge_bytes() + kMoeReclaimSlack;
+        // the dense VRAM promotion (--dense-vram-tensors) also takes its bytes
+        // from the reclaimed region, so the expert cache pool shrinks by them
+        const uint64_t reserve = moe_scratch_charge_bytes() + kMoeReclaimSlack +
+                                 (dense_vram ? dense_vram->bytes() : 0);
         return pp > tg + reserve ? (uint64_t) (pp - tg - reserve) : 0;
     }
     return 0;
@@ -4819,9 +4844,17 @@ void llama_context::vram_swap(bool to_prefill) {
     synchronize();
 
     if (to_prefill) {
-        // decode -> prefill: hand the VRAM back to the compute buffers
+        // decode -> prefill: hand the VRAM back to the compute buffers. Restore
+        // the dense host originals first so the prefill graph builds against the
+        // CPU copies (and the device pool is released before the compute buffers
+        // grow back)
+        const bool dense_changed = dense_vram && dense_vram->is_active();
+        if (dense_changed) {
+            dense_vram->demote();
+        }
         moe_cache->suspend();
         ggml_backend_sched_release_buffers(sched.get());
+        sched_need_reserve = sched_need_reserve || dense_changed;
         // prefill needs a much larger scratch than decode: forget the decode
         // peak so the released bytes go to the compute buffers, and let the
         // prefill graph re-grow the scratch as needed
@@ -4853,6 +4886,16 @@ void llama_context::vram_swap(bool to_prefill) {
         moe_reset_scratch_peak();
         moe_trim_scratch();
         moe_reserve_scratch(moe_scratch_target_bytes());
+        // promote the dense weights before the MoE pool is re-allocated, so the
+        // pool sizes itself against the already-reduced budget. On failure
+        // bytes() drops to 0 and the space is handed back to the expert cache
+        const bool dense_before = dense_vram && dense_vram->is_active();
+        if (dense_vram) {
+            dense_vram->promote();
+            moe_cache->set_decode_budget_extra(vram_reclaim_bytes());
+        }
+        const bool dense_changed = dense_vram && dense_vram->is_active() != dense_before;
+        sched_need_reserve = sched_need_reserve || dense_changed;
         if (!moe_scratch_measured) {
             // first decode: the decode extra is still the pre-activation
             // estimate, so resume at the base only and let the scratch grow
@@ -5167,6 +5210,7 @@ llama_context_params llama_context_default_params() {
         /*.n_moe_cache_budget_bytes    =*/ 0,
         /*.n_moe_cache_inserts         =*/ 2,
         /*.n_moe_cache_drift_percent   =*/ 0.0f,
+        /*.dense_vram_tensors          =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,

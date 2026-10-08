@@ -19,6 +19,7 @@ struct llama_model;
 class llama_batch_allocr;
 class llama_hot_expert_cache;
 class llama_moe_cache;
+class llama_dense_vram;
 class llama_disk_stage;
 
 class llama_io_read_i;
@@ -393,6 +394,11 @@ private:
     // --moe-expert-cache*: GPU-resident cache for host-offloaded MoE experts
     // (null when disabled or when the model has no cacheable layer)
     std::unique_ptr<llama_moe_cache> moe_cache;
+
+    // --dense-vram-tensors: host-resident dense weights promoted to the same
+    // device pool for decode, restored to host memory for prefill (null when
+    // disabled, when no tensor matches, or when there is no MoE cache device)
+    std::unique_ptr<llama_dense_vram> dense_vram;
 
     // VRAM swap between the prefill compute buffers and the MoE expert cache:
     // enabled automatically when a MoE cache is configured and n_ubatch > 1.

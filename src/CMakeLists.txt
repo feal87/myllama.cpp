@@ -16,6 +16,8 @@ set(LLAMA_CORE_SOURCES
     llama-chat.cpp
     llama-context.cpp
     llama-cparams.cpp
+    llama-dense-vram.cpp
+    llama-dense-vram.h
     llama-disk-buft.cpp
     llama-disk-buft.h
     llama-disk-stage.cpp

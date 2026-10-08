@@ -3278,6 +3278,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.n_moe_cache_drift_percent = v;
         }
     ));
+    add_opt(common_arg(
+        {"--dense-vram-tensors"}, "REGEX[,REGEX...]",
+        "decode-only promotion of host-resident dense weights into the VRAM the MoE\n"
+        "expert cache reclaims from the prefill compute buffer (--moe-expert-cache-*).\n"
+        "A comma-separated list of regular expressions over model tensor names, for\n"
+        "example 'blk\\\\.\\\\d+\\\\.attn_output\\\\.weight,output\\\\.weight'. At every prefill -> decode\n"
+        "transition the matching tensors that currently live in host memory are copied\n"
+        "to the device and their matmuls run on the GPU during decode; at decode ->\n"
+        "prefill the originals are restored, so prefill is unchanged. The copies share\n"
+        "the reclaimed bytes with the expert cache, so the expert cache pool shrinks by\n"
+        "their size. Requires the MoE expert cache (--moe-expert-cache-budget-mib).\n"
+        "Empty = disabled",
+        [](common_params & params, const std::string & value) {
+            params.dense_vram_tensors = value;
+        }
+    ).set_env("LLAMA_ARG_DENSE_VRAM_TENSORS"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

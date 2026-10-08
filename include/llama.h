@@ -480,6 +480,17 @@ extern "C" {
                                            // this percent from the ideal composition for the current ranking
                                            // (0 = keep the layout fixed between prompt boundaries)
 
+        // Decode-only promotion of host-resident dense weights into the VRAM
+        // reclaimed from the prefill compute buffer (the same pool the MoE expert
+        // cache uses). A comma-separated list of std::regex over model tensor
+        // names, e.g. "blk\\.\\d+\\.attn_output\\.weight,output\\.weight". The
+        // matched tensors are copied to the GPU at each prefill -> decode
+        // transition and restored at decode -> prefill, so decode runs their
+        // matmuls on the GPU while prefill keeps using the host copies. Requires
+        // the MoE expert cache (--moe-expert-cache-budget-mib) for the VRAM swap.
+        // Empty = disabled
+        const char * dense_vram_tensors;
+
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
