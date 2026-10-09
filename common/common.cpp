@@ -1759,6 +1759,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_pin_hot_experts_prompt_decay    = params.n_pin_hot_experts_prompt_decay;
     cparams.n_pin_hot_experts_min_count      = params.n_pin_hot_experts_min_count;
     cparams.expert_profile_path              = params.expert_profile.empty() ? nullptr : params.expert_profile.c_str();
+    cparams.expert_ngram_record_path         = params.expert_ngram_record.empty() ? nullptr : params.expert_ngram_record.c_str();
     cparams.pin_experts_from_profile_path    = params.pin_experts_from_profile.empty() ? nullptr : params.pin_experts_from_profile.c_str();
     cparams.warm_experts_from_profile_path   = params.warm_experts_from_profile.empty() ? nullptr : params.warm_experts_from_profile.c_str();
     cparams.pin_experts_template_path        = params.pin_experts_template.empty() ? nullptr : params.pin_experts_template.c_str();

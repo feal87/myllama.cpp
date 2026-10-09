@@ -14,6 +14,47 @@
 #include <string>
 #include <vector>
 
+// --expert-ngram-record: one raw binary stream, appended across runs. The header
+// is written once and re-verified on every append, so a recording cannot be
+// merged across models. A record is one byte of type followed by its payload;
+// the decode_step payload is the token a graph consumed plus, per observed MoE
+// layer, the experts it routed. scripts/expert-ngram parses this.
+static constexpr char     NGRAM_REC_MAGIC[8]     = { 'L', 'E', 'N', 'G', 'R', 'E', 'C', '1' };
+static constexpr uint32_t NGRAM_REC_VERSION      = 1;
+static constexpr uint8_t  NGRAM_REC_PROMPT_BEGIN = 1;
+static constexpr uint8_t  NGRAM_REC_DECODE_STEP  = 2;
+
+static uint64_t ngram_fnv1a(uint64_t h, const void * data, size_t n) {
+    const unsigned char * p = (const unsigned char *) data;
+    for (size_t i = 0; i < n; ++i) {
+        h ^= (uint64_t) p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+// true when `f` starts with a header matching this model and tokenizer
+static bool ngram_header_matches(std::FILE * f, uint64_t model_fp, uint64_t tok_fp) {
+    char     magic[8];
+    uint32_t version = 0;
+    uint32_t n_layer = 0, n_expert = 0, n_used = 0;
+    uint64_t mfp = 0, tfp = 0;
+    if (std::fseek(f, 0, SEEK_SET) != 0) {
+        return false;
+    }
+    if (std::fread(magic, 1, sizeof(magic), f) != sizeof(magic) ||
+        std::fread(&version, sizeof(version), 1, f) != 1 ||
+        std::fread(&n_layer, sizeof(n_layer), 1, f) != 1 ||
+        std::fread(&n_expert, sizeof(n_expert), 1, f) != 1 ||
+        std::fread(&n_used, sizeof(n_used), 1, f) != 1 ||
+        std::fread(&mfp, sizeof(mfp), 1, f) != 1 ||
+        std::fread(&tfp, sizeof(tfp), 1, f) != 1) {
+        return false;
+    }
+    return std::memcmp(magic, NGRAM_REC_MAGIC, sizeof(NGRAM_REC_MAGIC)) == 0 &&
+           version == NGRAM_REC_VERSION && mfp == model_fp && tfp == tok_fp;
+}
+
 llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
                                                int32_t             n_pin_experts,
                                                uint64_t            budget_bytes,
@@ -24,7 +65,8 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
                                                bool                prefetch_enabled,
                                                bool                track_rank,
                                                bool                disk_mode,
-                                               const char *        profile_path) :
+                                               const char *        profile_path,
+                                               const char *        ngram_record_path) :
     model(model),
     n_pin(n_pin_experts),
     budget_bytes(budget_bytes),
@@ -53,6 +95,53 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
             LLAMA_LOG_WARN("%s: failed to open expert profile '%s', profiling disabled\n", __func__, profile_path);
         } else {
             LLAMA_LOG_INFO("%s: writing decode-only expert profiles to %s\n", __func__, profile_path);
+        }
+    }
+
+    if (ngram_record_path != nullptr && ngram_record_path[0] != '\0') {
+        // fingerprints guard the append path: a recording only merges with one
+        // made by the same model weights and tokenizer
+        const std::string arch = model.arch_name();
+        const uint64_t    dims[4] = {
+            (uint64_t) model.hparams.n_layer(),
+            (uint64_t) model.hparams.n_expert,
+            (uint64_t) model.hparams.n_expert_used(),
+            (uint64_t) model.hparams.n_embd,
+        };
+        ngram_model_fp     = ngram_fnv1a(1469598103934665603ULL, arch.data(), arch.size());
+        ngram_model_fp     = ngram_fnv1a(ngram_model_fp, dims, sizeof(dims));
+        const uint64_t n_vocab = model.vocab.n_tokens();
+        ngram_tokenizer_fp = ngram_fnv1a(1469598103934665603ULL, &n_vocab, sizeof(n_vocab));
+
+        ngram_file = std::fopen(ngram_record_path, "ab+");
+        if (ngram_file == nullptr) {
+            LLAMA_LOG_WARN("%s: failed to open expert n-gram recording '%s', recording disabled\n", __func__, ngram_record_path);
+        } else {
+            std::fseek(ngram_file, 0, SEEK_END);
+            const long size = std::ftell(ngram_file);
+            if (size < 0) {
+                LLAMA_LOG_WARN("%s: expert n-gram recording '%s' is not seekable, recording disabled\n", __func__, ngram_record_path);
+                std::fclose(ngram_file);
+                ngram_file = nullptr;
+            } else if (size == 0) {
+                write_ngram_header();
+                std::fflush(ngram_file);
+                LLAMA_LOG_INFO("%s: recording decode tokens and routed experts to %s\n", __func__, ngram_record_path);
+            } else if (!ngram_header_matches(ngram_file, ngram_model_fp, ngram_tokenizer_fp)) {
+                LLAMA_LOG_WARN("%s: expert n-gram recording '%s' was made by a different model or tokenizer, recording disabled\n",
+                               __func__, ngram_record_path);
+                std::fclose(ngram_file);
+                ngram_file = nullptr;
+            } else {
+                std::fseek(ngram_file, 0, SEEK_END);
+                LLAMA_LOG_INFO("%s: appending decode token + expert recording to %s\n", __func__, ngram_record_path);
+            }
+            if (ngram_file != nullptr) {
+                // a run boundary is a prompt boundary: the offline study must not
+                // build an n-gram across two independent sessions
+                std::fwrite(&NGRAM_REC_PROMPT_BEGIN, sizeof(NGRAM_REC_PROMPT_BEGIN), 1, ngram_file);
+                std::fflush(ngram_file);
+            }
         }
     }
 
@@ -136,6 +225,16 @@ llama_hot_expert_cache::~llama_hot_expert_cache() {
         write_profile();
         std::fclose(profile_file);
         profile_file = nullptr;
+    }
+    if (ngram_file != nullptr) {
+        std::lock_guard<std::mutex> lock(mu);
+        std::fflush(ngram_file);
+        std::fclose(ngram_file);
+        ngram_file = nullptr;
+    }
+    if (ngram_records > 0 || ngram_tokens_missed > 0) {
+        LLAMA_LOG_INFO("%s: expert n-gram recording: %" PRIu64 " decode steps, %" PRIu64 " steps skipped (no token)\n",
+                       __func__, ngram_records, ngram_tokens_missed);
     }
 
     // stop the pin worker and drain whatever is queued (pending jobs are simply
@@ -644,7 +743,7 @@ void llama_hot_expert_cache::observe_decode_begin(const std::vector<ggml_tensor 
                 resolve_tensors(il, ls);
             }
         }
-        if (!ls.tensors_are_host && profile_file == nullptr) {
+        if (!ls.tensors_are_host && profile_file == nullptr && ngram_file == nullptr) {
             continue;  // experts offloaded to a device: nothing to count or pin
         }
 
@@ -741,6 +840,13 @@ bool llama_hot_expert_cache::ensure_obs_stage(ggml_backend_t backend, size_t byt
 
 void llama_hot_expert_cache::observe_decode_finish() {
     if (obs_ids == nullptr) {
+        // no layer produced an observable top-k this step, but the token still
+        // belongs in the recording: a missing step would shift every following
+        // n-gram window by one token
+        if (ngram_file != nullptr) {
+            std::lock_guard<std::mutex> lock(mu);
+            write_ngram_step();
+        }
         return;  // nothing was staged (no observed layer)
     }
 
@@ -830,6 +936,8 @@ void llama_hot_expert_cache::observe_decode_finish() {
             }
         }
     }
+
+    write_ngram_step();
 }
 
 void llama_hot_expert_cache::resolve_tensors(int il, layer_state & ls) {
@@ -1859,11 +1967,17 @@ static void write_json_string(std::FILE * f, const std::string & s) {
 }
 
 void llama_hot_expert_cache::note_output_token(int32_t token) {
-    if (profile_file == nullptr) {
+    if (profile_file == nullptr && ngram_file == nullptr) {
         return;
     }
     std::lock_guard<std::mutex> lock(mu);
-    profile_output.push_back(token);
+    if (profile_file != nullptr) {
+        profile_output.push_back(token);
+    }
+    if (ngram_file != nullptr) {
+        ngram_token      = token;
+        ngram_have_token = true;
+    }
 }
 
 void llama_hot_expert_cache::write_profile() {
@@ -1920,6 +2034,55 @@ void llama_hot_expert_cache::write_profile() {
     profile_routes = 0;
 }
 
+void llama_hot_expert_cache::write_ngram_header() {
+    const uint32_t version  = NGRAM_REC_VERSION;
+    const uint32_t n_layer  = (uint32_t) model.hparams.n_layer();
+    const uint32_t n_expert = (uint32_t) model.hparams.n_expert;
+    const uint32_t n_used   = (uint32_t) model.hparams.n_expert_used();
+    std::fwrite(NGRAM_REC_MAGIC, 1, sizeof(NGRAM_REC_MAGIC), ngram_file);
+    std::fwrite(&version,  sizeof(version),  1, ngram_file);
+    std::fwrite(&n_layer,  sizeof(n_layer),  1, ngram_file);
+    std::fwrite(&n_expert, sizeof(n_expert), 1, ngram_file);
+    std::fwrite(&n_used,   sizeof(n_used),   1, ngram_file);
+    std::fwrite(&ngram_model_fp,     sizeof(ngram_model_fp),     1, ngram_file);
+    std::fwrite(&ngram_tokenizer_fp, sizeof(ngram_tokenizer_fp), 1, ngram_file);
+    ngram_records = 0;
+}
+
+void llama_hot_expert_cache::write_ngram_step() {
+    if (ngram_file == nullptr) {
+        return;
+    }
+    if (!ngram_have_token) {
+        ngram_tokens_missed++;
+        return;
+    }
+
+    uint16_t n_layer_obs = 0;
+    for (int il = 0; il < (int) obs_off.size(); ++il) {
+        if (obs_off[il] >= 0 && obs_cnt[il] > 0) {
+            n_layer_obs++;
+        }
+    }
+
+    std::fwrite(&NGRAM_REC_DECODE_STEP, sizeof(NGRAM_REC_DECODE_STEP), 1, ngram_file);
+    std::fwrite(&ngram_token, sizeof(ngram_token), 1, ngram_file);
+    std::fwrite(&n_layer_obs, sizeof(n_layer_obs), 1, ngram_file);
+    for (int il = 0; il < (int) obs_off.size(); ++il) {
+        if (obs_off[il] < 0 || obs_cnt[il] <= 0) {
+            continue;
+        }
+        const uint16_t il16 = (uint16_t) il;
+        const uint16_t k    = (uint16_t) obs_cnt[il];
+        std::fwrite(&il16, sizeof(il16), 1, ngram_file);
+        std::fwrite(&k, sizeof(k), 1, ngram_file);
+        std::fwrite(obs_ids + obs_off[il], sizeof(int32_t), (size_t) k, ngram_file);
+    }
+
+    ngram_records++;
+    ngram_have_token = false;
+}
+
 void llama_hot_expert_cache::flush_profile() {
     std::lock_guard<std::mutex> lock(mu);
 
@@ -1938,6 +2101,13 @@ void llama_hot_expert_cache::on_prompt_begin() {
 
     if (profile_file != nullptr) {
         write_profile();
+    }
+
+    // prompt boundary: the offline study must not build n-grams across two
+    // unrelated prompts
+    if (ngram_file != nullptr) {
+        std::fwrite(&NGRAM_REC_PROMPT_BEGIN, sizeof(NGRAM_REC_PROMPT_BEGIN), 1, ngram_file);
+        std::fflush(ngram_file);
     }
 
     // fresh epoch for the periodic decay clock: do not fire a scheduled halving

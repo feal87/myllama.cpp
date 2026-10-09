@@ -455,6 +455,11 @@ extern "C" {
         // decode-only MoE routing profile output in JSONL format (nullptr = disabled)
         const char * expert_profile_path;
 
+        // raw binary recording of the decode token stream and the experts each
+        // single-token decode step routed, for offline expert-prediction
+        // experiments (nullptr = disabled). Appended across runs
+        const char * expert_ngram_record_path;
+
         // base set of experts read into the disk decode cache at load and never
         // evicted (nullptr = disabled). Requires the disk stage (--load-mode dio)
         const char * pin_experts_from_profile_path;

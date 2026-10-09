@@ -2992,6 +2992,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--expert-ngram-record"}, "FILE",
+        "append a raw binary recording of the decode token stream and the experts\n"
+        "each single-token decode step routed to FILE (default: disabled). No\n"
+        "effect on inference; the file is appended across runs and feeds the\n"
+        "offline expert-prediction study in scripts/expert-ngram. Use -np 1 so\n"
+        "multiple slots do not interleave their token streams",
+        [](common_params & params, const std::string & value) {
+            params.expert_ngram_record = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--pin-experts-from-profile"}, "FILE",
         "keep a base set of MoE experts permanently resident in the disk\n"
         "decode cache (default: disabled). FILE is a base-expert set derived\n"
