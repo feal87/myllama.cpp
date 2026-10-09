@@ -2635,64 +2635,75 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     if (split_host) {
-        // cold pass on the second CPU backend, emitted after the VRAM cache
-        // chain so the hot CPU split stays next to the GPU split (the early
-        // launch overlap). The scheduler gives the cold pass its own split and
-        // the node-prepare hook waits there for the disk batch that the get_rows
-        // handed to the worker, i.e. after the hot compute
-        ggml_tensor * c_up   = build_lora_mm_id(lc->up,   mc_inp, selected_experts_l2, nullptr);
-        ggml_tensor * c_gate = build_lora_mm_id(lc->gate, mc_inp, selected_experts_l2, nullptr);
-        cb(c_up,   "ffn_moe_cold_up",   il);
-        cb(c_gate, "ffn_moe_cold_gate", il);
-        c_up->src[3]         = lc->skip;
-        c_gate->src[3]       = lc->skip;
-        c_up->op_params[0]   = 0;
-        c_gate->op_params[0] = 0;
+        // Build one L2 sub-pass over the shared slot remap, selected by a per-slot
+        // mask. The hit mask runs on the hot CPU backend so its compute overlaps
+        // the disk read; the miss mask runs on the split backend and is the only
+        // part that waits for the read. The disk batch and the read issue are
+        // untouched; only the post-read compute shrinks by the hit share
+        const auto build_l2_sub = [&](ggml_tensor * skip, const char * prefix,
+                                      ggml_backend_t backend) -> ggml_tensor * {
+            ggml_tensor * p_up   = build_lora_mm_id(lc->up,   mc_inp, selected_experts_l2, nullptr);
+            ggml_tensor * p_gate = build_lora_mm_id(lc->gate, mc_inp, selected_experts_l2, nullptr);
+            cb(p_up,   (std::string(prefix) + "up").c_str(),   il);
+            cb(p_gate, (std::string(prefix) + "gate").c_str(), il);
+            p_up->src[3]         = skip;
+            p_gate->src[3]       = skip;
+            p_up->op_params[0]   = 0;
+            p_gate->op_params[0] = 0;
 
-        // every node of the cold split carries the "ffn_moe_cold_" prefix: the
-        // node-prepare hook uses it both to find the layer to wait for and to
-        // recognize where the cold split ends
-        const float    c_limit     = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
-        const bool     c_clamp     = c_limit > 1e-6f;
-        const bool     c_fused_op  = arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 ||
-                                      arch == LLM_ARCH_GLM5_NEXT ||
-                                      (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) ||
-                                      arch == LLM_ARCH_HY_V4;
-        ggml_tensor *  c_act       = nullptr;
-        if (!c_clamp) {
-            c_act = ggml_swiglu_split(ctx0, c_gate, c_up);
-            cb(c_act, "ffn_moe_cold_act", il);
-        } else if (c_fused_op) {
-            c_act = ggml_swiglu_clamp(ctx0, c_gate, c_up, c_limit);
-            cb(c_act, "ffn_moe_cold_act", il);
-        } else {
-            ggml_tensor * c_up_c = ggml_clamp(ctx0, c_up, -c_limit, c_limit);
-            cb(c_up_c, "ffn_moe_cold_up_clamped", il);
-            ggml_tensor * c_g_silu = ggml_silu(ctx0, c_gate);
-            cb(c_g_silu, "ffn_moe_cold_silu", il);
-            ggml_tensor * c_g_a = ggml_clamp(ctx0, c_g_silu, -INFINITY, c_limit);
-            cb(c_g_a, "ffn_moe_cold_silu_clamped", il);
-            c_act = ggml_mul(ctx0, c_g_a, c_up_c);
-            cb(c_act, "ffn_moe_cold_act", il);
-        }
-        ggml_tensor * c_down = build_lora_mm_id(lc->down, c_act, selected_experts_l2, nullptr);
-        cb(c_down, "ffn_moe_cold_down", il);
-        c_down->src[3]       = lc->skip;
-        c_down->op_params[0] = 0;
-        c_down->op_params[2] = 1;
+            const float    c_limit    = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
+            const bool     c_clamp    = c_limit > 1e-6f;
+            const bool     c_fused_op = arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 ||
+                                        arch == LLM_ARCH_GLM5_NEXT ||
+                                        (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) ||
+                                        arch == LLM_ARCH_HY_V4;
+            ggml_tensor *  p_act      = nullptr;
+            if (!c_clamp) {
+                p_act = ggml_swiglu_split(ctx0, p_gate, p_up);
+                cb(p_act, (std::string(prefix) + "act").c_str(), il);
+            } else if (c_fused_op) {
+                p_act = ggml_swiglu_clamp(ctx0, p_gate, p_up, c_limit);
+                cb(p_act, (std::string(prefix) + "act").c_str(), il);
+            } else {
+                ggml_tensor * p_up_c = ggml_clamp(ctx0, p_up, -c_limit, c_limit);
+                cb(p_up_c, (std::string(prefix) + "up_clamped").c_str(), il);
+                ggml_tensor * p_g_silu = ggml_silu(ctx0, p_gate);
+                cb(p_g_silu, (std::string(prefix) + "silu").c_str(), il);
+                ggml_tensor * p_g_a = ggml_clamp(ctx0, p_g_silu, -INFINITY, c_limit);
+                cb(p_g_a, (std::string(prefix) + "silu_clamped").c_str(), il);
+                p_act = ggml_mul(ctx0, p_g_a, p_up_c);
+                cb(p_act, (std::string(prefix) + "act").c_str(), il);
+            }
+            ggml_tensor * p_down = build_lora_mm_id(lc->down, p_act, selected_experts_l2, nullptr);
+            cb(p_down, (std::string(prefix) + "down").c_str(), il);
+            p_down->src[3]       = skip;
+            p_down->op_params[0] = 0;
+            p_down->op_params[2] = 1;
 
-        // the merge stays on the split backend, so it joins the cold split
-        // instead of adding a third CPU split per layer
+            ggml_backend_sched_set_tensor_backend(sched, p_up,   backend);
+            ggml_backend_sched_set_tensor_backend(sched, p_gate, backend);
+            ggml_backend_sched_set_tensor_backend(sched, p_act,  backend);
+            ggml_backend_sched_set_tensor_backend(sched, p_down, backend);
+            return p_down;
+        };
+
+        // L2 hits on the hot backend: this compute overlaps the disk read
+        ggml_tensor * h_down = build_l2_sub(lc->skip_hit, "ffn_moe_l2hit_", backend_cpu);
+        experts = ggml_add(ctx0, experts, h_down);
+        cb(experts, "ffn_moe_l2hit_add", il);
+        ggml_backend_sched_set_tensor_backend(sched, experts, backend_cpu);
+
+        // L2 misses on the split backend, after the VRAM cache chain so the hot
+        // CPU split stays next to the GPU split (the early launch overlap). The
+        // "ffn_moe_cold_" prefix is what the node-prepare hook matches to wait
+        // for the disk batch and to recognize where the cold split ends
+        ggml_tensor * c_down = build_l2_sub(lc->skip_miss, "ffn_moe_cold_", backend_cpu_split);
         experts = ggml_add(ctx0, experts, c_down);
         cb(experts, "ffn_moe_cold_add", il);
+        ggml_backend_sched_set_tensor_backend(sched, experts, backend_cpu_split);
 
-        ggml_backend_sched_set_tensor_backend(sched, c_up,     backend_cpu_split);
-        ggml_backend_sched_set_tensor_backend(sched, c_gate,   backend_cpu_split);
-        ggml_backend_sched_set_tensor_backend(sched, c_act,    backend_cpu_split);
-        ggml_backend_sched_set_tensor_backend(sched, c_down,   backend_cpu_split);
-        ggml_backend_sched_set_tensor_backend(sched, experts,  backend_cpu_split);
-        // the L2 remap is tiny and feeds the cold split; keep it off the hot
-        // chain so it does not force an extra split of its own
+        // the L2 remap is tiny and feeds both passes; keep it off the hot chain
+        // so it does not force an extra split of its own
         ggml_backend_sched_set_tensor_backend(sched, selected_experts_l2, backend_cpu);
         if (selected_experts_l2->src[0] != nullptr) {
             ggml_backend_sched_set_tensor_backend(sched, selected_experts_l2->src[0], backend_cpu);

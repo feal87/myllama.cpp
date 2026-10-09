@@ -81,7 +81,11 @@ struct llama_disk_stage_l2_layer {
     ggml_tensor * up    = nullptr;
     ggml_tensor * down  = nullptr;
     ggml_tensor * table = nullptr; // I32 [n_expert], expert id -> L2 slot
-    ggml_tensor * skip  = nullptr; // I32 [n_slots], 1 at the sentinel
+    // per-layer slot masks for the two L2 sub-passes. skip_hit is 0 on the
+    // slots that are L2 hits this token, skip_miss is 0 on the slots that are
+    // misses. Every other slot (the other segment and the sentinel) is 1
+    ggml_tensor * skip_hit  = nullptr; // I32 [n_slots]
+    ggml_tensor * skip_miss = nullptr; // I32 [n_slots]
 };
 
 class llama_disk_stage {

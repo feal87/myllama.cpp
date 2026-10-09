@@ -693,7 +693,6 @@ struct llama_disk_stage::impl {
         ggml_tensor * gate = nullptr; // [n_ff, n_embd, cap]
         ggml_tensor * up   = nullptr;
         ggml_tensor * down = nullptr;
-        ggml_tensor * skip = nullptr; // I32 [cap], 1 at the sentinel
         std::list<int64_t> prob; // probation, front = MRU
         std::list<int64_t> prot; // protected, front = MRU
         std::unordered_map<int64_t, int32_t>      slot_of;   // key -> slot
@@ -715,8 +714,10 @@ struct llama_disk_stage::impl {
     // per-layer expert -> L2 slot table the graph remaps through, plus the public
     // view. The pool's weight tensors are shared; only the table is per layer
     struct l2_layer {
-        int           pool  = -1;
-        ggml_tensor * table = nullptr; // I32 [1, n_expert], expert id -> L2 slot
+        int           pool      = -1;
+        ggml_tensor * table     = nullptr; // I32 [1, n_expert], expert id -> L2 slot
+        ggml_tensor * skip_hit  = nullptr; // I32 [1, cap], 0 on a hit slot
+        ggml_tensor * skip_miss = nullptr; // I32 [1, cap], 0 on a miss slot
         llama_disk_stage_l2_layer pub;
     };
     std::vector<l2_layer> l2;
@@ -3161,13 +3162,17 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                             // the L2 tables and skip tables are tiny CPU tensors; the
                             // pool weights themselves live on the staging slabs
                             {
+                                // per layer: the id table plus the hit and miss skip
+                                // masks (a pool is capped at two expert sets)
+                                const size_t table_bytes = align_up((size_t) n_expert * sizeof(int32_t), disk_stage_align);
+                                const size_t skip_bytes  = align_up((size_t) (2 * n_expert + 64) * sizeof(int32_t), disk_stage_align);
                                 ggml_init_params lip = {
-                                    /*.mem_size   =*/ ggml_tensor_overhead() * (size_t) (n_layer + l2_regions.size() + 8),
+                                    /*.mem_size   =*/ ggml_tensor_overhead() * (size_t) (3 * n_layer + l2_regions.size() + 8),
                                     /*.mem_buffer =*/ nullptr,
                                     /*.no_alloc   =*/ true,
                                 };
                                 p.l2_ctx = ggml_init(lip);
-                                const size_t l2_bytes = (size_t) (n_layer + l2_regions.size() + 4) * 2 * disk_stage_align;
+                                const size_t l2_bytes = (size_t) n_layer * (table_bytes + 2 * skip_bytes) + 16 * disk_stage_align;
                                 p.l2_buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), l2_bytes);
                             }
                             size_t off_l2 = 0;
@@ -3242,13 +3247,6 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                 ep.up   = tensors[1];
                                 ep.down = tensors[2];
 
-                                ep.skip = ggml_new_tensor_2d(p.l2_ctx, GGML_TYPE_I32, 1, ep.cap);
-                                ggml_format_name(ep.skip, "disk_l2_skip.%d", pid);
-                                ggml_backend_tensor_alloc(p.l2_buf, ep.skip, l2_alloc((size_t) ep.cap * sizeof(int32_t)));
-                                for (int32_t s = 0; s < ep.cap; ++s) {
-                                    ((int32_t *) ep.skip->data)[s] = (s == ep.sentinel) ? 1 : 0;
-                                }
-
                                 ep.slot_key.assign((size_t) ep.cap, -1);
                                 ep.iter_of.resize((size_t) ep.cap);
                                 ep.seg.assign((size_t) ep.cap, 0);
@@ -3269,11 +3267,24 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                     for (int32_t e = 0; e < n_expert; ++e) {
                                         ((int32_t *) L.table->data)[e] = pool.sentinel;
                                     }
-                                    L.pub.gate  = pool.gate;
-                                    L.pub.up    = pool.up;
-                                    L.pub.down  = pool.down;
-                                    L.pub.table = L.table;
-                                    L.pub.skip  = pool.skip;
+                                    // per-layer masks for the L2 hit / miss sub-passes,
+                                    // 1 everywhere until the fill marks the used slots
+                                    L.skip_hit  = ggml_new_tensor_2d(p.l2_ctx, GGML_TYPE_I32, 1, pool.cap);
+                                    L.skip_miss = ggml_new_tensor_2d(p.l2_ctx, GGML_TYPE_I32, 1, pool.cap);
+                                    ggml_format_name(L.skip_hit,  "disk_l2_skip_hit.%d",  jl);
+                                    ggml_format_name(L.skip_miss, "disk_l2_skip_miss.%d", jl);
+                                    ggml_backend_tensor_alloc(p.l2_buf, L.skip_hit,  l2_alloc((size_t) pool.cap * sizeof(int32_t)));
+                                    ggml_backend_tensor_alloc(p.l2_buf, L.skip_miss, l2_alloc((size_t) pool.cap * sizeof(int32_t)));
+                                    for (int32_t s = 0; s < pool.cap; ++s) {
+                                        ((int32_t *) L.skip_hit->data)[s]  = 1;
+                                        ((int32_t *) L.skip_miss->data)[s] = 1;
+                                    }
+                                    L.pub.gate      = pool.gate;
+                                    L.pub.up        = pool.up;
+                                    L.pub.down      = pool.down;
+                                    L.pub.table     = L.table;
+                                    L.pub.skip_hit  = L.skip_hit;
+                                    L.pub.skip_miss = L.skip_miss;
                                 }
                             }
 
@@ -4088,7 +4099,9 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
     const std::vector<impl::region> & regions = p.layer_regions[il];
     const int epid = p.evict_pool_for(il);
     const int32_t l2_sentinel = epid >= 0 ? p.evict_pools[(size_t) epid].sentinel : 0;
-    int32_t * l2_table = epid >= 0 ? (int32_t *) p.l2[(size_t) il].table->data : nullptr;
+    int32_t * l2_table  = epid >= 0 ? (int32_t *) p.l2[(size_t) il].table->data     : nullptr;
+    int32_t * skip_hit  = epid >= 0 ? (int32_t *) p.l2[(size_t) il].skip_hit->data  : nullptr;
+    int32_t * skip_miss = epid >= 0 ? (int32_t *) p.l2[(size_t) il].skip_miss->data : nullptr;
 
     // an id needs no disk read this token: VRAM, a permanent base resident, an
     // existing RAM slot (filled or still waiting for its fill), or an L2 entry.
@@ -4536,7 +4549,8 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                 impl::evict_pool & ep = p.evict_pools[(size_t) epid];
                 const int64_t      key = ((int64_t) il << 32) | (uint32_t) id;
                 int32_t            eslot = p.evict_touch(epid, key);
-                if (eslot >= 0) {
+                const bool         hit   = eslot >= 0;
+                if (hit) {
                     p.n_l2_all_hits++;
                     if (p.l2_warm) {
                         p.n_l2_hits++;
@@ -4571,6 +4585,13 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                     l2_pending.push_back({ epid, key, eslot });
                 }
                 l2_table[id] = eslot;
+                // the hit and miss sub-passes read the same table through their
+                // own slot mask, so each cold expert is computed exactly once:
+                // the hit pass overlaps the read, the miss pass waits on it
+                if (skip_hit != nullptr) {
+                    skip_hit[eslot]  = hit ? 0 : 1;
+                    skip_miss[eslot] = hit ? 1 : 0;
+                }
 
                 // a reserved resident slot means the ranking promoted the expert:
                 // fill it from the L2 after the reads, so the copy overlaps the
