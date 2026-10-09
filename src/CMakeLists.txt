@@ -24,6 +24,8 @@ set(LLAMA_CORE_SOURCES
     llama-disk-stage.h
     llama-expert-base.cpp
     llama-expert-base.h
+    llama-expert-predict.cpp
+    llama-expert-predict.h
     llama-grammar.cpp
     llama-graph.cpp
     llama-hot-experts.cpp

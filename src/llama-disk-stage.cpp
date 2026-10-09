@@ -26,6 +26,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // streaming stores for the L2 copy: the destination is not read again until a
@@ -444,8 +445,9 @@ static std::vector<std::vector<int32_t>> disk_stage_parse_expert_set(
 
 #if defined(_WIN32)
 struct disk_stage_file {
-    HANDLE h     = INVALID_HANDLE_VALUE; // prefetch / prefill reads
-    HANDLE h_dec = INVALID_HANDLE_VALUE; // split-hot decode reads, own completion port
+    HANDLE h      = INVALID_HANDLE_VALUE; // prefetch / prefill reads
+    HANDLE h_dec  = INVALID_HANDLE_VALUE; // split-hot decode reads, own completion port
+    HANDLE h_pref = INVALID_HANDLE_VALUE; // --expert-ngram-profile read-ahead, own completion port
 
     ~disk_stage_file() {
         if (h != INVALID_HANDLE_VALUE) {
@@ -453,6 +455,9 @@ struct disk_stage_file {
         }
         if (h_dec != INVALID_HANDLE_VALUE) {
             CloseHandle(h_dec);
+        }
+        if (h_pref != INVALID_HANDLE_VALUE) {
+            CloseHandle(h_pref);
         }
     }
 
@@ -476,6 +481,17 @@ struct disk_stage_file {
                             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
         if (h_dec == INVALID_HANDLE_VALUE) {
             throw std::runtime_error("disk stage: cannot open " + path + " for the decode read queue");
+        }
+    }
+
+    // the read-ahead runs on its own queue so a speculative read can never make
+    // a layer's own read wait for it
+    void open_pref(const std::string & path) {
+        h_pref = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             nullptr, OPEN_EXISTING,
+                             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
+        if (h_pref == INVALID_HANDLE_VALUE) {
+            throw std::runtime_error("disk stage: cannot open " + path + " for the read-ahead queue");
         }
     }
 };
@@ -597,6 +613,7 @@ struct llama_disk_stage::impl {
 #if defined(_WIN32)
     HANDLE iocp     = nullptr; // one completion port, every staging file associated with it
     HANDLE iocp_dec = nullptr; // split-hot decode: a second port over a second handle per file
+    HANDLE iocp_pref = nullptr; // --expert-ngram-profile read-ahead: its own port and handle per file
 #endif
 
     ggml_context *       ctx  = nullptr;
@@ -1063,6 +1080,28 @@ struct llama_disk_stage::impl {
     int64_t trace_n_cold = 0;
     int64_t trace_n_vram = 0;
 
+    // --expert-ngram-profile prefetch: a dedicated worker reads the predicted
+    // experts of the step into L2 slots ahead of the layer that routes them. It
+    // takes FREE slots only (never evicts one the decode may still execute) and
+    // yields the shared decode completion port to the demand fill, so it cannot
+    // delay a layer's read
+    std::thread             pref_io;
+    std::mutex              pref_mu;
+    std::condition_variable pref_cv;
+    std::condition_variable pref_idle_cv;
+    std::vector<std::pair<int, int32_t>> pref_queue; // (layer, expert id), layer order
+    size_t                  pref_pos     = 0;
+    bool                    pref_running = false;
+    bool                    pref_stop    = false;
+    uint64_t                n_pref_reads = 0;
+    uint64_t                n_pref_bytes = 0;
+    uint64_t                n_pref_skip  = 0; // already resident / in L2 / VRAM
+    uint64_t                n_pref_noslot = 0;
+    // keys the demand fill reserved a slot for but has not published yet. The
+    // read-ahead checks it so the two readers never insert the same key, which
+    // would corrupt the SLRU lists
+    std::unordered_set<int64_t> dec_reserved;
+
     // split-hot trace: absolute marks of one layer, reported as deltas between
     // the two calls so the read/hot intersection is visible
     struct split_phase {
@@ -1286,6 +1325,30 @@ struct llama_disk_stage::impl {
         evict_trim(ep);
     }
 
+    // reserve a FREE L2 slot only: the prefetch must never evict an entry the
+    // decode may still execute. -1 when the pool has none to spare
+    int32_t evict_reserve_free(int pool) {
+        evict_pool & ep = evict_pools[(size_t) pool];
+        if (ep.free_slots.empty()) {
+            return -1;
+        }
+        const int32_t slot = ep.free_slots.back();
+        ep.free_slots.pop_back();
+        return slot;
+    }
+
+    // publish a prefetched slot; a key that landed in the meantime (the demand
+    // fill read it first) wins and the extra slot goes back to the free list
+    void evict_finalize_new(int pool, int64_t key, int32_t slot) {
+        evict_pool & ep = evict_pools[(size_t) pool];
+        if (ep.slot_of.count(key) != 0) {
+            ep.free_slots.push_back(slot);
+            return;
+        }
+        evict_push(ep, key, slot, 0);
+        evict_trim(ep);
+    }
+
     void evict_remove(int pool, int64_t key) {
         std::lock_guard<std::mutex> lk(l2_mu);
         evict_pool & ep = evict_pools[(size_t) pool];
@@ -1326,6 +1389,7 @@ struct llama_disk_stage::impl {
         for (int64_t e = 0; e < (int64_t) L.table->ne[0] * L.table->ne[1]; ++e) {
             t[e] = sentinel;
         }
+        dec_reserved.clear();
     }
 
     // Clear and reset only the transient pools. The permanent pools are backed by
@@ -1508,6 +1572,12 @@ struct llama_disk_stage::impl {
             f->open_dec(path);
             if (CreateIoCompletionPort(f->h_dec, iocp_dec, 0, 0) == nullptr) {
                 throw std::runtime_error("disk stage: failed to associate " + path + " with the decode completion port");
+            }
+        }
+        if (iocp_pref != nullptr) {
+            f->open_pref(path);
+            if (CreateIoCompletionPort(f->h_pref, iocp_pref, 0, 0) == nullptr) {
+                throw std::runtime_error("disk stage: failed to associate " + path + " with the read-ahead completion port");
             }
         }
 #endif
@@ -1966,6 +2036,10 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
         line("  l2 policy : %" PRIu64 " evictions, %" PRIu64 " demotions | %zu/%zu entries live%s",
              d_evict, d_demote, n_entries, n_capacity,
              p.l2_warm ? "" : " | not warm yet");
+        if (p.n_pref_reads > 0 || p.n_pref_noslot > 0) {
+            line("  prefetch  : %" PRIu64 " experts read ahead (%s) | %" PRIu64 " resident, %" PRIu64 " no free slot",
+                 p.n_pref_reads, report_volume(p.n_pref_bytes).c_str(), p.n_pref_skip, p.n_pref_noslot);
+        }
     }
     const std::string sec_l = out.substr(s_l);
 
@@ -2299,6 +2373,13 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     if (p.iocp_dec == nullptr) {
         LLAMA_LOG_WARN("%s: failed to create the decode I/O completion port, the decode fill runs inline\n", __func__);
         p.split_hot_active = false;
+    }
+
+    // the read-ahead gets its own port so it can overlap the demand reads instead
+    // of queueing behind them
+    p.iocp_pref = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
+    if (p.iocp_pref == nullptr) {
+        LLAMA_LOG_WARN("%s: failed to create the read-ahead I/O completion port, expert prefetch disabled\n", __func__);
     }
 
     // stages the separate gate/up/down layout only
@@ -3683,9 +3764,22 @@ llama_disk_stage::~llama_disk_stage() {
         if (pimpl->dec_io.joinable()) {
             pimpl->dec_io.join();
         }
+        prefetch_drain();
+        {
+            std::lock_guard<std::mutex> lk(pimpl->pref_mu);
+            pimpl->pref_stop = true;
+        }
+        pimpl->pref_cv.notify_all();
+        if (pimpl->pref_io.joinable()) {
+            pimpl->pref_io.join();
+        }
         if (pimpl->iocp_dec != nullptr) {
             CloseHandle(pimpl->iocp_dec);
             pimpl->iocp_dec = nullptr;
+        }
+        if (pimpl->iocp_pref != nullptr) {
+            CloseHandle(pimpl->iocp_pref);
+            pimpl->iocp_pref = nullptr;
         }
         if (pimpl->iocp != nullptr) {
             CloseHandle(pimpl->iocp);
@@ -3742,6 +3836,7 @@ void llama_disk_stage::fill(int il) {
         // store still writing them before the prefill clears those pools. The
         // permanent pools are not on the slabs and are left untouched
         dec_io_drain();
+        prefetch_drain();
         std::lock_guard<std::mutex> lock(p.cache_mu);
         p.evict_clear_transient();
     }
@@ -4036,6 +4131,7 @@ void llama_disk_stage::fill_selected(int il, const int32_t * ids, int64_t n_ids)
     // for; the permanent pools are backed by their own buffer and survive
     if (p.evict_populated) {
         dec_io_drain();
+        prefetch_drain();
         std::lock_guard<std::mutex> lock(p.cache_mu);
         p.evict_clear_transient();
     }
@@ -4584,6 +4680,7 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                     }
                     read_to_l2(id, eslot);
                     l2_pending.push_back({ epid, key, eslot });
+                    p.dec_reserved.insert(key);
                 }
                 l2_table[id] = eslot;
                 // the hit and miss sub-passes read the same table through their
@@ -4666,6 +4763,7 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids, co
         std::lock_guard<std::mutex> lock(p.cache_mu);
         for (const impl::l2_pending & m : p.fs_l2_pending) {
             p.evict_finalize(m.pid, m.key, m.slot);
+            p.dec_reserved.erase(m.key);
         }
         for (const impl::res_pending & m : p.fs_res_pending) {
             p.cache[(size_t) m.il].resident_filled[(size_t) m.id] = 1;
@@ -4768,6 +4866,7 @@ void llama_disk_stage::dec_io_drain() {
     if (!p.dec_io_error) {
         for (const impl::l2_pending & m : p.fs_l2_pending) {
             p.evict_finalize(m.pid, m.key, m.slot);
+            p.dec_reserved.erase(m.key);
         }
         for (const impl::res_pending & m : p.fs_res_pending) {
             impl::cache_layer & c = p.cache[(size_t) m.il];
@@ -4787,9 +4886,197 @@ void llama_disk_stage::dec_io_drain() {
 }
 
 void llama_disk_stage::evict_invalidate() {
+    prefetch_drain();
     impl & p = *pimpl;
     std::lock_guard<std::mutex> lock(p.cache_mu);
     p.evict_invalidate();
+}
+
+void llama_disk_stage::prefetch_drain() {
+#if defined(_WIN32)
+    impl & p = *pimpl;
+    if (!p.pref_io.joinable()) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(p.pref_mu);
+        p.pref_queue.clear();
+        p.pref_pos = 0;
+    }
+    std::unique_lock<std::mutex> lk(p.pref_mu);
+    p.pref_idle_cv.wait(lk, [&p] { return !p.pref_running; });
+#endif
+}
+
+void llama_disk_stage::prefetch(const std::vector<std::vector<int32_t>> & per_layer, int32_t max_reads) {
+#if defined(_WIN32)
+    impl & p = *pimpl;
+    if (!p.active || p.iocp_pref == nullptr || p.cache.empty() || p.evict_pools.empty()) {
+        return;
+    }
+
+    // the step's read list, built in layer order: the layer the graph reaches
+    // first is queued first, so its read starts first
+    std::vector<std::pair<int, int32_t>> list;
+    for (int il = 0; il < (int) per_layer.size() && il < (int) p.cache.size(); ++il) {
+        impl::cache_layer & c = p.cache[(size_t) il];
+        if (c.table == nullptr || p.evict_pool_for(il) < 0) {
+            continue;
+        }
+        for (const int32_t id : per_layer[(size_t) il]) {
+            if (id < 0 || id >= (int32_t) c.resident_slot.size()) {
+                continue;
+            }
+            if (max_reads > 0 && (int) list.size() >= max_reads) {
+                break;
+            }
+            list.emplace_back(il, id);
+        }
+        if (max_reads > 0 && (int) list.size() >= max_reads) {
+            break;
+        }
+    }
+
+    std::lock_guard<std::mutex> lk(p.pref_mu);
+    if (p.pref_stop) {
+        return;
+    }
+    if (!p.pref_io.joinable()) {
+        // the dedicated reader: it reserves only FREE L2 slots, yields the
+        // decode completion port to the demand fill, and stores each expert
+        // into the pool so the layer's fill is a hit
+        p.pref_io = std::thread([&p]() {
+            for (;;) {
+                std::vector<std::pair<int, int32_t>> chunk;
+                {
+                    std::unique_lock<std::mutex> pl(p.pref_mu);
+                    p.pref_cv.wait(pl, [&p] { return p.pref_stop || p.pref_pos < p.pref_queue.size(); });
+                    if (p.pref_stop) {
+                        return;
+                    }
+                    const size_t take = std::min<size_t>(8, p.pref_queue.size() - p.pref_pos);
+                    chunk.assign(p.pref_queue.begin() + p.pref_pos, p.pref_queue.begin() + p.pref_pos + take);
+                    p.pref_pos += take;
+                }
+
+                struct pending {
+                    int     epid;
+                    int32_t slot;
+                    int64_t key;
+                };
+                std::vector<disk_stage_job> jobs;
+                std::vector<pending>        pend;
+                {
+                    std::lock_guard<std::mutex> cl(p.cache_mu);
+                    for (const auto & [il, id] : chunk) {
+                        if (il < 0 || il >= (int) p.cache.size()) {
+                            continue;
+                        }
+                        impl::cache_layer & c = p.cache[(size_t) il];
+                        const int epid = p.evict_pool_for(il);
+                        if (c.table == nullptr || epid < 0 || id < 0 || id >= (int32_t) c.resident_slot.size()) {
+                            continue;
+                        }
+                        const int64_t key = ((int64_t) il << 32) | (uint32_t) id;
+                        if (c.vram[(size_t) id] || c.base[(size_t) id] ||
+                                c.resident_slot[(size_t) id] >= 0 || p.evict_has(epid, key) ||
+                                p.dec_reserved.count(key) != 0) {
+                            p.n_pref_skip++;
+                            continue;
+                        }
+                        const int32_t eslot = p.evict_reserve_free(epid);
+                        if (eslot < 0) {
+                            p.n_pref_noslot++;
+                            continue;
+                        }
+                        const impl::evict_pool &          ep      = p.evict_pools[(size_t) epid];
+                        const std::vector<impl::region> & regions = p.layer_regions[(size_t) il];
+                        const size_t jobs_before = jobs.size();
+                        for (int r = 0; r < 3; ++r) {
+                            const impl::region & sr = regions[(size_t) r];
+                            if (sr.file == nullptr || sr.stride == 0) {
+                                continue;
+                            }
+                            char *       dst = ep.data[r] + (size_t) eslot * ep.stride[r];
+                            const size_t len = align_up(sr.head + sr.stride, disk_stage_align);
+                            const HANDLE h   = sr.file->h_pref != INVALID_HANDLE_VALUE ? sr.file->h_pref : sr.file->h;
+                            jobs.push_back({ h, dst, sr.file_off + (size_t) id * sr.stride, len });
+                            p.n_pref_bytes += len;
+                        }
+                        if (jobs.size() == jobs_before) {
+                            // no readable region for this layer: give the slot back
+                            p.evict_pools[(size_t) epid].free_slots.push_back(eslot);
+                            p.n_pref_skip++;
+                            continue;
+                        }
+                        p.n_pref_reads++;
+                        pend.push_back({ epid, eslot, key });
+                    }
+                }
+
+                if (!jobs.empty()) {
+                    // its own completion port and handle: the read-ahead overlaps
+                    // the demand reads instead of queueing behind them
+                    bool err = false;
+                    try {
+                        disk_stage_run_jobs(jobs, 32, p.iocp_pref);
+                    } catch (...) {
+                        err = true;
+                    }
+                    if (err) {
+                        // a failed speculative read is not fatal: return the
+                        // slots and let the demand path read the experts again
+                        std::lock_guard<std::mutex> cl(p.cache_mu);
+                        for (const pending & m : pend) {
+                            p.evict_pools[(size_t) m.epid].free_slots.push_back(m.slot);
+                        }
+                        pend.clear();
+                    }
+                }
+
+                {
+                    std::lock_guard<std::mutex> cl(p.cache_mu);
+                    for (const pending & m : pend) {
+                        if (p.dec_reserved.count(m.key) != 0) {
+                            // the demand fill reserved the same expert first: it
+                            // owns the key, so give the extra slot back
+                            p.evict_pools[(size_t) m.epid].free_slots.push_back(m.slot);
+                        } else {
+                            p.evict_finalize_new(m.epid, m.key, m.slot);
+                        }
+                    }
+                    if (!pend.empty()) {
+                        // the prefetched entries live on the staging slabs, so a
+                        // prefill must drain the worker and clear the pool first
+                        p.evict_populated = true;
+                    }
+                }
+
+                bool idle = false;
+                {
+                    std::lock_guard<std::mutex> pl(p.pref_mu);
+                    if (p.pref_pos >= p.pref_queue.size()) {
+                        p.pref_running = false;
+                        idle = true;
+                    }
+                }
+                if (idle) {
+                    p.pref_idle_cv.notify_all();
+                }
+                if (p.pref_stop) {
+                    return;
+                }
+            }
+        });
+    }
+    p.pref_queue   = std::move(list);
+    p.pref_pos     = 0;
+    if (p.pref_queue.empty() && !p.pref_running) {
+        return; // nothing to read and the worker is idle: leave it asleep
+    }
+    p.pref_running = true;
+    p.pref_cv.notify_one();
+#endif
 }
 
 void llama_disk_stage::fill_cache_begin(int il, const int32_t * ids, int64_t n_ids, const float * probs) {

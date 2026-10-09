@@ -516,6 +516,12 @@ struct common_params {
     // single-token decode step routed, for offline expert-prediction experiments
     // (--expert-ngram-record), appended across runs
     std::string expert_ngram_record;
+    // LENGPROF v1 table the decode stage reads ahead from
+    // (--expert-ngram-profile); empty = disabled
+    std::string expert_ngram_profile;
+    // cap on experts prefetched per decode step (--expert-ngram-prefetch-max,
+    // 0 = no cap)
+    int32_t expert_ngram_prefetch_max = 64;
     // base set of experts to keep permanently resident in the disk decode cache
     // (--pin-experts-from-profile), derived from one or more --expert-profile exports
     std::string pin_experts_from_profile;

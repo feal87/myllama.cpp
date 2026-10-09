@@ -94,6 +94,7 @@
 
 struct llama_model;
 class llama_disk_stage;
+class llama_expert_predict;
 
 class llama_hot_expert_cache {
   public:
@@ -135,7 +136,9 @@ class llama_hot_expert_cache {
                            bool                track_rank,
                            bool                disk_mode,
                            const char *        profile_path,
-                           const char *        ngram_record_path);
+                           const char *        ngram_record_path,
+                           const char *        ngram_profile_path,
+                           int32_t             ngram_prefetch_max);
     ~llama_hot_expert_cache();
 
     llama_hot_expert_cache(const llama_hot_expert_cache &)             = delete;
@@ -567,6 +570,17 @@ class llama_hot_expert_cache {
     uint64_t       ngram_tokenizer_fp = 0;
     uint64_t       ngram_records = 0;       // decode_step records written
     uint64_t       ngram_tokens_missed = 0; // decode steps with no token captured
+    // --expert-ngram-profile: the predicted experts of the decode step about to
+    // run, per layer, plus how many of them the step actually routed. All of it
+    // is touched on the decode thread only, under mu
+    std::unique_ptr<llama_expert_predict> ngram_predict;
+    std::vector<std::vector<int32_t>>     ngram_predicted;
+    std::vector<uint64_t>                 ngram_pred_layer; // predicted (layer, expert) pairs
+    std::vector<uint64_t>                 ngram_hit_layer;  // ... that the step routed
+    int32_t                               ngram_prefetch_max = 0;
+    uint64_t                              n_ngram_matched     = 0; // steps a stored order matched
+    uint64_t                              n_ngram_pred_routes = 0;
+    uint64_t                              n_ngram_pred_hits   = 0;
     uint64_t       profile_tokens = 0;
     uint64_t       profile_routes = 0;
     uint64_t       n_tokens_seen = 0;  // tokens since the last decay

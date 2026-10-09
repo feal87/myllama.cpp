@@ -180,6 +180,17 @@ public:
     // read once its contents changed
     void evict_invalidate();
 
+    // --expert-ngram-profile: predicted experts per layer of the decode step
+    // about to run. The stage reads the non-resident ones into the L2 pool in
+    // layer order from a dedicated worker, so each layer's fill finds them.
+    // max_reads caps the experts queued this step (0 = no cap). Replaces any
+    // list still being processed. Safe to call from the decode thread
+    void prefetch(const std::vector<std::vector<int32_t>> & per_layer, int32_t max_reads);
+
+    // drop the pending prefetch list and wait out the worker, so the staging
+    // slabs can be reused by a prefill or reclaimed by the dense demotion
+    void prefetch_drain();
+
     // the graph records, per layer, whether it emitted a cold pass for it. The The
     // decode fill consults this to pick the split or the synchronous path, so a
     // layer without a cold pass never hands a batch to the worker

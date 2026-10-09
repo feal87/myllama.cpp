@@ -3003,6 +3003,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--expert-ngram-profile"}, "FILE",
+        "read ahead from a LENGPROF expert-prediction table built by\n"
+        "scripts/expert-ngram/export_profile.py (default: disabled). Each\n"
+        "single-token decode step hashes the recent tokens, predicts the experts\n"
+        "every enabled layer will route, and prefetches the non-resident ones\n"
+        "into the disk decode-cache L2 pool in layer order. Requires the disk\n"
+        "decode cache (--load-mode dio on Windows)",
+        [](common_params & params, const std::string & value) {
+            params.expert_ngram_profile = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--expert-ngram-prefetch-max"}, "N",
+        string_format(
+            "cap on experts prefetched per decode step from --expert-ngram-profile\n"
+            "(default: %d, 0 = no cap)",
+            params.expert_ngram_prefetch_max
+        ),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --expert-ngram-prefetch-max must be >= 0");
+            }
+            params.expert_ngram_prefetch_max = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--pin-experts-from-profile"}, "FILE",
         "keep a base set of MoE experts permanently resident in the disk\n"
         "decode cache (default: disabled). FILE is a base-expert set derived\n"
