@@ -279,6 +279,10 @@ class llama_hot_expert_cache {
     void set_base_set_for_tools(const std::vector<std::string> & tools);
     bool set_base_set_for_fence();
 
+    // true when --expert-ngram-profile is active. The periodic report must run
+    // even without pinning, so the predict line is emitted at the same cadence
+    bool has_ngram_predict() const;
+
     // Prints the periodic stats report via LLAMA_LOG_INFO (verbosity 4): a header
     // line plus one themed line each for the slots, hit rate, churn, memory, locks,
     // ranking, decays, base set, prefetch and the per-layer breakdown. Called by
@@ -581,6 +585,12 @@ class llama_hot_expert_cache {
     uint64_t                              n_ngram_matched     = 0; // steps a stored order matched
     uint64_t                              n_ngram_pred_routes = 0;
     uint64_t                              n_ngram_pred_hits   = 0;
+    // previous report's predict counters, for the interval figures
+    uint64_t                              prev_ngram_matched     = 0;
+    uint64_t                              prev_ngram_pred_routes = 0;
+    uint64_t                              prev_ngram_pred_hits   = 0;
+    std::vector<uint64_t>                 prev_ngram_pred_layer;
+    std::vector<uint64_t>                 prev_ngram_hit_layer;
     uint64_t       profile_tokens = 0;
     uint64_t       profile_routes = 0;
     uint64_t       n_tokens_seen = 0;  // tokens since the last decay

@@ -4447,7 +4447,7 @@ void llama_context::print_expert_report() {
     if (moe_cache && moe_cache->is_active()) {
         moe_cache->print_stats();
     }
-    if (hot_experts && cparams.n_pin_hot_experts > 0) {
+    if (hot_experts && (cparams.n_pin_hot_experts > 0 || hot_experts->has_ngram_predict())) {
         // the RAM tier's realized hit rate is the disk stage's, counted at the
         // read decision. Pass it so the reported rate matches the funnel
         hot_experts->print_stats(false, tot.ram, tot.routed - tot.vram);

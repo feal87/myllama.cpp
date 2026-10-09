@@ -1097,6 +1097,11 @@ struct llama_disk_stage::impl {
     uint64_t                n_pref_bytes = 0;
     uint64_t                n_pref_skip  = 0; // already resident / in L2 / VRAM
     uint64_t                n_pref_noslot = 0;
+    // previous report's read-ahead counters, for the interval figures
+    uint64_t                prev_n_pref_reads  = 0;
+    uint64_t                prev_n_pref_bytes  = 0;
+    uint64_t                prev_n_pref_skip   = 0;
+    uint64_t                prev_n_pref_noslot = 0;
     // keys the demand fill reserved a slot for but has not published yet. The
     // read-ahead checks it so the two readers never insert the same key, which
     // would corrupt the SLRU lists
@@ -1878,6 +1883,10 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     const uint64_t d_base_sub  = base_sub  > p.prev_base_sub  ? base_sub  - p.prev_base_sub  : 0;
     const uint64_t d_base_drop = base_drop > p.prev_base_drop ? base_drop - p.prev_base_drop : 0;
     const uint64_t d_l2_all    = p.n_l2_all_hits > p.prev_l2_all_hits ? p.n_l2_all_hits - p.prev_l2_all_hits : 0;
+    const uint64_t d_pref_reads  = p.n_pref_reads  - p.prev_n_pref_reads;
+    const uint64_t d_pref_bytes  = p.n_pref_bytes  - p.prev_n_pref_bytes;
+    const uint64_t d_pref_skip   = p.n_pref_skip   - p.prev_n_pref_skip;
+    const uint64_t d_pref_noslot = p.n_pref_noslot - p.prev_n_pref_noslot;
 
     // one themed line each. The report is split in four blocks (L2, substitution,
     // dropping, disk) and each block is emitted in one write
@@ -2024,9 +2033,9 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
         line("  l2 policy : %" PRIu64 " evictions, %" PRIu64 " demotions | %zu/%zu entries live%s",
              d_evict, d_demote, n_entries, n_capacity,
              p.l2_warm ? "" : " | not warm yet");
-        if (p.n_pref_reads > 0 || p.n_pref_noslot > 0) {
-            line("  prefetch  : %" PRIu64 " experts read ahead (%s) | %" PRIu64 " resident, %" PRIu64 " no free slot",
-                 p.n_pref_reads, report_volume(p.n_pref_bytes).c_str(), p.n_pref_skip, p.n_pref_noslot);
+        if (d_pref_reads > 0 || d_pref_noslot > 0) {
+            line("  prefetch  : %" PRIu64 " experts read ahead this interval (%s) | %" PRIu64 " resident, %" PRIu64 " no free slot",
+                 d_pref_reads, report_volume(d_pref_bytes).c_str(), d_pref_skip, d_pref_noslot);
         }
     }
     const std::string sec_l = out.substr(s_l);
@@ -2120,6 +2129,10 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     p.prev_base_sub          = base_sub;
     p.prev_base_drop         = base_drop;
     p.prev_split_tot         = p.split_tot;
+    p.prev_n_pref_reads      = p.n_pref_reads;
+    p.prev_n_pref_bytes      = p.n_pref_bytes;
+    p.prev_n_pref_skip       = p.n_pref_skip;
+    p.prev_n_pref_noslot     = p.n_pref_noslot;
     p.n_reports++;
 }
 
