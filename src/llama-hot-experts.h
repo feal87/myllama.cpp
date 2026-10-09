@@ -134,7 +134,8 @@ class llama_hot_expert_cache {
                            bool                prefetch_enabled,
                            bool                track_rank,
                            bool                disk_mode,
-                           const char *        profile_path);
+                           const char *        profile_path,
+                           const char *        ngram_record_path);
     ~llama_hot_expert_cache();
 
     llama_hot_expert_cache(const llama_hot_expert_cache &)             = delete;
@@ -239,13 +240,19 @@ class llama_hot_expert_cache {
     void on_ubatch_begin(int64_t n_tokens);
 
     // Record the token of a single-token decode ubatch (the token sampled on the
-    // previous step) for the expert profile's generated-output text. No-op when
-    // profiling is disabled.
+    // previous step) for the expert profile's generated-output text and for the
+    // --expert-ngram-record decode stream. No-op when both are disabled.
     void note_output_token(int32_t token);
 
     // Flush the accumulated decode profile to disk and start a new record. No-op
     // when profiling is disabled or no routing was seen since the last flush.
     void flush_profile();
+
+    // The --expert-ngram-record pipeline: note_output_token() captures the token
+    // and observe_decode_finish() then writes the routed experts of that step, so
+    // one record pairs the token a graph consumed with the experts it routed.
+    // See write_ngram_step() for the on-disk format; the raw recording is the
+    // input of the offline expert-prediction study (scripts/expert-ngram).
 
     // direct-read expert staging: when set, ubatches fill the stage at each
     // layer's topk instead of prefetching the mmap (--load-mode dio). The disk
@@ -520,6 +527,15 @@ class llama_hot_expert_cache {
     // write and reset the current decode profile
     void write_profile();
 
+    // --expert-ngram-record: write the file header once (magic, model/tokenizer
+    // fingerprints, expert dimensions); a run that appends to a non-empty file
+    // verifies the existing header matches instead
+    void write_ngram_header();
+
+    // one decode_step record: the token fed to the graph and, per observed MoE
+    // layer, its routed expert ids. Called from observe_decode_finish (mu held)
+    void write_ngram_step();
+
     const llama_model & model;
 
     const int32_t  n_pin;            // N experts per layer
@@ -544,6 +560,13 @@ class llama_hot_expert_cache {
     std::FILE *    profile_file = nullptr;
     std::vector<int32_t> profile_output; // decode tokens of the current profile
     uint64_t       profile_id = 0;
+    std::FILE *    ngram_file = nullptr;   // --expert-ngram-record sink (null when off)
+    int32_t        ngram_token = 0;         // token of the decode step being recorded
+    bool           ngram_have_token = false;
+    uint64_t       ngram_model_fp = 0;      // model/tokenizer fingerprints of the header
+    uint64_t       ngram_tokenizer_fp = 0;
+    uint64_t       ngram_records = 0;       // decode_step records written
+    uint64_t       ngram_tokens_missed = 0; // decode steps with no token captured
     uint64_t       profile_tokens = 0;
     uint64_t       profile_routes = 0;
     uint64_t       n_tokens_seen = 0;  // tokens since the last decay

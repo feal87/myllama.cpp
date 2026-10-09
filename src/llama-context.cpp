@@ -156,6 +156,7 @@ llama_context::llama_context(
     cparams.n_pin_hot_experts_prompt_decay    = params.n_pin_hot_experts_prompt_decay;
     cparams.n_pin_hot_experts_min_count      = params.n_pin_hot_experts_min_count;
     cparams.expert_profile_path              = params.expert_profile_path;
+    cparams.expert_ngram_record_path         = params.expert_ngram_record_path;
     cparams.pin_experts_from_profile_path    = params.pin_experts_from_profile_path;
     cparams.warm_experts_from_profile_path   = params.warm_experts_from_profile_path;
     cparams.pin_experts_template_path        = params.pin_experts_template_path;
@@ -269,18 +270,20 @@ llama_context::llama_context(
     // decode ubatches feed the hot-expert ranking whenever pinning, the VRAM MoE
     // tier or the disk decode cache can consume it (matches the track_rank the
     // engine was built with)
-    hot_observe_decode = cparams.n_pin_hot_experts > 0 || moe_requested || disk_active || cparams.expert_profile_path != nullptr;
+    hot_observe_decode = cparams.n_pin_hot_experts > 0 || moe_requested || disk_active || cparams.expert_profile_path != nullptr ||
+                         cparams.expert_ngram_record_path != nullptr;
 
     const bool hot_experts_requested =
         cparams.n_pin_hot_experts > 0 ||
         moe_requested ||
         cparams.hot_experts_prefetch ||
         disk_active ||
-        cparams.expert_profile_path != nullptr;
+        cparams.expert_profile_path != nullptr ||
+        cparams.expert_ngram_record_path != nullptr;
 
     if (hot_experts_requested) {
         if (cparams.cb_eval != nullptr) {
-            LLAMA_LOG_WARN("%s: --pin-hot-experts / --hot-experts-prefetch / --moe-expert-cache* "
+            LLAMA_LOG_WARN("%s: --pin-hot-experts / --hot-experts-prefetch / --moe-expert-cache* / --expert-ngram-record "
                             "require the eval callback slot, but a custom cb_eval was already "
                             "supplied; all hot-expert features disabled\n", __func__);
         } else {
@@ -295,8 +298,9 @@ llama_context::llama_context(
                 cparams.n_pin_hot_experts_decay_tokens, cparams.n_moe_cache_decay_tokens, cparams.n_pin_hot_experts_prompt_decay,
                 cparams.n_pin_hot_experts_min_count,
                 cparams.hot_experts_prefetch,
-                cparams.n_pin_hot_experts > 0 || moe_requested || disk_active || cparams.expert_profile_path != nullptr,
-                disk_active, cparams.expert_profile_path);
+                cparams.n_pin_hot_experts > 0 || moe_requested || disk_active || cparams.expert_profile_path != nullptr ||
+                    cparams.expert_ngram_record_path != nullptr,
+                disk_active, cparams.expert_profile_path, cparams.expert_ngram_record_path);
             cparams.cb_eval           = llama_hot_expert_cache::eval_callback;
             cparams.cb_eval_user_data = hot_experts.get();
         }
@@ -5214,6 +5218,7 @@ llama_context_params llama_context_default_params() {
         /*.n_pin_hot_experts_prompt_decay =*/ 4,
         /*.n_pin_hot_experts_min_count   =*/ 8,
         /*.expert_profile_path           =*/ nullptr,
+        /*.expert_ngram_record_path      =*/ nullptr,
         /*.pin_experts_from_profile_path =*/ nullptr,
         /*.warm_experts_from_profile_path=*/ nullptr,
         /*.n_moe_cache_budget_bytes    =*/ 0,

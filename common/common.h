@@ -512,6 +512,10 @@ struct common_params {
     uint64_t n_pin_hot_experts_min_count = 8;
     // decode-only MoE routing profile output in JSONL format (empty = disabled)
     std::string expert_profile;
+    // raw binary recording of the decode token stream and the experts each
+    // single-token decode step routed, for offline expert-prediction experiments
+    // (--expert-ngram-record), appended across runs
+    std::string expert_ngram_record;
     // base set of experts to keep permanently resident in the disk decode cache
     // (--pin-experts-from-profile), derived from one or more --expert-profile exports
     std::string pin_experts_from_profile;
