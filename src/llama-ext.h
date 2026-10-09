@@ -145,6 +145,10 @@ struct llama_expert_l2_stats {
     uint64_t promotion_bytes  = 0;
     uint64_t evictions        = 0;
     uint64_t demotions        = 0;
+    // subset of entries/capacity backed by the permanent (prefill-surviving)
+    // L2 pool (--disk-stage-l2-permanent-mib)
+    uint64_t permanent_entries  = 0;
+    uint64_t permanent_capacity = 0;
     uint64_t decode_fill_calls       = 0;
     uint64_t decode_fill_bytes       = 0;
     uint64_t decode_fill_microseconds = 0;

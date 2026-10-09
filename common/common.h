@@ -553,6 +553,9 @@ struct common_params {
     // disk stage: measure and report the routed score distribution without
     // dropping anything. See --disk-stage-drop-probe.
     bool     disk_stage_drop_probe =     false;
+    // disk stage: dedicated mlocked L2 pool, in MiB, that survives prefill
+    // (0 = off). See --disk-stage-l2-permanent-mib.
+    uint64_t disk_stage_l2_permanent_mib = 0;
 
     // GPU-resident cache for host-offloaded MoE experts, served from VRAM on
     // decode (0 = disabled). See --moe-expert-cache*. Works with --pin-hot-experts

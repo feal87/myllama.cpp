@@ -3200,6 +3200,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--disk-stage-l2-permanent-mib"}, "N",
+        string_format(
+            "with --load-mode dio, reserve N MiB of dedicated, RAM-locked host\n"
+            "memory as an L2 eviction pool that survives prefill (default: %" PRIu64 "\n"
+            ", 0 = off). The staging-slab and dense-vram L2 pools are cleared whenever\n"
+            "the slabs are reused for prefill; this pool is not, so the hot expert set\n"
+            "stays warm across turns. At load a small planner splits the budget across\n"
+            "the model's expert-bundle types and assigns each layer to either a slab,\n"
+            "dense or permanent pool so every layer keeps an L2, balancing the slot\n"
+            "depth across layers. It is attributed to the disk decode cache and does\n"
+            "not count against --pin-hot-experts-budget-mib",
+            params.disk_stage_l2_permanent_mib
+        ),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --disk-stage-l2-permanent-mib must be >= 0");
+            }
+            params.disk_stage_l2_permanent_mib = (uint64_t) value;
+        }
+    ).set_env("LLAMA_ARG_DISK_STAGE_L2_PERMANENT_MIB"));
+    add_opt(common_arg(
         {"--hot-experts-prefetch"},
         {"--no-hot-experts-prefetch"},
         string_format(

@@ -172,6 +172,7 @@ llama_context::llama_context(
     cparams.disk_stage_drop_substitute_rel  = params.disk_stage_drop_substitute_rel;
     cparams.disk_stage_drop_substitute_pool = params.disk_stage_drop_substitute_pool;
     cparams.disk_stage_drop_probe     = params.disk_stage_drop_probe;
+    cparams.disk_stage_l2_permanent_bytes = params.disk_stage_l2_permanent_bytes;
 
     // The hot-expert cache is the shared router-observation engine: it maintains
     // the global decayed ranking behind the RAM pinning tier (--pin-hot-experts
@@ -210,6 +211,7 @@ llama_context::llama_context(
                 cparams.disk_stage_drop_max_mass_token,
                 cparams.disk_stage_drop_substitute_rel, cparams.disk_stage_drop_substitute_pool,
                 cparams.disk_stage_drop_probe,
+                cparams.disk_stage_l2_permanent_bytes,
                 params.dense_vram_tensors != nullptr && params.dense_vram_tensors[0] != '\0'
                     ? llama_dense_vram::find_host_regions(model, params.dense_vram_tensors)
                     : std::vector<std::pair<void *, size_t>>());
@@ -254,6 +256,11 @@ llama_context::llama_context(
 
     if (cparams.disk_stage_drop_substitute_pool > 0 && !disk_active) {
         LLAMA_LOG_WARN("%s: --disk-stage-drop-substitute-pool has no effect without the disk decode cache "
+                       "(--load-mode dio on Windows)\n", __func__);
+    }
+
+    if (cparams.disk_stage_l2_permanent_bytes > 0 && !disk_active) {
+        LLAMA_LOG_WARN("%s: --disk-stage-l2-permanent-mib has no effect without the disk decode cache "
                        "(--load-mode dio on Windows)\n", __func__);
     }
 
@@ -5229,6 +5236,7 @@ llama_context_params llama_context_default_params() {
         /*.disk_stage_drop_substitute_rel  =*/ 0.0f,
         /*.disk_stage_drop_substitute_pool =*/ 0,
         /*.disk_stage_drop_probe     =*/ false,
+        /*.disk_stage_l2_permanent_bytes =*/ 0,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

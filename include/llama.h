@@ -568,6 +568,13 @@ extern "C" {
         // the disk-stage report without dropping anything (--disk-stage-drop-probe)
         bool disk_stage_drop_probe;
 
+        // disk stage: dedicated mlocked CPU memory used as an L2 eviction pool
+        // that survives prefill (--disk-stage-l2-permanent-mib). Unlike the
+        // staging-slab and dense-vram L2 pools, its entries are not cleared when
+        // the slabs are reused for prefill, so the hot expert set stays warm
+        // across turns. 0 = off
+        uint64_t disk_stage_l2_permanent_bytes;
+
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)

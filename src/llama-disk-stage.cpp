@@ -64,6 +64,308 @@ static size_t align_up(size_t v, size_t a) {
     return (v + a - 1) & ~(a - 1);
 }
 
+// smallest pool that still pays for itself (--disk-stage-l2-permanent-mib)
+static const int32_t disk_stage_l2_cap_min = 8;
+// a pool holds at most this many expert sets, so a single hot layer cannot turn
+// a large pool's probation window over too fast. A bigger permanent budget is
+// split into several pools and the layers spread across them
+static const int32_t disk_stage_l2_pool_layer_cap = 2;
+
+// ---- start-time L2 layout planner -------------------------------------------
+// One expert-bundle type: the layers that share a gate/up/down shape and the
+// bytes one of their expert slots costs. per_slot and overhead match the pool
+// sizing in the constructor
+struct l2_layout_type {
+    size_t           per_slot = 0; // sum align_up(stride_role, disk_stage_align)
+    size_t           overhead = 0; // n_role * disk_stage_align
+    uint64_t         w        = 0; // per_slot * n_layers: bytes for one slot/layer
+    int32_t          n_expert = 0; // expert set size, the pool cap unit
+    std::vector<int> layers;
+};
+
+static size_t l2_min_pool_bytes(const l2_layout_type & t, int32_t cap_min) {
+    return t.overhead + (size_t) cap_min * t.per_slot;
+}
+
+static size_t l2_region_slots(size_t size, const l2_layout_type & t) {
+    if (t.per_slot == 0 || size <= t.overhead) {
+        return 0;
+    }
+    return (size - t.overhead) / t.per_slot;
+}
+
+// Decide which type each fixed region (slab, dense) serves and split the
+// permanent budget, so every layer keeps an L2 pool at as even a slot depth as
+// possible. The permanent budget becomes one pool per covered type; the fixed
+// regions are assigned to balance. k is 1 or 2 for real models, so the fixed
+// assignment is enumerated exactly. Every layer of a covered type is placed in
+// a pool; pool_layers_max is intentionally ignored so no layer is left without
+// an L2
+static void disk_stage_plan_l2(
+        const std::vector<l2_layout_type> & types,
+        const std::vector<size_t> & fixed_sizes,
+        uint64_t permanent_bytes,
+        int32_t cap_min,
+        std::vector<int> & fixed_type,
+        std::vector<std::pair<int, uint64_t>> & perm_pools,
+        std::vector<std::vector<int>> & region_layers) {
+    const int k = (int) types.size();
+    const int R = (int) fixed_sizes.size();
+    fixed_type.assign((size_t) R, -1);
+    perm_pools.clear();
+    region_layers.assign((size_t) R, {});
+    if (k == 0 || R == 0) {
+        return;
+    }
+
+    std::vector<std::vector<uint8_t>> usable((size_t) R, std::vector<uint8_t>((size_t) k, 0));
+    for (int i = 0; i < R; ++i) {
+        for (int j = 0; j < k; ++j) {
+            usable[(size_t) i][(size_t) j] =
+                l2_region_slots(fixed_sizes[(size_t) i], types[(size_t) j]) >= (size_t) cap_min ? 1 : 0;
+        }
+    }
+
+    // water-fill the permanent budget: P_j raises (A_j + P_j)/w_j to a common
+    // level; a pool below the minimum is dropped rather than admitted
+    const auto water_fill = [&](const std::vector<uint64_t> & A, std::vector<uint64_t> & P) {
+        P.assign((size_t) k, 0);
+        if (permanent_bytes == 0) {
+            return;
+        }
+        double lo = 0.0;
+        double hi = 0.0;
+        for (int j = 0; j < k; ++j) {
+            if (types[(size_t) j].w > 0) {
+                hi = std::max(hi, (double) (permanent_bytes + A[(size_t) j]) / (double) types[(size_t) j].w);
+            }
+        }
+        for (int it = 0; it < 80; ++it) {
+            const double mid = 0.5 * (lo + hi);
+            double cost = 0.0;
+            for (int j = 0; j < k; ++j) {
+                const double want = mid * (double) types[(size_t) j].w - (double) A[(size_t) j];
+                if (want > 0.0) {
+                    cost += want;
+                }
+            }
+            if (cost <= (double) permanent_bytes) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        for (int j = 0; j < k; ++j) {
+            const double want = lo * (double) types[(size_t) j].w - (double) A[(size_t) j];
+            P[(size_t) j] = want > 0.0 ? (uint64_t) want : 0;
+            if (P[(size_t) j] > 0 && P[(size_t) j] < l2_min_pool_bytes(types[(size_t) j], cap_min)) {
+                P[(size_t) j] = 0;
+            }
+        }
+    };
+
+    std::vector<int>      best_assign((size_t) R, -1);
+    std::vector<uint64_t> best_P((size_t) k, 0);
+    double                best_score = -1.0;
+    uint64_t              best_sum   = 0;
+
+    const auto consider = [&](const std::vector<int> & assign, std::vector<uint64_t> & P) {
+        std::vector<uint64_t> A((size_t) k, 0);
+        for (int i = 0; i < R; ++i) {
+            const int j = assign[(size_t) i];
+            if (j >= 0) {
+                A[(size_t) j] += fixed_sizes[(size_t) i];
+            }
+        }
+        water_fill(A, P);
+        double   score = 0.0;
+        uint64_t sum   = 0;
+        for (int j = 0; j < k; ++j) {
+            const bool   covered = A[(size_t) j] > 0 || P[(size_t) j] > 0;
+            const double lvl = covered ? (double) (A[(size_t) j] + P[(size_t) j]) / (double) types[(size_t) j].w : 0.0;
+            if (j == 0 || lvl < score) {
+                score = lvl;
+            }
+            sum += A[(size_t) j] + P[(size_t) j];
+        }
+        if (score > best_score || (score == best_score && sum > best_sum)) {
+            best_score  = score;
+            best_sum    = sum;
+            best_assign = assign;
+            best_P      = P;
+        }
+    };
+
+    const int n_choices = k + 1; // -1 = unused, else a type
+    int64_t   total     = 1;
+    for (int i = 0; i < R; ++i) {
+        total *= n_choices;
+        if (total > (int64_t) 1 << 20) {
+            total = -1;
+            break;
+        }
+    }
+    if (total > 0) {
+        std::vector<int> assign((size_t) R, -1);
+        for (int64_t code = 0; code < total; ++code) {
+            int64_t c  = code;
+            bool    ok = true;
+            for (int i = 0; i < R; ++i) {
+                const int choice = (int) (c % n_choices) - 1;
+                c /= n_choices;
+                assign[(size_t) i] = choice;
+                if (choice >= 0 && !usable[(size_t) i][(size_t) choice]) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) {
+                continue;
+            }
+            std::vector<uint64_t> P;
+            consider(assign, P);
+        }
+    } else {
+        // too many regions to enumerate: greedy, each region to the most starved type
+        std::vector<uint64_t> A((size_t) k, 0);
+        std::vector<int>      assign((size_t) R, -1);
+        for (int i = 0; i < R; ++i) {
+            int    bj = -1;
+            double bl = 0.0;
+            for (int j = 0; j < k; ++j) {
+                if (!usable[(size_t) i][(size_t) j]) {
+                    continue;
+                }
+                const double lvl = (double) A[(size_t) j] / (double) types[(size_t) j].w;
+                if (bj < 0 || lvl < bl) {
+                    bj = j;
+                    bl = lvl;
+                }
+            }
+            assign[(size_t) i] = bj;
+            if (bj >= 0) {
+                A[(size_t) bj] += fixed_sizes[(size_t) i];
+            }
+        }
+        std::vector<uint64_t> P;
+        consider(assign, P);
+    }
+
+    fixed_type = best_assign;
+    for (int j = 0; j < k; ++j) {
+        if (best_P[(size_t) j] == 0) {
+            continue;
+        }
+        // split the type's permanent share so no pool holds more than
+        // disk_stage_l2_pool_layer_cap expert sets
+        const size_t cap_total = l2_region_slots((size_t) best_P[(size_t) j], types[(size_t) j]);
+        const size_t max_slots = (size_t) disk_stage_l2_pool_layer_cap *
+                (size_t) std::max<int32_t>(types[(size_t) j].n_expert, 1);
+        if (cap_total == 0) {
+            continue;
+        }
+        // split evenly, so every pool serves a similar number of layers instead
+        // of one full pool plus a useless remainder
+        const int    n_pools = (int) ((cap_total + max_slots - 1) / max_slots);
+        const size_t base    = cap_total / (size_t) n_pools;
+        size_t       rem     = cap_total % (size_t) n_pools;
+        for (int p = 0; p < n_pools; ++p) {
+            const size_t k_slots = base + (rem > 0 ? 1 : 0);
+            if (rem > 0) {
+                rem--;
+            }
+            const uint64_t bytes = (uint64_t) types[(size_t) j].overhead +
+                                   (uint64_t) k_slots * (uint64_t) types[(size_t) j].per_slot;
+            perm_pools.emplace_back(j, bytes);
+        }
+    }
+
+    // per-type pools: fixed regions (index < R) and permanent pools (>= R)
+    std::vector<std::vector<int>> pools_of((size_t) k);
+    for (int i = 0; i < R; ++i) {
+        if (best_assign[(size_t) i] >= 0) {
+            pools_of[(size_t) best_assign[(size_t) i]].push_back(i);
+        }
+    }
+    for (size_t p = 0; p < perm_pools.size(); ++p) {
+        pools_of[(size_t) perm_pools[p].first].push_back(R + (int) p);
+    }
+
+    const auto region_cap = [&](int region, int type) -> size_t {
+        if (region < R) {
+            return l2_region_slots(fixed_sizes[(size_t) region], types[(size_t) type]);
+        }
+        return l2_region_slots(perm_pools[(size_t) (region - R)].second, types[(size_t) type]);
+    };
+
+    // distribute each type's layers over its pools in proportion to slot
+    // capacity, so every layer of the type gets the same depth
+    region_layers.assign((size_t) (R + perm_pools.size()), {});
+    for (int j = 0; j < k; ++j) {
+        const std::vector<int> & pl = pools_of[(size_t) j];
+        const size_t             n  = types[(size_t) j].layers.size();
+        if (pl.empty() || n == 0) {
+            continue;
+        }
+        size_t total_cap = 0;
+        for (int r : pl) {
+            total_cap += region_cap(r, j);
+        }
+        if (total_cap == 0) {
+            continue;
+        }
+
+        std::vector<int>    cnt(pl.size(), 0);
+        std::vector<double> rem(pl.size(), 0.0);
+        int                 assigned = 0;
+        for (size_t pi = 0; pi < pl.size(); ++pi) {
+            const double q = (double) region_cap(pl[pi], j) * (double) n / (double) total_cap;
+            cnt[pi] = (int) std::floor(q);
+            rem[pi] = q - (double) cnt[pi];
+            assigned += cnt[pi];
+        }
+        // do not leave a pool empty when layers can fill it
+        if (n >= pl.size()) {
+            for (size_t pi = 0; pi < pl.size(); ++pi) {
+                if (cnt[pi] == 0) {
+                    cnt[pi] = 1;
+                    assigned++;
+                }
+            }
+        }
+        while (assigned < (int) n) {
+            size_t bi = 0;
+            for (size_t pi = 1; pi < pl.size(); ++pi) {
+                if (rem[pi] > rem[bi]) {
+                    bi = pi;
+                }
+            }
+            cnt[bi]++;
+            rem[bi] -= 1.0;
+            assigned++;
+        }
+        while (assigned > (int) n) {
+            size_t bi = 0;
+            for (size_t pi = 1; pi < pl.size(); ++pi) {
+                if (cnt[pi] > cnt[bi]) {
+                    bi = pi;
+                }
+            }
+            if (cnt[bi] == 0) {
+                break;
+            }
+            cnt[bi]--;
+            assigned--;
+        }
+        size_t pos = 0;
+        for (size_t pi = 0; pi < pl.size(); ++pi) {
+            for (int c = 0; c < cnt[pi]; ++c) {
+                region_layers[(size_t) pl[pi]].push_back(types[(size_t) j].layers[pos++]);
+            }
+        }
+    }
+}
+
 // Parse a base-expert set: a required header, then one "<layer> <expert>" pair
 // per line. Blank lines and '#' comments are skipped. Only the layer range is
 // checked here; the constructor validates stageability and the expert range
@@ -402,6 +704,9 @@ struct llama_disk_stage::impl {
         uint64_t hits      = 0; // counted only once the RAM tier is warm
         uint64_t misses    = 0;
         uint64_t evictions = 0;
+        // permanent pools are backed by the dedicated --disk-stage-l2-permanent-mib
+        // buffer and are NOT cleared when a prefill reuses the staging slabs
+        bool     permanent = false;
     };
     std::vector<evict_pool> evict_pools;
     std::vector<int>        evict_pool_id;    // layer -> pool, -1 when not pooled
@@ -426,6 +731,9 @@ struct llama_disk_stage::impl {
         size_t  size;
     };
     std::vector<ggml_backend_buffer_t> extra_l2_bufs; // wrapped external regions, freed with the stage
+    // dedicated, mlocked backing for the permanent L2 pools. Allocated once and
+    // never touched by prefill, so its entries survive the staging-slab reuse
+    ggml_backend_buffer_t perm_buf = nullptr;
 
     uint64_t n_l2_hits        = 0;
     uint64_t n_l2_misses      = 0;
@@ -997,35 +1305,52 @@ struct llama_disk_stage::impl {
         ep.free_slots.push_back(slot);
     }
 
-    void evict_clear() {
-        for (evict_pool & ep : evict_pools) {
-            ep.prob.clear();
-            ep.prot.clear();
-            ep.slot_of.clear();
-            ep.free_slots.resize((size_t) ep.sentinel); // the sentinel is never free
-            for (int32_t s = 0; s < ep.sentinel; ++s) {
-                ep.free_slots[(size_t) s] = s;
-            }
-            std::fill(ep.slot_key.begin(), ep.slot_key.end(), (int64_t) -1);
+    static void evict_clear_pool(evict_pool & ep) {
+        ep.prob.clear();
+        ep.prot.clear();
+        ep.slot_of.clear();
+        ep.free_slots.resize((size_t) ep.sentinel); // the sentinel is never free
+        for (int32_t s = 0; s < ep.sentinel; ++s) {
+            ep.free_slots[(size_t) s] = s;
+        }
+        std::fill(ep.slot_key.begin(), ep.slot_key.end(), (int64_t) -1);
+    }
+
+    // Reset a layer's id table to its pool's sentinel (every routed expert then
+    // falls through to the disk read path)
+    void evict_reset_table(l2_layer & L) {
+        if (L.table == nullptr || L.pool < 0 || L.pool >= (int) evict_pools.size()) {
+            return;
+        }
+        const int32_t sentinel = evict_pools[(size_t) L.pool].sentinel;
+        int32_t * t = (int32_t *) L.table->data;
+        for (int64_t e = 0; e < (int64_t) L.table->ne[0] * L.table->ne[1]; ++e) {
+            t[e] = sentinel;
         }
     }
 
-    // evict_clear plus a reset of every per-layer table. Used when the memory the
-    // extra L2 regions sit on changes identity (the dense host regions become
-    // weights again), so no slot can be read after its contents changed
-    void evict_invalidate() {
-        evict_clear();
-        for (l2_layer & L : l2) {
-            if (L.table == nullptr || L.pool < 0 || L.pool >= (int) evict_pools.size()) {
-                continue;
+    // Clear and reset only the transient pools. The permanent pools are backed by
+    // the dedicated perm_buf and prefill never writes them, so their entries and
+    // tables must stay valid across the staging-slab reuse
+    void evict_clear_transient() {
+        for (evict_pool & ep : evict_pools) {
+            if (!ep.permanent) {
+                evict_clear_pool(ep);
             }
-            const int32_t sentinel = evict_pools[(size_t) L.pool].sentinel;
-            int32_t * t = (int32_t *) L.table->data;
-            for (int64_t e = 0; e < (int64_t) L.table->ne[0] * L.table->ne[1]; ++e) {
-                t[e] = sentinel;
+        }
+        for (l2_layer & L : l2) {
+            if (L.pool < 0 || L.pool >= (int) evict_pools.size() || !evict_pools[(size_t) L.pool].permanent) {
+                evict_reset_table(L);
             }
         }
         evict_populated = false;
+    }
+
+    // evict_clear_transient plus a reset of every transient layer's table. Used
+    // when the memory the extra L2 regions sit on changes identity (the dense
+    // host regions become weights again); permanent pools never alias those bytes
+    void evict_invalidate() {
+        evict_clear_transient();
     }
 
     // double-buffered staging pipeline: one reader thread reads the next
@@ -1055,6 +1380,9 @@ struct llama_disk_stage::impl {
         }
         if (cache_buf) {
             ggml_backend_buffer_free(cache_buf);
+        }
+        if (perm_buf) {
+            ggml_backend_buffer_free(perm_buf);
         }
         if (ctx) {
             ggml_free(ctx);
@@ -1229,6 +1557,10 @@ void llama_disk_stage::stats_snapshot(llama_expert_stats & out) const {
     for (const auto & pool : p.evict_pools) {
         out.disk_l2.entries  += pool.slot_of.size();
         out.disk_l2.capacity += (uint64_t) pool.cap;
+        if (pool.permanent) {
+            out.disk_l2.permanent_entries  += pool.slot_of.size();
+            out.disk_l2.permanent_capacity += (uint64_t) pool.cap;
+        }
     }
     out.disk_l2.hits               = p.n_l2_all_hits;
     out.disk_l2.misses             = p.n_l2_all_misses;
@@ -1448,12 +1780,14 @@ std::string llama_disk_stage::ram_layout() const {
         slots = "(" + slots + ")";
     }
     const size_t cache_bytes = p.cache_buf ? ggml_backend_buffer_get_size(p.cache_buf) : 0;
+    const size_t perm_bytes  = p.perm_buf ? ggml_backend_buffer_get_size(p.perm_buf) : 0;
 
-    char buf[512];
+    char buf[768];
     snprintf(buf, sizeof(buf), "%zu pool(s) over %zu layer(s) | %s resident slots | %d transient per layer"
-             " | decode cache %.2f MiB%s",
+             " | decode cache %.2f MiB%s | permanent L2 %.2f MiB%s",
              p.pools.size(), p.cache.size(), slots.c_str(), p.n_trans,
-             cache_bytes / (1024.0 * 1024.0), p.cache_lock ? " RAM-locked" : "");
+             cache_bytes / (1024.0 * 1024.0), p.cache_lock ? " RAM-locked" : "",
+             perm_bytes / (1024.0 * 1024.0), perm_bytes > 0 ? " RAM-locked" : " (off)");
     return buf;
 }
 
@@ -1658,8 +1992,8 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
         for (size_t k = 0; k < p.evict_pools.size(); ++k) {
             const impl::evict_pool & ep = p.evict_pools[k];
             const uint64_t look = ep.hits + ep.misses;
-            snprintf(buf, sizeof(buf), " pool %zu: %zu/%d live, hit %.1f%% (%" PRIu64 "/%" PRIu64
-                     " warm), evictions %" PRIu64, k, ep.slot_of.size(), ep.cap,
+            snprintf(buf, sizeof(buf), " pool %zu%s: %zu/%d live, hit %.1f%% (%" PRIu64 "/%" PRIu64
+                     " warm), evictions %" PRIu64, k, ep.permanent ? "*" : "", ep.slot_of.size(), ep.cap,
                      look ? 100.0 * (double) ep.hits / (double) look : 0.0, ep.hits, look, ep.evictions);
             row += buf;
             // wrap after appending: checking first lets the last entry push the
@@ -1892,7 +2226,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                    const char * warm_experts_path, const char * base_template_path,
                                    int32_t sparse_max, float drop_fraction, float drop_below_rel,
                                    float drop_max_mass, float drop_max_mass_token, float substitute_rel, int32_t substitute_pool,
-                                   bool drop_probe,
+                                   bool drop_probe, uint64_t permanent_bytes,
                                    const std::vector<std::pair<void *, size_t>> & extra_l2_regions) :
     pimpl(std::make_unique<impl>(model)) {
     impl & p = *pimpl;
@@ -1916,6 +2250,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     GGML_UNUSED(substitute_rel);
     GGML_UNUSED(substitute_pool);
     GGML_UNUSED(drop_probe);
+    GGML_UNUSED(permanent_bytes);
     return;
 #else
     if (!model.has_disk_weights()) {
@@ -2232,7 +2567,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     }
 
     ggml_init_params ip = {
-        /*.mem_size   =*/ ggml_tensor_overhead() * (size_t) (n_layer * 4 + (size_t) p.n_buf * 4 + 32),
+        /*.mem_size   =*/ ggml_tensor_overhead() * (size_t) (n_layer * 4 + ((size_t) p.n_buf + extra_l2_regions.size() + 2) * 4 + 32),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -2678,18 +3013,15 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
 
                             // group the stageable layers by expert-bundle type: a
                             // slot stride is fixed per tensor, so only identical
-                            // tensors can share one pool. Start with one pool per
-                            // type, then let any spare slab halve the largest type,
-                            // so both staging slabs hold L2 slots even when the
-                            // model has a single layout
-                            std::vector<std::vector<int>> l2_groups;
+                            // tensors can share one pool
+                            std::vector<std::vector<int>> type_groups;
                             for (int il = 0; il < n_layer; ++il) {
                                 if (!src[il].ok) {
                                     continue;
                                 }
                                 int g = -1;
-                                for (size_t k = 0; k < l2_groups.size(); ++k) {
-                                    const layer_src & a = src[l2_groups[k][0]];
+                                for (size_t k = 0; k < type_groups.size(); ++k) {
+                                    const layer_src & a = src[type_groups[k][0]];
                                     bool same = true;
                                     for (const auto & role : roles) {
                                         const ggml_tensor * ta = a.t[role.slot];
@@ -2705,41 +3037,121 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                     }
                                 }
                                 if (g < 0) {
-                                    l2_groups.push_back({});
-                                    g = (int) l2_groups.size() - 1;
+                                    type_groups.push_back({});
+                                    g = (int) type_groups.size() - 1;
                                 }
-                                l2_groups[g].push_back(il);
+                                type_groups[g].push_back(il);
                             }
 
-                            // more bundle types than staging slabs: pool the
-                            // types that cover the most layers, the remaining
-                            // layers keep streaming (a prefill clears the pools
-                            // anyway, so a partial pool is safe)
-                            if ((int) l2_groups.size() > (int) l2_regions.size()) {
-                                std::stable_sort(l2_groups.begin(), l2_groups.end(),
-                                                 [](const std::vector<int> & a, const std::vector<int> & b) {
-                                                     return a.size() > b.size();
-                                                 });
+                            std::vector<std::vector<int>> l2_groups;
+                            std::vector<char>             region_permanent; // region -> permanent L2 pool
+
+                            if (permanent_bytes > 0) {
+                                // start-time planner: split the dedicated budget
+                                // across the bundle types and assign the slabs and
+                                // dense regions to balance the per-layer depth
+                                std::vector<l2_layout_type> layout_types(type_groups.size());
+                                for (size_t tj = 0; tj < type_groups.size(); ++tj) {
+                                    const layer_src & a  = src[type_groups[tj][0]];
+                                    l2_layout_type &  lt = layout_types[tj];
+                                    for (const auto & role : roles) {
+                                        const size_t stride = a.r[role.slot].stride;
+                                        if (stride > 0) {
+                                            lt.per_slot += align_up(stride, disk_stage_align);
+                                            lt.overhead += disk_stage_align;
+                                        }
+                                    }
+                                    lt.n_expert = (int32_t) a.t[0]->ne[2];
+                                    lt.w      = (uint64_t) lt.per_slot * (uint64_t) type_groups[tj].size();
+                                    lt.layers = type_groups[tj];
+                                }
+
+                                std::vector<size_t> fixed_sizes;
+                                fixed_sizes.reserve(l2_regions.size());
+                                for (const auto & r : l2_regions) {
+                                    fixed_sizes.push_back(r.size);
+                                }
+
+                                // the permanent buffer is allocated once; the
+                                // planner decides how it is carved across types
+                                // each split permanent pool carries its own per-role
+                                // alignment overhead on top of the budget, so leave slack
+                                const size_t perm_alloc = align_up((size_t) permanent_bytes, disk_stage_align) + (2 << 20);
+                                p.perm_buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), perm_alloc);
+                                if (p.perm_buf != nullptr) {
+                                    // same usage as the staging pool, so the scheduler
+                                    // keeps the L2 tensors on the host backend
+                                    ggml_backend_buffer_set_usage(p.perm_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                                    ggml_backend_buffer_clear(p.perm_buf, 0);
+                                } else {
+                                    LLAMA_LOG_WARN("%s: could not allocate the %.2f GiB permanent L2 pool, "
+                                                   "continuing without it\n",
+                                                   __func__, permanent_bytes / (1024.0 * 1024.0 * 1024.0));
+                                }
+
+                                std::vector<int> fixed_type;
+                                std::vector<std::pair<int, uint64_t>> perm_pools;
+                                disk_stage_plan_l2(layout_types, fixed_sizes,
+                                                   p.perm_buf != nullptr ? permanent_bytes : 0,
+                                                   disk_stage_l2_cap_min,
+                                                   fixed_type, perm_pools, l2_groups);
+
+                                // fixed regions first, then one region per type that
+                                // got a permanent pool
+                                region_permanent.assign(l2_regions.size(), 0);
+                                if (p.perm_buf != nullptr && !perm_pools.empty()) {
+                                    char * pbase = (char *) align_up((uintptr_t) ggml_backend_buffer_get_base(p.perm_buf), disk_stage_align);
+                                    size_t poff  = 0;
+                                    for (const auto & pp : perm_pools) {
+                                        const size_t bytes = align_up((size_t) pp.second, disk_stage_align);
+                                        l2_regions.push_back({ p.perm_buf, pbase + poff, bytes });
+                                        region_permanent.push_back(1);
+                                        poff += bytes + disk_stage_align;
+                                    }
+                                }
+                                if (p.perm_buf != nullptr && perm_pools.empty()) {
+                                    LLAMA_LOG_WARN("%s: --disk-stage-l2-permanent-mib too small for a usable pool "
+                                                   "(minimum %d slots), no permanent L2 pool\n",
+                                                   __func__, disk_stage_l2_cap_min);
+                                    ggml_backend_buffer_free(p.perm_buf);
+                                    p.perm_buf = nullptr;
+                                }
                                 l2_groups.resize(l2_regions.size());
-                            }
+                                region_permanent.resize(l2_regions.size(), 0);
+                            } else {
+                                l2_groups = type_groups;
+                                region_permanent.assign(l2_regions.size(), 0);
 
-                            while ((int) l2_groups.size() < (int) l2_regions.size()) {
-                                size_t best = l2_groups.size();
-                                for (size_t k = 0; k < l2_groups.size(); ++k) {
-                                    if (l2_groups[k].size() < 2) {
-                                        continue;
-                                    }
-                                    if (best == l2_groups.size() || l2_groups[k].size() > l2_groups[best].size()) {
-                                        best = k;
-                                    }
+                                // more bundle types than staging slabs: pool the
+                                // types that cover the most layers, the remaining
+                                // layers keep streaming (a prefill clears the pools
+                                // anyway, so a partial pool is safe)
+                                if ((int) l2_groups.size() > (int) l2_regions.size()) {
+                                    std::stable_sort(l2_groups.begin(), l2_groups.end(),
+                                                     [](const std::vector<int> & a, const std::vector<int> & b) {
+                                                         return a.size() > b.size();
+                                                     });
+                                    l2_groups.resize(l2_regions.size());
                                 }
-                                if (best == l2_groups.size()) {
-                                    break;  // no type has a layer to spare
+
+                                while ((int) l2_groups.size() < (int) l2_regions.size()) {
+                                    size_t best = l2_groups.size();
+                                    for (size_t k = 0; k < l2_groups.size(); ++k) {
+                                        if (l2_groups[k].size() < 2) {
+                                            continue;
+                                        }
+                                        if (best == l2_groups.size() || l2_groups[k].size() > l2_groups[best].size()) {
+                                            best = k;
+                                        }
+                                    }
+                                    if (best == l2_groups.size()) {
+                                        break;  // no type has a layer to spare
+                                    }
+                                    const size_t mid = l2_groups[best].size() / 2;
+                                    std::vector<int> half(l2_groups[best].begin() + mid, l2_groups[best].end());
+                                    l2_groups[best].resize(mid);
+                                    l2_groups.push_back(std::move(half));
                                 }
-                                const size_t mid = l2_groups[best].size() / 2;
-                                std::vector<int> half(l2_groups[best].begin() + mid, l2_groups[best].end());
-                                l2_groups[best].resize(mid);
-                                l2_groups.push_back(std::move(half));
                             }
 
                             p.evict_pool_id.assign(n_layer, -1);
@@ -2750,12 +3162,12 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                             // pool weights themselves live on the staging slabs
                             {
                                 ggml_init_params lip = {
-                                    /*.mem_size   =*/ ggml_tensor_overhead() * (size_t) (n_layer + p.n_buf + 8),
+                                    /*.mem_size   =*/ ggml_tensor_overhead() * (size_t) (n_layer + l2_regions.size() + 8),
                                     /*.mem_buffer =*/ nullptr,
                                     /*.no_alloc   =*/ true,
                                 };
                                 p.l2_ctx = ggml_init(lip);
-                                const size_t l2_bytes = (size_t) (n_layer + p.n_buf + 4) * 2 * disk_stage_align;
+                                const size_t l2_bytes = (size_t) (n_layer + l2_regions.size() + 4) * 2 * disk_stage_align;
                                 p.l2_buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), l2_bytes);
                             }
                             size_t off_l2 = 0;
@@ -2768,6 +3180,9 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                             for (size_t g = 0; g < l2_groups.size(); ++g) {
                                 if (g >= l2_regions.size()) {
                                     break;
+                                }
+                                if (l2_groups[g].empty()) {
+                                    continue;  // no layer assigned to this region
                                 }
                                 const int il  = l2_groups[g][0];
                                 const int pid = (int) p.evict_pools.size();
@@ -2792,8 +3207,9 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                 region_used[g] = 1;
 
                                 impl::evict_pool ep;
-                                ep.cap      = cap;
-                                ep.sentinel = cap - 1; // never filled, skipped by the graph
+                                ep.cap       = cap;
+                                ep.permanent = g < region_permanent.size() && region_permanent[g] != 0;
+                                ep.sentinel  = cap - 1; // never filled, skipped by the graph
                                 // protected gets three quarters: one-shot misses
                                 // enter probation and cannot displace a re-read
                                 ep.prot_cap  = ep.sentinel - std::max(1, ep.sentinel / 4);
@@ -2902,8 +3318,9 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                                    __func__, n_pooled, n_staged, n_staged - n_pooled);
                                 }
                                 for (size_t k = 0; k < p.evict_pools.size(); ++k) {
-                                    LLAMA_LOG_INFO("%s:   L2 pool %zu: %d slots, strides %zu/%zu/%zu bytes\n",
-                                                   __func__, k, p.evict_pools[k].cap,
+                                    LLAMA_LOG_INFO("%s:   L2 pool %zu%s: %d slots, strides %zu/%zu/%zu bytes\n",
+                                                   __func__, k, p.evict_pools[k].permanent ? " (permanent)" : "",
+                                                   p.evict_pools[k].cap,
                                                    p.evict_pools[k].stride[0], p.evict_pools[k].stride[1],
                                                    p.evict_pools[k].stride[2]);
                                 }
@@ -3309,12 +3726,12 @@ void llama_disk_stage::fill(int il) {
 
 #if defined(_WIN32)
     if (p.evict_populated) {
-        // the staging slabs hold the L2 pool, so wait out any decode store still
-        // writing them before the prefill clears the pool
+        // the staging slabs hold the transient L2 pools, so wait out any decode
+        // store still writing them before the prefill clears those pools. The
+        // permanent pools are not on the slabs and are left untouched
         dec_io_drain();
         std::lock_guard<std::mutex> lock(p.cache_mu);
-        p.evict_clear();
-        p.evict_populated = false;
+        p.evict_clear_transient();
     }
 
     if (p.n_buf < 2) {
@@ -3424,9 +3841,33 @@ void llama_disk_stage::fill_run(int il, const uint8_t * used) {
             // a resident expert already sits in the cache's CPU memory, so copy
             // it instead of reading it again. An expert served by the VRAM cache
             // has no RAM slot (vram_commit freed it), so it is read like any
-            // non-resident. A promoted-but-unread resident must be read too
+            // non-resident. A promoted-but-unread resident must be read too.
+            // The permanent L2 pool survives prefill, so its entries are a second
+            // disk surrogate here; the transient L2 pools were cleared above, so
+            // a lookup only ever finds permanent entries
             auto resident = [&](int32_t id) {
                 return c != nullptr && c->resident_slot[id] >= 0 && c->resident_filled[id] != 0 && c->vram[id] == 0;
+            };
+            const int epid = p.evict_pool_for(il);
+            const impl::evict_pool * l2_pool = epid >= 0 ? &p.evict_pools[(size_t) epid] : nullptr;
+            auto l2_slot = [&](int32_t id) -> int32_t {
+                if (l2_pool == nullptr) {
+                    return -1;
+                }
+                const auto it = l2_pool->slot_of.find(((int64_t) il << 32) | (uint32_t) id);
+                return it == l2_pool->slot_of.end() ? -1 : it->second;
+            };
+            auto cached = [&](int32_t id) -> bool {
+                return resident(id) || l2_slot(id) >= 0;
+            };
+            // source pointer of a cached expert for this role, or null
+            auto cached_src = [&](int32_t id) -> const char * {
+                if (resident(id)) {
+                    const size_t slot = (size_t) c->resident_slot[id];
+                    return pool->data[role] + slot * pool->slot_stride[role];
+                }
+                const int32_t slot = l2_slot(id);
+                return slot >= 0 ? l2_pool->data[role] + (size_t) slot * l2_pool->stride[role] : nullptr;
             };
             // sparse fill reads only the routed experts, the whole slab reads all
             auto selected = [&](int32_t id) {
@@ -3441,16 +3882,14 @@ void llama_disk_stage::fill_run(int il, const uint8_t * used) {
                     ++id;
                     continue;
                 }
-                if (resident(id)) {
-                    const size_t slot = (size_t) c->resident_slot[id];
-                    copies.push_back({ pool->data[role] + slot * pool->slot_stride[role],
-                                       slab + (size_t) id * stride, stride });
+                if (cached(id)) {
+                    copies.push_back({ cached_src(id), slab + (size_t) id * stride, stride });
                     ++id;
                     continue;
                 }
 
                 int32_t last = id;
-                while (last < n_expert && selected(last) && !resident(last)) {
+                while (last < n_expert && selected(last) && !cached(last)) {
                     ++last;
                 }
 
@@ -3473,17 +3912,14 @@ void llama_disk_stage::fill_run(int il, const uint8_t * used) {
                 // resident and the head of the following one. Restore both from the
                 // cache once the reads are done: that is what frees the resident
                 // copies to run while the drive is busy instead of after it.
-                if (prefix > 0 && id > 0 && resident(id - 1)) {
-                    const size_t slot = (size_t) c->resident_slot[id - 1];
-                    patches.push_back({ pool->data[role] + slot * pool->slot_stride[role] + (stride - prefix),
+                if (prefix > 0 && id > 0 && cached(id - 1)) {
+                    patches.push_back({ cached_src(id - 1) + (stride - prefix),
                                         slab + (size_t) id * stride - prefix, prefix });
                 }
-                if (last < n_expert && resident(last)) {
+                if (last < n_expert && cached(last)) {
                     const size_t over = (size_t) ((dst + rlen) - (slab + (size_t) last * stride));
                     if (over > 0 && over <= stride) {
-                        const size_t slot = (size_t) c->resident_slot[last];
-                        patches.push_back({ pool->data[role] + slot * pool->slot_stride[role],
-                                            slab + (size_t) last * stride, over });
+                        patches.push_back({ cached_src(last), slab + (size_t) last * stride, over });
                     }
                 }
                 id = last;
@@ -3584,12 +4020,12 @@ void llama_disk_stage::fill_selected(int il, const int32_t * ids, int64_t n_ids)
         }
     }
 
-    // a prefill clobbers the L2 pool decode reuses the staging slabs for
+    // a prefill clobbers the transient L2 pools decode reuses the staging slabs
+    // for; the permanent pools are backed by their own buffer and survive
     if (p.evict_populated) {
         dec_io_drain();
         std::lock_guard<std::mutex> lock(p.cache_mu);
-        p.evict_clear();
-        p.evict_populated = false;
+        p.evict_clear_transient();
     }
 
     fill_run(il, used.data());

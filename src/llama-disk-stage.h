@@ -110,13 +110,17 @@ public:
     // the L2 pool may lay slots over during decode instead of the prefill staging
     // slabs. The caller guarantees the bytes are free while the decode graph runs
     // (the decode-promoted dense weights' host memory)
+    // permanent_bytes: optional dedicated, mlocked L2 pool that survives prefill
+    // (--disk-stage-l2-permanent-mib). 0 = off. A start-time planner splits it
+    // across the model's expert-bundle types and assigns layers to slab, dense
+    // or permanent pools so every layer keeps an L2
     llama_disk_stage(const llama_model & model, ggml_backend_dev_t dev,
                      int32_t n_pin_experts, uint64_t cache_budget_bytes,
                      int32_t pool_layers_max, const char * base_experts_path,
                      const char * warm_experts_path, const char * base_template_path,
                      int32_t sparse_max, float drop_fraction, float drop_below_rel,
                      float drop_max_mass, float drop_max_mass_token, float substitute_rel, int32_t substitute_pool,
-                     bool drop_probe,
+                     bool drop_probe, uint64_t permanent_bytes,
                      const std::vector<std::pair<void *, size_t>> & extra_l2_regions);
     ~llama_disk_stage();
 

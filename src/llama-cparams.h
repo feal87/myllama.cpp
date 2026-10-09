@@ -130,6 +130,9 @@ struct llama_cparams {
     // disk stage: measure and report the routed score distribution without
     // dropping anything (--disk-stage-drop-probe)
     bool    disk_stage_drop_probe;
+    // disk stage: dedicated mlocked L2 pool that survives prefill
+    // (--disk-stage-l2-permanent-mib, 0 = off)
+    uint64_t disk_stage_l2_permanent_bytes;
 
     llama_context * ctx_other;
 };
