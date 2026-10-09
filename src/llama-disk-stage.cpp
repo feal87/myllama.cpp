@@ -1325,18 +1325,6 @@ struct llama_disk_stage::impl {
         evict_trim(ep);
     }
 
-    // reserve a FREE L2 slot only: the prefetch must never evict an entry the
-    // decode may still execute. -1 when the pool has none to spare
-    int32_t evict_reserve_free(int pool) {
-        evict_pool & ep = evict_pools[(size_t) pool];
-        if (ep.free_slots.empty()) {
-            return -1;
-        }
-        const int32_t slot = ep.free_slots.back();
-        ep.free_slots.pop_back();
-        return slot;
-    }
-
     // publish a prefetched slot; a key that landed in the meantime (the demand
     // fill read it first) wins and the extra slot goes back to the free list
     void evict_finalize_new(int pool, int64_t key, int32_t slot) {
@@ -4942,9 +4930,8 @@ void llama_disk_stage::prefetch(const std::vector<std::vector<int32_t>> & per_la
         return;
     }
     if (!p.pref_io.joinable()) {
-        // the dedicated reader: it reserves only FREE L2 slots, yields the
-        // decode completion port to the demand fill, and stores each expert
-        // into the pool so the layer's fill is a hit
+        // the dedicated reader: it reads each predicted expert into an L2 slot
+        // (free, else the probation LRU) so the layer's fill is a hit
         p.pref_io = std::thread([&p]() {
             for (;;) {
                 std::vector<std::pair<int, int32_t>> chunk;
@@ -4984,7 +4971,10 @@ void llama_disk_stage::prefetch(const std::vector<std::vector<int32_t>> & per_la
                             p.n_pref_skip++;
                             continue;
                         }
-                        const int32_t eslot = p.evict_reserve_free(epid);
+                        // like the demand fill, take a free slot or evict the
+                        // probation LRU: a reserved slot is unpublished, so the
+                        // LRU can never be one a layer is executing right now
+                        const int32_t eslot = p.evict_reserve(epid);
                         if (eslot < 0) {
                             p.n_pref_noslot++;
                             continue;

@@ -182,9 +182,10 @@ public:
 
     // --expert-ngram-profile: predicted experts per layer of the decode step
     // about to run. The stage reads the non-resident ones into the L2 pool in
-    // layer order from a dedicated worker, so each layer's fill finds them.
-    // max_reads caps the experts queued this step (0 = no cap). Replaces any
-    // list still being processed. Safe to call from the decode thread
+    // layer order from a dedicated worker, so each layer's fill finds them. It
+    // takes a free L2 slot or evicts the probation LRU, exactly like the demand
+    // fill. max_reads caps the experts queued this step (0 = no cap). Replaces
+    // any list still being processed. Safe to call from the decode thread
     void prefetch(const std::vector<std::vector<int32_t>> & per_layer, int32_t max_reads);
 
     // drop the pending prefetch list and wait out the worker, so the staging
