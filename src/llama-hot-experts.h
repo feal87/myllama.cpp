@@ -543,6 +543,11 @@ class llama_hot_expert_cache {
     // layer, its routed expert ids. Called from observe_decode_finish (mu held)
     void write_ngram_step();
 
+    // drop the predictions the step just finished scoring. Called at the end of
+    // the step (from observe_decode_finish, mu held); the prediction itself is
+    // made by note_output_token at the start of the step it keys on
+    void ngram_advance_prediction();
+
     const llama_model & model;
 
     const int32_t  n_pin;            // N experts per layer
@@ -578,7 +583,14 @@ class llama_hot_expert_cache {
     // run, per layer, plus how many of them the step actually routed. All of it
     // is touched on the decode thread only, under mu
     std::unique_ptr<llama_expert_predict> ngram_predict;
-    std::vector<std::vector<int32_t>>     ngram_predicted;
+    // predictions awaiting scoring: (target decode step, per-layer ids). Made in
+    // note_output_token at the start of the step (keyed on that step's input,
+    // i.e. the token the previous step sampled) and scored in
+    // observe_decode_finish at the end of the step they target, so a lead of 1
+    // keeps one entry queued
+    std::deque<std::pair<int64_t, std::vector<std::vector<int32_t>>>> ngram_pending;
+    int32_t                               ngram_lead = 0; // taken from the profile
+    int64_t                               ngram_step = 0; // decode steps seen (predict axis)
     std::vector<uint64_t>                 ngram_pred_layer; // predicted (layer, expert) pairs
     std::vector<uint64_t>                 ngram_hit_layer;  // ... that the step routed
     int32_t                               ngram_prefetch_max = 0;

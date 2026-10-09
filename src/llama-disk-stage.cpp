@@ -1105,10 +1105,21 @@ struct llama_disk_stage::impl {
     uint64_t                n_pref_waste_bytes = 0;
     uint64_t                n_pref_late    = 0; // reads that finished after their layer was filled
     uint64_t                n_pref_late_bytes = 0;
+    uint64_t                n_pref_late_good = 0; // ... and the layer did route the expert
+    uint64_t                n_pref_late_good_bytes = 0;
+    uint64_t                n_pref_late_bad  = 0; // ... and the layer never routed the expert
+    uint64_t                n_pref_late_bad_bytes = 0;
     uint64_t                n_pref_passed  = 0; // predicted experts skipped, layer already filled
+    uint64_t                n_pref_steps   = 0; // steps with a prediction (reads-per-token budget)
+    int32_t                 pref_budget    = 0; // the per-step cap the caller passed (0 = no cap)
     // layer the demand fill is on right now, reset at every step; a read-ahead
     // that reaches a layer after this is too late to matter
     int32_t                 dec_cur_fill_il = -1;
+    // decode fill sweeps completed. The late check is armed once dec_fill_gen
+    // reaches the generation recorded at prefetch time, so a read-ahead queued
+    // `lead` steps ahead is not judged late during the issuing step's fill
+    uint64_t                dec_fill_gen = 0;
+    uint64_t                pref_arm_gen = 0;
     // previous report's read-ahead counters, for the interval figures
     uint64_t                prev_n_pref_reads  = 0;
     uint64_t                prev_n_pref_bytes  = 0;
@@ -1121,11 +1132,20 @@ struct llama_disk_stage::impl {
     uint64_t                prev_n_pref_waste_bytes = 0;
     uint64_t                prev_n_pref_late    = 0;
     uint64_t                prev_n_pref_late_bytes = 0;
+    uint64_t                prev_n_pref_late_good = 0;
+    uint64_t                prev_n_pref_late_good_bytes = 0;
+    uint64_t                prev_n_pref_late_bad  = 0;
+    uint64_t                prev_n_pref_late_bad_bytes = 0;
     uint64_t                prev_n_pref_passed  = 0;
+    uint64_t                prev_n_pref_steps   = 0;
     // keys the demand fill reserved a slot for but has not published yet. The
     // read-ahead checks it so the two readers never insert the same key, which
     // would corrupt the SLRU lists
     std::unordered_set<int64_t> dec_reserved;
+    // (layer, expert) keys the demand has routed so far this step, filled in
+    // layer order. A late read-ahead is "good" when its key is here (the
+    // prediction was right, the read just arrived too late) and "bad" otherwise
+    std::unordered_set<int64_t> dec_routed;
 
     // split-hot trace: absolute marks of one layer, reported as deltas between
     // the two calls so the read/hot intersection is visible
@@ -1934,7 +1954,12 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     const uint64_t d_pref_waste_bytes = p.n_pref_waste_bytes - p.prev_n_pref_waste_bytes;
     const uint64_t d_pref_late        = p.n_pref_late        - p.prev_n_pref_late;
     const uint64_t d_pref_late_bytes  = p.n_pref_late_bytes  - p.prev_n_pref_late_bytes;
+    const uint64_t d_pref_late_good       = p.n_pref_late_good       - p.prev_n_pref_late_good;
+    const uint64_t d_pref_late_good_bytes = p.n_pref_late_good_bytes - p.prev_n_pref_late_good_bytes;
+    const uint64_t d_pref_late_bad        = p.n_pref_late_bad        - p.prev_n_pref_late_bad;
+    const uint64_t d_pref_late_bad_bytes  = p.n_pref_late_bad_bytes  - p.prev_n_pref_late_bad_bytes;
     const uint64_t d_pref_passed      = p.n_pref_passed      - p.prev_n_pref_passed;
+    const uint64_t d_pref_steps       = p.n_pref_steps       - p.prev_n_pref_steps;
 
     // one themed line each. The report is split in four blocks (L2, substitution,
     // dropping, disk) and each block is emitted in one write
@@ -2082,14 +2107,18 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
              d_evict, d_demote, n_entries, n_capacity,
              p.l2_warm ? "" : " | not warm yet");
         if (d_pref_offered > 0 || d_pref_reads > 0 || d_pref_passed > 0) {
-            line("  prefetch  : %" PRIu64 " predicted | %" PRIu64 " read (%s) | %" PRIu64 " useful (%s, %.1f%% of reads) | %" PRIu64 " wasted (%s) | %" PRIu64 " late (%s)",
+            line("  prefetch  : %" PRIu64 " predicted | %" PRIu64 " read (%s) | %" PRIu64 " useful (%s, %.1f%% of reads) | %" PRIu64 " wasted (%s)",
                  d_pref_offered, d_pref_reads, report_volume(d_pref_bytes).c_str(),
                  d_pref_hit, report_volume(d_pref_hit_bytes).c_str(),
                  d_pref_reads ? 100.0 * (double) d_pref_hit / (double) d_pref_reads : 0.0,
-                 d_pref_waste, report_volume(d_pref_waste_bytes).c_str(),
-                 d_pref_late, report_volume(d_pref_late_bytes).c_str());
-            line("  prefetch  : %" PRIu64 " already resident | %" PRIu64 " layer passed | %" PRIu64 " no free slot",
-                 d_pref_skip, d_pref_passed, d_pref_noslot);
+                 d_pref_waste, report_volume(d_pref_waste_bytes).c_str());
+            line("  prefetch  : late %" PRIu64 " (%s): %" PRIu64 " good / %" PRIu64 " bad | %" PRIu64 " already resident | %" PRIu64 " layer passed | %" PRIu64 " no slot",
+                 d_pref_late, report_volume(d_pref_late_bytes).c_str(),
+                 d_pref_late_good, d_pref_late_bad, d_pref_skip, d_pref_passed, d_pref_noslot);
+            line("  prefetch  : %.1f offered/step | %.1f read/step | budget %d/step",
+                 d_pref_steps ? (double) d_pref_offered / (double) d_pref_steps : 0.0,
+                 d_pref_steps ? (double) d_pref_reads   / (double) d_pref_steps : 0.0,
+                 p.pref_budget);
         }
     }
     const std::string sec_l = out.substr(s_l);
@@ -2194,7 +2223,12 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     p.prev_n_pref_waste_bytes = p.n_pref_waste_bytes;
     p.prev_n_pref_late       = p.n_pref_late;
     p.prev_n_pref_late_bytes = p.n_pref_late_bytes;
+    p.prev_n_pref_late_good       = p.n_pref_late_good;
+    p.prev_n_pref_late_good_bytes = p.n_pref_late_good_bytes;
+    p.prev_n_pref_late_bad        = p.n_pref_late_bad;
+    p.prev_n_pref_late_bad_bytes  = p.n_pref_late_bad_bytes;
     p.prev_n_pref_passed     = p.n_pref_passed;
+    p.prev_n_pref_steps      = p.n_pref_steps;
     p.n_reports++;
 }
 
@@ -4315,7 +4349,20 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
     {
         std::lock_guard<std::mutex> lock(p.cache_mu);
         // the read-ahead checks this to drop a prediction the graph already passed
+        if (il <= p.dec_cur_fill_il) {
+            // the layer index wrapped: a new decode step, so the routed set starts over
+            p.dec_fill_gen++;
+            p.dec_routed.clear();
+        }
         p.dec_cur_fill_il = il;
+        if (p.iocp_pref != nullptr) {
+            for (int64_t i = 0; i < n_ids; ++i) {
+                const int32_t id = ids[i];
+                if (id >= 0) {
+                    p.dec_routed.insert(((int64_t) il << 32) | (uint32_t) id);
+                }
+            }
+        }
 
         // cache-aware opportunistic dropping: mark the cold, weak experts to
         // skip. The fraction cap and the relative floor need all scores at once,
@@ -4974,7 +5021,7 @@ void llama_disk_stage::prefetch_drain() {
 #endif
 }
 
-void llama_disk_stage::prefetch(const std::vector<std::vector<int32_t>> & per_layer, int32_t max_reads) {
+void llama_disk_stage::prefetch(const std::vector<std::vector<int32_t>> & per_layer, int32_t max_reads, int32_t lead) {
 #if defined(_WIN32)
     impl & p = *pimpl;
     if (!p.active || p.iocp_pref == nullptr || p.cache.empty() || p.evict_pools.empty()) {
@@ -4982,8 +5029,13 @@ void llama_disk_stage::prefetch(const std::vector<std::vector<int32_t>> & per_la
     }
 
     // a new step: nothing has been filled yet, so a read that reaches a layer
-    // after the demand has moved past it is late
+    // after the demand has moved past it is late. The list targets the step
+    // `lead` sweeps ahead, so arm the late check only when that sweep begins
     p.dec_cur_fill_il = -1;
+    p.dec_routed.clear();
+    p.pref_arm_gen = p.dec_fill_gen + (uint64_t) (lead > 0 ? lead : 0);
+    p.pref_budget = max_reads;
+    p.n_pref_steps++;
 
     // the step's read list, built in layer order: the layer the graph reaches
     // first is queued first, so its read starts first
@@ -5122,11 +5174,22 @@ void llama_disk_stage::prefetch(const std::vector<std::vector<int32_t>> & per_la
                     for (const pending & m : pend) {
                         // the read is only useful if the demand has not already
                         // reserved the key and the graph has not passed the layer
-                        const bool late = p.dec_reserved.count(m.key) != 0 ||
-                                          m.il <= p.dec_cur_fill_il;
+                        // in the target step's sweep (dec_fill_gen)
+                        const bool passed = p.dec_fill_gen >= p.pref_arm_gen &&
+                                            m.il <= p.dec_cur_fill_il;
+                        const bool late = p.dec_reserved.count(m.key) != 0 || passed;
                         if (late) {
+                            const bool routed = p.dec_reserved.count(m.key) != 0 ||
+                                                p.dec_routed.count(m.key) != 0;
                             p.n_pref_late++;
                             p.n_pref_late_bytes += m.bytes;
+                            if (routed) {
+                                p.n_pref_late_good++;
+                                p.n_pref_late_good_bytes += m.bytes;
+                            } else {
+                                p.n_pref_late_bad++;
+                                p.n_pref_late_bad_bytes += m.bytes;
+                            }
                             p.evict_pools[(size_t) m.epid].free_slots.push_back(m.slot);
                         } else {
                             p.evict_finalize_new(m.epid, m.key, m.slot);

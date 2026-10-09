@@ -186,7 +186,10 @@ public:
     // takes a free L2 slot or evicts the probation LRU, exactly like the demand
     // fill. max_reads caps the experts queued this step (0 = no cap). Replaces
     // any list still being processed. Safe to call from the decode thread
-    void prefetch(const std::vector<std::vector<int32_t>> & per_layer, int32_t max_reads);
+    // queue the predicted experts of a future decode step. `lead` is how many
+    // decode steps ahead the list targets (0 = the step about to run); the
+    // late check only arms once the target step's fill sweep begins
+    void prefetch(const std::vector<std::vector<int32_t>> & per_layer, int32_t max_reads, int32_t lead);
 
     // drop the pending prefetch list and wait out the worker, so the staging
     // slabs can be reused by a prefill or reclaimed by the dense demotion

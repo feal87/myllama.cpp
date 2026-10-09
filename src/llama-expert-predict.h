@@ -41,6 +41,9 @@ class llama_expert_predict {
     int32_t max_order() const;
     int32_t top_m() const;
 
+    // decode steps ahead the table was trained for (0 for a v1 table)
+    int32_t lead() const;
+
     // decode steps fed and steps where a stored order matched
     uint64_t n_steps() const;
     uint64_t n_matched() const;

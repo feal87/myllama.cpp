@@ -10,9 +10,12 @@
 namespace {
 
 constexpr char     profile_magic[8] = { 'L', 'E', 'N', 'G', 'P', 'R', 'O', 'F' };
-constexpr uint32_t profile_version  = 1;
-constexpr size_t   header_size      = 68; // 8 magic + 9 u32 + 3 u64
-constexpr uint16_t empty_id         = 0xFFFF;
+constexpr uint32_t profile_version_v1 = 1;
+constexpr uint32_t profile_version_v2 = 2;
+constexpr size_t   header_size_v1     = 68; // 8 magic + 9 u32 + 3 u64
+constexpr size_t   header_size_v2     = 72; // 8 magic + 10 u32 + 3 u64 (adds lead)
+constexpr size_t   lead_offset        = 44;
+constexpr uint16_t empty_id           = 0xFFFF;
 
 constexpr uint64_t fnv_offset = 0xCBF29CE484222325ULL;
 constexpr uint64_t fnv_prime  = 0x100000001B3ULL;
@@ -67,6 +70,7 @@ struct llama_expert_predict_impl {
     int32_t  max_order = 0;
     int32_t  top_m     = 0;
     int32_t  n_enabled = 0;
+    int32_t  lead      = 0;
     uint32_t table_size = 0;
     uint64_t n_entries  = 0;
 
@@ -92,11 +96,18 @@ llama_expert_predict::llama_expert_predict(const std::string & path, int32_t n_l
 
     const uint8_t * base = (const uint8_t *) p.map->addr();
     const size_t    size = p.map->size();
-    if (size < header_size || std::memcmp(base, profile_magic, sizeof(profile_magic)) != 0) {
+    if (size < header_size_v1 || std::memcmp(base, profile_magic, sizeof(profile_magic)) != 0) {
         throw std::runtime_error("expert predict: '" + path + "' is not a LENGPROF table");
     }
     const uint32_t version = rd_u32(base + 8);
-    if (version != profile_version) {
+    size_t header_size;
+    if (version == profile_version_v1) {
+        header_size = header_size_v1;
+        p.lead      = 0;
+    } else if (version == profile_version_v2) {
+        header_size = header_size_v2;
+        p.lead      = (int32_t) rd_u32(base + lead_offset);
+    } else {
         throw std::runtime_error("expert predict: '" + path + "' has unsupported version " +
                                  std::to_string(version));
     }
@@ -108,7 +119,7 @@ llama_expert_predict::llama_expert_predict(const std::string & path, int32_t n_l
     p.table_size = rd_u32(base + 32);
     p.n_enabled  = (int32_t) rd_u32(base + 36);
     const uint32_t mask_bytes = rd_u32(base + 40);
-    p.n_entries  = rd_u64(base + 60);
+    p.n_entries  = rd_u64(base + header_size - 8);
 
     if (p.n_layer != n_layer || p.n_expert != n_expert) {
         throw std::runtime_error("expert predict: '" + path + "' is for " +
@@ -116,7 +127,7 @@ llama_expert_predict::llama_expert_predict(const std::string & path, int32_t n_l
                                  " experts, the model has " + std::to_string(n_layer) + " / " +
                                  std::to_string(n_expert));
     }
-    if (p.max_order < 1 || p.top_m < 1 || p.n_enabled < 0 || p.table_size == 0 ||
+    if (p.max_order < 1 || p.top_m < 1 || p.n_enabled < 0 || p.lead < 0 || p.table_size == 0 ||
             (p.table_size & (p.table_size - 1)) != 0) {
         throw std::runtime_error("expert predict: '" + path + "' has invalid header fields");
     }
@@ -204,5 +215,6 @@ int32_t llama_expert_predict::n_layer() const   { return pimpl->n_layer; }
 int32_t llama_expert_predict::n_enabled() const { return pimpl->n_enabled; }
 int32_t llama_expert_predict::max_order() const { return pimpl->max_order; }
 int32_t llama_expert_predict::top_m() const     { return pimpl->top_m; }
+int32_t llama_expert_predict::lead() const      { return pimpl->lead; }
 uint64_t llama_expert_predict::n_steps() const  { return pimpl->n_steps; }
 uint64_t llama_expert_predict::n_matched() const { return pimpl->n_matched; }
