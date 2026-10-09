@@ -157,6 +157,8 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
             ngram_predicted.resize(n_layer);
             ngram_pred_layer.assign(n_layer, 0);
             ngram_hit_layer.assign(n_layer, 0);
+            prev_ngram_pred_layer.assign(n_layer, 0);
+            prev_ngram_hit_layer.assign(n_layer, 0);
             LLAMA_LOG_INFO("%s: expert prediction profile %s: max order %d, top %d, %d/%d layers, "
                            "prefetching up to %d expert(s) per step\n",
                            __func__, ngram_profile_path, ngram_predict->max_order(),
@@ -325,11 +327,13 @@ void llama_hot_expert_cache::print_stats(bool final_report, uint64_t ram_hit, ui
     uint32_t n_reports           = 0;
     bool     prefetch_active     = false;
     uint64_t predict_steps       = 0;
-    uint64_t predict_matched     = 0;
     uint64_t predict_total       = 0;
     uint64_t predict_hits        = 0;
-    std::vector<uint64_t> predict_layer;
-    std::vector<uint64_t> predict_hit;
+    uint64_t predict_matched_d   = 0;
+    uint64_t predict_total_d     = 0;
+    uint64_t predict_hits_d      = 0;
+    std::vector<uint64_t> predict_layer_d;
+    std::vector<uint64_t> predict_hit_d;
 
     // one slot per layer, filled under mu and read after
     std::vector<size_t> per_layer(layers.size(), 0);
@@ -383,11 +387,22 @@ void llama_hot_expert_cache::print_stats(bool final_report, uint64_t ram_hit, ui
         // cache bypasses: it is skipped entirely there, so it is not reported
         prefetch_active     = prefetch_enabled && disk_stage == nullptr;
         predict_steps       = ngram_predict ? ngram_predict->n_steps() : 0;
-        predict_matched     = n_ngram_matched;
         predict_total       = n_ngram_pred_routes;
         predict_hits        = n_ngram_pred_hits;
-        predict_layer       = ngram_pred_layer;
-        predict_hit         = ngram_hit_layer;
+        predict_matched_d   = n_ngram_matched     - prev_ngram_matched;
+        predict_total_d     = n_ngram_pred_routes - prev_ngram_pred_routes;
+        predict_hits_d      = n_ngram_pred_hits   - prev_ngram_pred_hits;
+        prev_ngram_matched     = n_ngram_matched;
+        prev_ngram_pred_routes = n_ngram_pred_routes;
+        prev_ngram_pred_hits   = n_ngram_pred_hits;
+        predict_layer_d.resize(ngram_pred_layer.size());
+        predict_hit_d.resize(ngram_hit_layer.size());
+        for (size_t i = 0; i < ngram_pred_layer.size(); ++i) {
+            predict_layer_d[i] = ngram_pred_layer[i] - prev_ngram_pred_layer[i];
+            predict_hit_d[i]   = ngram_hit_layer[i]  - prev_ngram_hit_layer[i];
+        }
+        prev_ngram_pred_layer = ngram_pred_layer;
+        prev_ngram_hit_layer  = ngram_hit_layer;
 
         // RAM occupancy: pinned holds every resident, base included. Base entries
         // are permanent (never churn), so churn and the count range cover the
@@ -544,19 +559,20 @@ void llama_hot_expert_cache::print_stats(bool final_report, uint64_t ram_hit, ui
     }
 
     if (predict_total > 0) {
-        line("  predict  : %" PRIu64 "/%" PRIu64 " steps matched | %" PRIu64 " predicted, "
-             "%" PRIu64 " routed (%.1f%% precision)",
-             predict_matched, predict_steps, predict_total, predict_hits,
-             predict_total ? 100.0 * (double) predict_hits / (double) predict_total : 0.0);
+        line("  predict  : %" PRIu64 " of %" PRIu64 " steps matched | %" PRIu64 " predicted, "
+             "%" PRIu64 " routed (%.1f%% interval, %.1f%% total)",
+             predict_matched_d, predict_steps, predict_total_d, predict_hits_d,
+             predict_total_d ? 100.0 * (double) predict_hits_d / (double) predict_total_d : 0.0,
+             predict_total   ? 100.0 * (double) predict_hits   / (double) predict_total   : 0.0);
         std::string row = "  predict/L:";
         bool wrapped = false;
-        for (size_t il = 0; il < predict_layer.size(); ++il) {
-            if (predict_layer[il] == 0) {
+        for (size_t il = 0; il < predict_layer_d.size(); ++il) {
+            if (predict_layer_d[il] == 0) {
                 continue;
             }
             char cell[48];
             snprintf(cell, sizeof(cell), " L%zu=%" PRIu64 "/%" PRIu64,
-                     il, predict_hit[il], predict_layer[il]);
+                     il, predict_hit_d[il], predict_layer_d[il]);
             row += cell;
             if (row.size() > 110 && !wrapped) {
                 out += row;
@@ -2058,6 +2074,10 @@ static void write_json_string(std::FILE * f, const std::string & s) {
         }
     }
     std::fputc('"', f);
+}
+
+bool llama_hot_expert_cache::has_ngram_predict() const {
+    return ngram_predict != nullptr;
 }
 
 void llama_hot_expert_cache::note_output_token(int32_t token) {
