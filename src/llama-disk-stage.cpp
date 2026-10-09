@@ -720,6 +720,7 @@ struct llama_disk_stage::impl {
         std::vector<std::list<int64_t>::iterator> iter_of;   // slot -> position
         std::vector<int64_t>                      slot_key;  // slot -> key, -1 when empty
         std::vector<uint8_t>                      seg;       // slot -> 0 probation, 1 protected
+        std::vector<uint8_t>                      pref;      // slot -> 1 when the read-ahead filled it and the demand has not used it yet
         std::vector<int32_t>                      free_slots;
         uint64_t hits      = 0; // counted only once the RAM tier is warm
         uint64_t misses    = 0;
@@ -1097,11 +1098,30 @@ struct llama_disk_stage::impl {
     uint64_t                n_pref_bytes = 0;
     uint64_t                n_pref_skip  = 0; // already resident / in L2 / VRAM
     uint64_t                n_pref_noslot = 0;
+    uint64_t                n_pref_offered = 0; // predicted experts considered this run
+    uint64_t                n_pref_hit     = 0; // read-ahead entries the demand later used
+    uint64_t                n_pref_hit_bytes = 0;
+    uint64_t                n_pref_waste   = 0; // read-ahead entries evicted before any use
+    uint64_t                n_pref_waste_bytes = 0;
+    uint64_t                n_pref_late    = 0; // reads that finished after their layer was filled
+    uint64_t                n_pref_late_bytes = 0;
+    uint64_t                n_pref_passed  = 0; // predicted experts skipped, layer already filled
+    // layer the demand fill is on right now, reset at every step; a read-ahead
+    // that reaches a layer after this is too late to matter
+    int32_t                 dec_cur_fill_il = -1;
     // previous report's read-ahead counters, for the interval figures
     uint64_t                prev_n_pref_reads  = 0;
     uint64_t                prev_n_pref_bytes  = 0;
     uint64_t                prev_n_pref_skip   = 0;
     uint64_t                prev_n_pref_noslot = 0;
+    uint64_t                prev_n_pref_offered = 0;
+    uint64_t                prev_n_pref_hit     = 0;
+    uint64_t                prev_n_pref_hit_bytes = 0;
+    uint64_t                prev_n_pref_waste   = 0;
+    uint64_t                prev_n_pref_waste_bytes = 0;
+    uint64_t                prev_n_pref_late    = 0;
+    uint64_t                prev_n_pref_late_bytes = 0;
+    uint64_t                prev_n_pref_passed  = 0;
     // keys the demand fill reserved a slot for but has not published yet. The
     // read-ahead checks it so the two readers never insert the same key, which
     // would corrupt the SLRU lists
@@ -1231,6 +1251,11 @@ struct llama_disk_stage::impl {
         }
     }
 
+    // bytes one expert of this pool occupies across its roles
+    static uint64_t evict_slot_bytes(const evict_pool & ep) {
+        return (uint64_t) ep.stride[0] + (uint64_t) ep.stride[1] + (uint64_t) ep.stride[2];
+    }
+
     static void evict_push_unlocked(evict_pool & ep, int64_t key, int32_t slot, uint8_t seg) {
         std::list<int64_t> & l = seg != 0 ? ep.prot : ep.prob;
         l.push_front(key);
@@ -1284,6 +1309,12 @@ struct llama_disk_stage::impl {
         l.pop_back();
         ep.slot_of.erase(key);
         ep.slot_key[(size_t) slot] = -1;
+        if (ep.pref[(size_t) slot] != 0) {
+            // the read-ahead read this expert and eviction arrived before any use
+            n_pref_waste++;
+            n_pref_waste_bytes += evict_slot_bytes(ep);
+            ep.pref[(size_t) slot] = 0;
+        }
         n_l2_evictions++;
         ep.evictions++;
         return slot;
@@ -1303,6 +1334,12 @@ struct llama_disk_stage::impl {
             return -1;
         }
         const int32_t slot = it->second;
+        if (ep.pref[(size_t) slot] != 0) {
+            // the read-ahead fetched this expert and the demand just used it
+            n_pref_hit++;
+            n_pref_hit_bytes += evict_slot_bytes(ep);
+            ep.pref[(size_t) slot] = 0;
+        }
         if (ep.seg[(size_t) slot] == 0) {
             ep.prob.erase(ep.iter_of[(size_t) slot]);
             ep.seg[(size_t) slot] = 1;
@@ -1339,6 +1376,7 @@ struct llama_disk_stage::impl {
             return;
         }
         evict_push(ep, key, slot, 0);
+        ep.pref[(size_t) slot] = 1;
         evict_trim(ep);
     }
 
@@ -1357,6 +1395,7 @@ struct llama_disk_stage::impl {
         }
         ep.slot_of.erase(it);
         ep.slot_key[(size_t) slot] = -1;
+        ep.pref[(size_t) slot] = 0;
         ep.free_slots.push_back(slot);
     }
 
@@ -1369,6 +1408,7 @@ struct llama_disk_stage::impl {
             ep.free_slots[(size_t) s] = s;
         }
         std::fill(ep.slot_key.begin(), ep.slot_key.end(), (int64_t) -1);
+        std::fill(ep.pref.begin(), ep.pref.end(), (uint8_t) 0);
     }
 
     // Reset a layer's id table to its pool's sentinel (every routed expert then
@@ -1382,7 +1422,6 @@ struct llama_disk_stage::impl {
         for (int64_t e = 0; e < (int64_t) L.table->ne[0] * L.table->ne[1]; ++e) {
             t[e] = sentinel;
         }
-        dec_reserved.clear();
     }
 
     // Clear and reset only the transient pools. The permanent pools are backed by
@@ -1403,6 +1442,7 @@ struct llama_disk_stage::impl {
             }
         }
         evict_populated = false;
+        dec_reserved.clear();
     }
 
     // evict_clear_transient plus a reset of every transient layer's table. Used
@@ -1887,6 +1927,14 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     const uint64_t d_pref_bytes  = p.n_pref_bytes  - p.prev_n_pref_bytes;
     const uint64_t d_pref_skip   = p.n_pref_skip   - p.prev_n_pref_skip;
     const uint64_t d_pref_noslot = p.n_pref_noslot - p.prev_n_pref_noslot;
+    const uint64_t d_pref_offered     = p.n_pref_offered     - p.prev_n_pref_offered;
+    const uint64_t d_pref_hit         = p.n_pref_hit         - p.prev_n_pref_hit;
+    const uint64_t d_pref_hit_bytes   = p.n_pref_hit_bytes   - p.prev_n_pref_hit_bytes;
+    const uint64_t d_pref_waste       = p.n_pref_waste       - p.prev_n_pref_waste;
+    const uint64_t d_pref_waste_bytes = p.n_pref_waste_bytes - p.prev_n_pref_waste_bytes;
+    const uint64_t d_pref_late        = p.n_pref_late        - p.prev_n_pref_late;
+    const uint64_t d_pref_late_bytes  = p.n_pref_late_bytes  - p.prev_n_pref_late_bytes;
+    const uint64_t d_pref_passed      = p.n_pref_passed      - p.prev_n_pref_passed;
 
     // one themed line each. The report is split in four blocks (L2, substitution,
     // dropping, disk) and each block is emitted in one write
@@ -2033,9 +2081,15 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
         line("  l2 policy : %" PRIu64 " evictions, %" PRIu64 " demotions | %zu/%zu entries live%s",
              d_evict, d_demote, n_entries, n_capacity,
              p.l2_warm ? "" : " | not warm yet");
-        if (d_pref_reads > 0 || d_pref_noslot > 0) {
-            line("  prefetch  : %" PRIu64 " experts read ahead this interval (%s) | %" PRIu64 " resident, %" PRIu64 " no free slot",
-                 d_pref_reads, report_volume(d_pref_bytes).c_str(), d_pref_skip, d_pref_noslot);
+        if (d_pref_offered > 0 || d_pref_reads > 0 || d_pref_passed > 0) {
+            line("  prefetch  : %" PRIu64 " predicted | %" PRIu64 " read (%s) | %" PRIu64 " useful (%s, %.1f%% of reads) | %" PRIu64 " wasted (%s) | %" PRIu64 " late (%s)",
+                 d_pref_offered, d_pref_reads, report_volume(d_pref_bytes).c_str(),
+                 d_pref_hit, report_volume(d_pref_hit_bytes).c_str(),
+                 d_pref_reads ? 100.0 * (double) d_pref_hit / (double) d_pref_reads : 0.0,
+                 d_pref_waste, report_volume(d_pref_waste_bytes).c_str(),
+                 d_pref_late, report_volume(d_pref_late_bytes).c_str());
+            line("  prefetch  : %" PRIu64 " already resident | %" PRIu64 " layer passed | %" PRIu64 " no free slot",
+                 d_pref_skip, d_pref_passed, d_pref_noslot);
         }
     }
     const std::string sec_l = out.substr(s_l);
@@ -2133,6 +2187,14 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     p.prev_n_pref_bytes      = p.n_pref_bytes;
     p.prev_n_pref_skip       = p.n_pref_skip;
     p.prev_n_pref_noslot     = p.n_pref_noslot;
+    p.prev_n_pref_offered    = p.n_pref_offered;
+    p.prev_n_pref_hit        = p.n_pref_hit;
+    p.prev_n_pref_hit_bytes  = p.n_pref_hit_bytes;
+    p.prev_n_pref_waste      = p.n_pref_waste;
+    p.prev_n_pref_waste_bytes = p.n_pref_waste_bytes;
+    p.prev_n_pref_late       = p.n_pref_late;
+    p.prev_n_pref_late_bytes = p.n_pref_late_bytes;
+    p.prev_n_pref_passed     = p.n_pref_passed;
     p.n_reports++;
 }
 
@@ -3333,6 +3395,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                 ep.slot_key.assign((size_t) ep.cap, -1);
                                 ep.iter_of.resize((size_t) ep.cap);
                                 ep.seg.assign((size_t) ep.cap, 0);
+                                ep.pref.assign((size_t) ep.cap, 0);
                                 ep.free_slots.resize((size_t) ep.sentinel); // the sentinel is never free
                                 for (int32_t s = 0; s < ep.sentinel; ++s) {
                                     ep.free_slots[(size_t) s] = s;
@@ -4251,6 +4314,8 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
     // slot assignment under the lock; the unbuffered reads below run without it
     {
         std::lock_guard<std::mutex> lock(p.cache_mu);
+        // the read-ahead checks this to drop a prediction the graph already passed
+        p.dec_cur_fill_il = il;
 
         // cache-aware opportunistic dropping: mark the cold, weak experts to
         // skip. The fraction cap and the relative floor need all scores at once,
@@ -4916,6 +4981,10 @@ void llama_disk_stage::prefetch(const std::vector<std::vector<int32_t>> & per_la
         return;
     }
 
+    // a new step: nothing has been filled yet, so a read that reaches a layer
+    // after the demand has moved past it is late
+    p.dec_cur_fill_il = -1;
+
     // the step's read list, built in layer order: the layer the graph reaches
     // first is queued first, so its read starts first
     std::vector<std::pair<int, int32_t>> list;
@@ -4937,6 +5006,7 @@ void llama_disk_stage::prefetch(const std::vector<std::vector<int32_t>> & per_la
             break;
         }
     }
+    p.n_pref_offered += list.size();
 
     std::lock_guard<std::mutex> lk(p.pref_mu);
     if (p.pref_stop) {
@@ -4960,9 +5030,11 @@ void llama_disk_stage::prefetch(const std::vector<std::vector<int32_t>> & per_la
                 }
 
                 struct pending {
-                    int     epid;
-                    int32_t slot;
-                    int64_t key;
+                    int      il;
+                    int      epid;
+                    int32_t  slot;
+                    int64_t  key;
+                    uint64_t bytes;
                 };
                 std::vector<disk_stage_job> jobs;
                 std::vector<pending>        pend;
@@ -4978,6 +5050,12 @@ void llama_disk_stage::prefetch(const std::vector<std::vector<int32_t>> & per_la
                             continue;
                         }
                         const int64_t key = ((int64_t) il << 32) | (uint32_t) id;
+                        if (il <= p.dec_cur_fill_il) {
+                            // the graph already filled this layer: a read now
+                            // cannot help, so do not spend it
+                            p.n_pref_passed++;
+                            continue;
+                        }
                         if (c.vram[(size_t) id] || c.base[(size_t) id] ||
                                 c.resident_slot[(size_t) id] >= 0 || p.evict_has(epid, key) ||
                                 p.dec_reserved.count(key) != 0) {
@@ -4995,6 +5073,7 @@ void llama_disk_stage::prefetch(const std::vector<std::vector<int32_t>> & per_la
                         const impl::evict_pool &          ep      = p.evict_pools[(size_t) epid];
                         const std::vector<impl::region> & regions = p.layer_regions[(size_t) il];
                         const size_t jobs_before = jobs.size();
+                        uint64_t     bytes       = 0;
                         for (int r = 0; r < 3; ++r) {
                             const impl::region & sr = regions[(size_t) r];
                             if (sr.file == nullptr || sr.stride == 0) {
@@ -5004,7 +5083,7 @@ void llama_disk_stage::prefetch(const std::vector<std::vector<int32_t>> & per_la
                             const size_t len = align_up(sr.head + sr.stride, disk_stage_align);
                             const HANDLE h   = sr.file->h_pref != INVALID_HANDLE_VALUE ? sr.file->h_pref : sr.file->h;
                             jobs.push_back({ h, dst, sr.file_off + (size_t) id * sr.stride, len });
-                            p.n_pref_bytes += len;
+                            bytes += len;
                         }
                         if (jobs.size() == jobs_before) {
                             // no readable region for this layer: give the slot back
@@ -5013,7 +5092,8 @@ void llama_disk_stage::prefetch(const std::vector<std::vector<int32_t>> & per_la
                             continue;
                         }
                         p.n_pref_reads++;
-                        pend.push_back({ epid, eslot, key });
+                        p.n_pref_bytes += bytes;
+                        pend.push_back({ il, epid, eslot, key, bytes });
                     }
                 }
 
@@ -5040,9 +5120,13 @@ void llama_disk_stage::prefetch(const std::vector<std::vector<int32_t>> & per_la
                 {
                     std::lock_guard<std::mutex> cl(p.cache_mu);
                     for (const pending & m : pend) {
-                        if (p.dec_reserved.count(m.key) != 0) {
-                            // the demand fill reserved the same expert first: it
-                            // owns the key, so give the extra slot back
+                        // the read is only useful if the demand has not already
+                        // reserved the key and the graph has not passed the layer
+                        const bool late = p.dec_reserved.count(m.key) != 0 ||
+                                          m.il <= p.dec_cur_fill_il;
+                        if (late) {
+                            p.n_pref_late++;
+                            p.n_pref_late_bytes += m.bytes;
                             p.evict_pools[(size_t) m.epid].free_slots.push_back(m.slot);
                         } else {
                             p.evict_finalize_new(m.epid, m.key, m.slot);

@@ -242,17 +242,39 @@ into the L2 pool from a dedicated worker on its own completion port, so the
 read overlaps the graph instead of queueing behind a layer's demand read. The
 per-step read count is capped by `--expert-ngram-prefetch-max` (default 64).
 
-The hot-expert report gains a `predict` line per interval: steps matched,
-experts predicted, and the share the step actually routed (precision), plus the
-per-layer hit rate. That is the number to watch in the A/B:
+The reports gain two things per interval. The hot-expert `predict` line carries
+the prediction precision, overall and per enabled layer:
 
 ```
-experts stats:
-  predict  : 44/44 steps matched | 264 predicted, 121 routed (45.8% precision)
-  predict/L: L0=5/6 L1=5/6 L2=4/6 ...
+  predict  : 43 of 44 steps matched | 258 predicted, 118 routed (45.7% interval, 44.2% total)
+  predict/L: L0=6/6 L1=6/6 L2=5/6 L3=5/6 L4=4/6 L5=3/6 ...
 ```
 
-Tune the profile's `--layer-threshold` together with the runtime: with a fast
-NVMe a lower threshold (more layers, more reads) can win, on a slower drive a
-higher one. The exporter's `--sweep` prints the coverage/efficiency frontier to
-pick a starting point.
+The disk `prefetch` block carries the cost side, split by outcome:
+
+```
+  prefetch : 300 predicted | 144 read (1.79 GiB) | 66 useful (0.82 GiB, 45.8% of reads) | 60 wasted (0.75 GiB) | 18 late (0.22 GiB)
+  prefetch : 156 already resident | 0 layer passed | 0 no slot
+```
+
+- `useful`: a read the demand later served from the L2 slot, so it saved a disk
+  read.
+- `wasted`: a read evicted before any use.
+- `late`: a read that finished after the graph had already filled its layer (or
+  after the demand had reserved the same expert). The demand read its own copy.
+- `already resident`: a prediction that needed no read (resident, in L2 or VRAM).
+- `layer passed`: a prediction dropped because the graph had already passed the
+  layer, so the read was never issued.
+
+`predict_report.py` sums every interval in a log into global per-layer figures:
+
+```
+python scripts/expert-ngram/predict_report.py C:/models/logs/llama-server.log --top 8
+```
+
+Per-layer hit rate is the number that decides the allowlist; the prefetch block
+says how much of the read volume paid off. Tune the profile's
+`--layer-threshold` together with the runtime: with a fast NVMe a lower
+threshold (more layers, more reads) can win, on a slower drive a higher one. The
+exporter's `--sweep` prints the coverage/efficiency frontier to pick a starting
+point.
