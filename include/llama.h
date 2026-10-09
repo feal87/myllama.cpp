@@ -460,6 +460,15 @@ extern "C" {
         // experiments (nullptr = disabled). Appended across runs
         const char * expert_ngram_record_path;
 
+        // LENGPROF v1 table (scripts/expert-ngram/export_profile.py) the decode
+        // stage reads ahead from: each step predicts the experts of every enabled
+        // layer and prefetches the non-resident ones (nullptr = disabled).
+        // Requires the disk stage (--load-mode dio)
+        const char * expert_ngram_profile_path;
+
+        // cap on experts prefetched per decode step (0 = no cap)
+        int32_t expert_ngram_prefetch_max;
+
         // base set of experts read into the disk decode cache at load and never
         // evicted (nullptr = disabled). Requires the disk stage (--load-mode dio)
         const char * pin_experts_from_profile_path;

@@ -3,6 +3,7 @@
 #include "ggml-backend.h"
 #include "llama-impl.h"
 #include "llama-disk-stage.h"
+#include "llama-expert-predict.h"
 #include "llama-model.h"
 
 #include <algorithm>
@@ -66,7 +67,9 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
                                                bool                track_rank,
                                                bool                disk_mode,
                                                const char *        profile_path,
-                                               const char *        ngram_record_path) :
+                                               const char *        ngram_record_path,
+                                               const char *        ngram_profile_path,
+                                               int32_t             ngram_prefetch_max) :
     model(model),
     n_pin(n_pin_experts),
     budget_bytes(budget_bytes),
@@ -75,7 +78,8 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
     prompt_decay(prompt_decay),
     min_pin_count(min_pin_count),
     prefetch_enabled(prefetch_enabled),
-    track_rank(track_rank) {
+    track_rank(track_rank),
+    ngram_prefetch_max(ngram_prefetch_max) {
     // Count MoE layers by checking which layers have ffn_down_exps.weight
     int32_t n_moe_layers = 0;
     for (int32_t il = 0; il < (int32_t) model.hparams.n_layer(); il++) {
@@ -142,6 +146,25 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
                 std::fwrite(&NGRAM_REC_PROMPT_BEGIN, sizeof(NGRAM_REC_PROMPT_BEGIN), 1, ngram_file);
                 std::fflush(ngram_file);
             }
+        }
+    }
+
+    if (ngram_profile_path != nullptr && ngram_profile_path[0] != '\0') {
+        try {
+            ngram_predict = std::make_unique<llama_expert_predict>(ngram_profile_path,
+                    (int32_t) model.hparams.n_layer(), (int32_t) model.hparams.n_expert);
+            const size_t n_layer = (size_t) model.hparams.n_layer();
+            ngram_predicted.resize(n_layer);
+            ngram_pred_layer.assign(n_layer, 0);
+            ngram_hit_layer.assign(n_layer, 0);
+            LLAMA_LOG_INFO("%s: expert prediction profile %s: max order %d, top %d, %d/%d layers, "
+                           "prefetching up to %d expert(s) per step\n",
+                           __func__, ngram_profile_path, ngram_predict->max_order(),
+                           ngram_predict->top_m(), ngram_predict->n_enabled(),
+                           ngram_predict->n_layer(), ngram_prefetch_max);
+        } catch (const std::exception & e) {
+            LLAMA_LOG_WARN("%s: %s, expert prefetch disabled\n", __func__, e.what());
+            ngram_predict.reset();
         }
     }
 
@@ -217,7 +240,7 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
 }
 
 llama_hot_expert_cache::~llama_hot_expert_cache() {
-    if (n_pin > 0 || prefetch_enabled) {
+    if (n_pin > 0 || prefetch_enabled || ngram_predict != nullptr) {
         print_stats(/* final_report = */ true);
     }
     if (profile_file != nullptr) {
@@ -301,6 +324,12 @@ void llama_hot_expert_cache::print_stats(bool final_report, uint64_t ram_hit, ui
     size_t   n_moe_layers        = 0;
     uint32_t n_reports           = 0;
     bool     prefetch_active     = false;
+    uint64_t predict_steps       = 0;
+    uint64_t predict_matched     = 0;
+    uint64_t predict_total       = 0;
+    uint64_t predict_hits        = 0;
+    std::vector<uint64_t> predict_layer;
+    std::vector<uint64_t> predict_hit;
 
     // one slot per layer, filled under mu and read after
     std::vector<size_t> per_layer(layers.size(), 0);
@@ -353,6 +382,12 @@ void llama_hot_expert_cache::print_stats(bool final_report, uint64_t ram_hit, ui
         // the row prefetch needs the mmap'd model pages, which the disk decode
         // cache bypasses: it is skipped entirely there, so it is not reported
         prefetch_active     = prefetch_enabled && disk_stage == nullptr;
+        predict_steps       = ngram_predict ? ngram_predict->n_steps() : 0;
+        predict_matched     = n_ngram_matched;
+        predict_total       = n_ngram_pred_routes;
+        predict_hits        = n_ngram_pred_hits;
+        predict_layer       = ngram_pred_layer;
+        predict_hit         = ngram_hit_layer;
 
         // RAM occupancy: pinned holds every resident, base included. Base entries
         // are permanent (never churn), so churn and the count range cover the
@@ -506,6 +541,32 @@ void llama_hot_expert_cache::print_stats(bool final_report, uint64_t ram_hit, ui
     if (prefetch_active) {
         line("  prefetch : %" PRIu64 " calls | %.2f MiB read ahead | %" PRIu64 " failed",
              prefetch_calls, prefetch_bytes / mib, prefetch_failures);
+    }
+
+    if (predict_total > 0) {
+        line("  predict  : %" PRIu64 "/%" PRIu64 " steps matched | %" PRIu64 " predicted, "
+             "%" PRIu64 " routed (%.1f%% precision)",
+             predict_matched, predict_steps, predict_total, predict_hits,
+             predict_total ? 100.0 * (double) predict_hits / (double) predict_total : 0.0);
+        std::string row = "  predict/L:";
+        bool wrapped = false;
+        for (size_t il = 0; il < predict_layer.size(); ++il) {
+            if (predict_layer[il] == 0) {
+                continue;
+            }
+            char cell[48];
+            snprintf(cell, sizeof(cell), " L%zu=%" PRIu64 "/%" PRIu64,
+                     il, predict_hit[il], predict_layer[il]);
+            row += cell;
+            if (row.size() > 110 && !wrapped) {
+                out += row;
+                out += '\n';
+                row = "            ";
+                wrapped = true;
+            }
+        }
+        out += row;
+        out += '\n';
     }
 
     if (n_layers_used > 0) {
@@ -847,6 +908,12 @@ void llama_hot_expert_cache::observe_decode_finish() {
             std::lock_guard<std::mutex> lock(mu);
             write_ngram_step();
         }
+        if (ngram_predict) {
+            std::lock_guard<std::mutex> lock(mu);
+            for (std::vector<int32_t> & v : ngram_predicted) {
+                v.clear();
+            }
+        }
         return;  // nothing was staged (no observed layer)
     }
 
@@ -869,6 +936,27 @@ void llama_hot_expert_cache::observe_decode_finish() {
         const int n_ids = obs_cnt[il];
 
         n_eval_calls++;
+
+        // score this step's prediction against what the layer just routed: of
+        // the predicted experts, how many the layer actually selected (precision)
+        if (ngram_predict) {
+            const std::vector<int32_t> & pred = ngram_predicted[(size_t) il];
+            for (const int32_t pid : pred) {
+                n_ngram_pred_routes++;
+                ngram_pred_layer[(size_t) il]++;
+                bool routed = false;
+                for (int k = 0; k < n_ids; ++k) {
+                    if (ids[k] == pid) {
+                        routed = true;
+                        break;
+                    }
+                }
+                if (routed) {
+                    n_ngram_pred_hits++;
+                    ngram_hit_layer[(size_t) il]++;
+                }
+            }
+        }
 
         // snapshot this layer's VRAM residency: the VRAM tier only publishes and
         // evicts at the ubatch boundary (tick), never during a graph, so the flags
@@ -938,6 +1026,12 @@ void llama_hot_expert_cache::observe_decode_finish() {
     }
 
     write_ngram_step();
+
+    if (ngram_predict) {
+        for (std::vector<int32_t> & v : ngram_predicted) {
+            v.clear();
+        }
+    }
 }
 
 void llama_hot_expert_cache::resolve_tensors(int il, layer_state & ls) {
@@ -1967,7 +2061,7 @@ static void write_json_string(std::FILE * f, const std::string & s) {
 }
 
 void llama_hot_expert_cache::note_output_token(int32_t token) {
-    if (profile_file == nullptr && ngram_file == nullptr) {
+    if (profile_file == nullptr && ngram_file == nullptr && ngram_predict == nullptr) {
         return;
     }
     std::lock_guard<std::mutex> lock(mu);
@@ -1977,6 +2071,22 @@ void llama_hot_expert_cache::note_output_token(int32_t token) {
     if (ngram_file != nullptr) {
         ngram_token      = token;
         ngram_have_token = true;
+    }
+    if (ngram_predict) {
+        // predict the experts of the step about to run and hand the disk stage
+        // the read list: it reads the non-resident ones into the L2 pool in
+        // layer order while the graph computes
+        const bool matched = ngram_predict->predict(token, ngram_predicted);
+        if (matched) {
+            n_ngram_matched++;
+        } else {
+            for (std::vector<int32_t> & v : ngram_predicted) {
+                v.clear();
+            }
+        }
+        if (disk_stage != nullptr && disk_stage->is_active()) {
+            disk_stage->prefetch(ngram_predicted, ngram_prefetch_max);
+        }
     }
 }
 
@@ -2108,6 +2218,9 @@ void llama_hot_expert_cache::on_prompt_begin() {
     if (ngram_file != nullptr) {
         std::fwrite(&NGRAM_REC_PROMPT_BEGIN, sizeof(NGRAM_REC_PROMPT_BEGIN), 1, ngram_file);
         std::fflush(ngram_file);
+    }
+    if (ngram_predict) {
+        ngram_predict->on_turn_begin();
     }
 
     // fresh epoch for the periodic decay clock: do not fire a scheduled halving

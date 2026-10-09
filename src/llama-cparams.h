@@ -85,6 +85,11 @@ struct llama_cparams {
     // raw binary decode token + routed-expert recording for offline expert-prediction
     // experiments (nullptr = off)
     const char * expert_ngram_record_path;
+    // LENGPROF v1 expert-prediction table the decode stage reads ahead from
+    // (nullptr = off)
+    const char * expert_ngram_profile_path;
+    // cap on experts prefetched per decode step (0 = no cap)
+    int32_t expert_ngram_prefetch_max;
     // base set of experts to keep resident in the disk decode cache (nullptr = off)
     const char * pin_experts_from_profile_path;
     // warm set of experts to prefill the remaining decode-cache slots (nullptr = off)

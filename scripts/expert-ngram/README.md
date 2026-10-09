@@ -226,3 +226,33 @@ below that, which no current model approaches.
   dynamic promotion/eviction policy. The residency sweep is a proxy.
 - The model is built in memory and dropped at the end; it is not yet exported as
   a runtime database file.
+
+## Runtime prefetch
+
+`--expert-ngram-profile FILE` makes a single-token decode step read ahead:
+
+```
+llama-server -m model.gguf --load-mode dio --pin-hot-experts 400 \
+    --expert-ngram-profile expertngrams/coding.prof
+```
+
+The step hashes the recent input tokens against the table (largest order first,
+first hit wins), then the disk stage reads the non-resident predicted experts
+into the L2 pool from a dedicated worker on its own completion port, so the
+read overlaps the graph instead of queueing behind a layer's demand read. The
+per-step read count is capped by `--expert-ngram-prefetch-max` (default 64).
+
+The hot-expert report gains a `predict` line per interval: steps matched,
+experts predicted, and the share the step actually routed (precision), plus the
+per-layer hit rate. That is the number to watch in the A/B:
+
+```
+experts stats:
+  predict  : 44/44 steps matched | 264 predicted, 121 routed (45.8% precision)
+  predict/L: L0=5/6 L1=5/6 L2=4/6 ...
+```
+
+Tune the profile's `--layer-threshold` together with the runtime: with a fast
+NVMe a lower threshold (more layers, more reads) can win, on a slower drive a
+higher one. The exporter's `--sweep` prints the coverage/efficiency frontier to
+pick a starting point.
