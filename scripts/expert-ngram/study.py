@@ -230,14 +230,24 @@ def resident_mask(static_res, prev_ids, n_layer, n_expert):
     return res
 
 
-def eval_split(d, train_mask, eval_idx, orders, budgets, min_support, resident_c):
-    """Evaluate every predictor on eval_idx with a model built on train_mask."""
+def eval_split(d, train_mask, eval_idx, orders, budgets, min_support, resident_c, lead=0):
+    """Evaluate every predictor on eval_idx with a model built on train_mask.
+
+    `lead` shifts the target: the key ending at token t-K predicts the routing
+    of step t, so the prediction is made K decode steps before it is needed."""
     routes = d["routes"]
     seg = d["seg"]
     tokens = d["tokens"]
     n_layer, n_expert = d["header"]["n_layer"], d["header"]["n_expert"]
     max_m = max(budgets)
     ref_budget = min(int(d["header"]["n_expert_used"]), max_m)
+
+    # rows whose key is K steps back and still inside the same turn
+    ok = np.ones(len(tokens), dtype=bool)
+    if lead > 0:
+        ok[:lead] = False
+        ok[lead:] = seg[lead:] == seg[:-lead]
+        eval_idx = eval_idx[ok[eval_idx]]
 
     static_counts = np.zeros((n_layer, n_expert), dtype=np.int64)
     for il in range(n_layer):
@@ -260,6 +270,11 @@ def eval_split(d, train_mask, eval_idx, orders, budgets, min_support, resident_c
     coverage = {}
     for o in orders:
         ids, table = key_ids_for_order(tokens, seg, o)
+        if lead > 0:
+            shifted = np.full_like(ids, -1)
+            shifted[lead:] = ids[:-lead]
+            shifted[~ok] = -1
+            ids = shifted
         model, kept = build_model(routes, ids, train_mask, n_layer, n_expert, max_m, min_support)
         preds[o] = pred_array_from_model(model, ids, eval_idx, n_layer, max_m)
         covered = sum(1 for t in eval_idx if ids[t] >= 0 and int(ids[t]) in model)
@@ -285,16 +300,30 @@ def eval_split(d, train_mask, eval_idx, orders, budgets, min_support, resident_c
         backoff[has] = preds[o][has]
     predictors["backoff"] = backoff
 
+    # the runtime predictor: the largest matching order, and nothing when no key
+    # matches. Unlike `backoff` there is no static fallback, so the precision is
+    # over the matched steps only, exactly like the engine's predict/L counter
+    backoff_ngram = np.full_like(static_pred, -1)
+    for o in orders:
+        has = (preds[o] >= 0).any(axis=2)
+        backoff_ngram[has] = preds[o][has]
+    predictors["ngram_backoff"] = backoff_ngram
+
     results = {name: tally(actual, act_valid, res, pred, budgets) for name, pred in predictors.items()}
     per_layer = []
     per_layer_rec = []
+    per_layer_rec_ngram = []
     for il in range(n_layer):
         rec = tally(actual[:, il : il + 1, :], act_valid[:, il : il + 1, :],
                     res[:, il : il + 1, :], backoff[:, il : il + 1, :], [ref_budget])[ref_budget]
         per_layer.append(ratios(rec))
         per_layer_rec.append(rec)
+        rec_ng = tally(actual[:, il : il + 1, :], act_valid[:, il : il + 1, :],
+                       res[:, il : il + 1, :], backoff_ngram[:, il : il + 1, :], [ref_budget])[ref_budget]
+        per_layer_rec_ngram.append(rec_ng)
     return {"results": results, "coverage": coverage, "n_eval": len(eval_idx),
             "ref_budget": ref_budget, "per_layer": per_layer, "per_layer_rec": per_layer_rec,
+            "per_layer_rec_ngram": per_layer_rec_ngram,
             "static_rank": static_rank, "budgets": budgets, "pred_backoff": backoff}
 
 

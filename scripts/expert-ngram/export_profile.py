@@ -27,10 +27,10 @@ from study import (  # noqa: E402
 )
 
 MAGIC = b"LENGPROF"
-VERSION = 1
+VERSION = 2
 # magic, version, n_layer, n_expert, n_expert_used, max_order, top_m, table_size,
-# n_enabled, layer_mask_bytes, model_fp, tokenizer_fp, n_entries
-HEADER = struct.Struct("<8sIIIIIIIIIQQQ")
+# n_enabled, layer_mask_bytes, lead, model_fp, tokenizer_fp, n_entries
+HEADER = struct.Struct("<8sIIIIIIIIIIQQQ")
 
 FNV_OFFSET = 0xCBF29CE484222325
 FNV_PRIME = 0x100000001B3
@@ -53,9 +53,9 @@ def hash_key(values, order):
 
 
 def select_layers(stats, threshold, limit, max_reads_per_step):
-    """Greedy selection by per-read efficiency, optionally capped."""
-    picked = [s for s in stats if s["efficiency"] >= threshold]
-    picked.sort(key=lambda s: -s["efficiency"])
+    """Greedy selection by per-layer precision, optionally capped."""
+    picked = [s for s in stats if s["precision"] >= threshold]
+    picked.sort(key=lambda s: -s["precision"])
     if limit > 0:
         picked = picked[:limit]
     if max_reads_per_step > 0:
@@ -70,7 +70,21 @@ def select_layers(stats, threshold, limit, max_reads_per_step):
     return sorted(s["layer"] for s in picked)
 
 
-def selection_folds(d, orders, ref_budget, min_support, resident_c):
+def shift_keys(ids, seg, lead):
+    """Make the key ending `lead` steps back predict the target step, so a
+    profile built from the result predicts `lead` steps ahead (lead 1 = next)."""
+    if lead <= 0:
+        return ids
+    ok = np.ones(len(ids), dtype=bool)
+    ok[:lead] = False
+    ok[lead:] = seg[lead:] == seg[:-lead]
+    shifted = np.full_like(ids, -1)
+    shifted[lead:] = ids[:-lead]
+    shifted[~ok] = -1
+    return shifted
+
+
+def selection_folds(d, orders, ref_budget, min_support, resident_c, lead):
     """Per-layer estimates for the allowlist. With two or more sessions these are
     leave-one-session-out folds (the transfer a profile has to survive); a single
     session falls back to a turn-parity split within it."""
@@ -79,33 +93,39 @@ def selection_folds(d, orders, ref_budget, min_support, resident_c):
     if len(sessions) >= 2:
         for s in sessions:
             folds.append(eval_split(d, d["session"] != s, np.flatnonzero(d["session"] == s),
-                                    orders, [ref_budget], min_support, resident_c))
+                                    orders, [ref_budget], min_support, resident_c, lead=lead))
     else:
         for parity in (0, 1):
             tr = (d["turn"] % 2) == parity
             ev = np.flatnonzero((d["turn"] % 2) == (1 - parity))
-            folds.append(eval_split(d, tr, ev, orders, [ref_budget], min_support, resident_c))
+            folds.append(eval_split(d, tr, ev, orders, [ref_budget], min_support, resident_c, lead=lead))
     return folds
 
 
 def layer_stats(folds, n_layer):
+    """Per-layer precision (routed / predicted) and reads/step of the runtime
+    predictor: the n-gram backoff with no static fallback (per_layer_rec_ngram)."""
     steps = sum(f["n_eval"] for f in folds) or 1
     out = []
     for il in range(n_layer):
-        reads = sum(f["per_layer_rec"][il]["pred_nonres"] for f in folds)
-        help_ = sum(f["per_layer_rec"][il]["help"] for f in folds)
-        miss = sum(f["per_layer_rec"][il]["miss"] for f in folds)
+        pred = sum(f["per_layer_rec_ngram"][il]["pred"] for f in folds)
+        hit = sum(f["per_layer_rec_ngram"][il]["hit"] for f in folds)
+        reads = sum(f["per_layer_rec_ngram"][il]["pred_nonres"] for f in folds)
+        help_ = sum(f["per_layer_rec_ngram"][il]["help"] for f in folds)
+        miss = sum(f["per_layer_rec_ngram"][il]["miss"] for f in folds)
         out.append({
             "layer": il,
+            "precision": hit / pred if pred else 0.0,
             "efficiency": help_ / reads if reads else 0.0,
             "reads_per_step": reads / steps,
+            "pred_per_step": pred / steps,
             "help_per_step": help_ / steps,
             "miss_per_step": miss / steps,
         })
     return out
 
 
-def build_entries(d, orders, top_m, min_support, selected):
+def build_entries(d, orders, top_m, min_support, selected, lead):
     """(hash, per-enabled-layer ids) for every trained key, in ascending layer order."""
     routes = d["routes"]
     train = np.ones(len(routes), dtype=bool)
@@ -116,6 +136,7 @@ def build_entries(d, orders, top_m, min_support, selected):
     keys_per_order = {}
     for order in orders:
         ids, table = key_ids_for_order(d["tokens"], d["seg"], order)
+        ids = shift_keys(ids, d["seg"], lead)
         model, _ = build_model(routes, ids, train, n_layer, n_expert, top_m, min_support)
         lookup = [None] * len(table)
         for tup, idx in table.items():
@@ -165,6 +186,7 @@ def write_profile(path, d, meta, entries):
         handle.write(HEADER.pack(
             MAGIC, VERSION, n_layer, d["header"]["n_expert"], d["header"]["n_expert_used"],
             meta["max_order"], top_m, table_size, n_enabled, layer_mask_bytes,
+            meta["lead"],
             d["header"]["model_fp"], d["header"]["tokenizer_fp"], n_entries))
         handle.write(bytes(mask))
         handle.write(budgets.tobytes())
@@ -178,9 +200,9 @@ def read_profile(path):
         blob = handle.read()
     fields = HEADER.unpack_from(blob, 0)
     (magic, version, n_layer, n_expert, n_expert_used, max_order, top_m, table_size,
-     n_enabled, layer_mask_bytes, model_fp, tokenizer_fp, n_entries) = fields
+     n_enabled, layer_mask_bytes, lead, model_fp, tokenizer_fp, n_entries) = fields
     if magic != MAGIC or version != VERSION:
-        raise ValueError("not a LENGPROF v1 profile")
+        raise ValueError("not a LENGPROF v%d profile" % VERSION)
     off = HEADER.size
     mask = np.frombuffer(blob, dtype=np.uint8, count=layer_mask_bytes, offset=off)
     off += layer_mask_bytes
@@ -192,6 +214,7 @@ def read_profile(path):
         "n_layer": n_layer, "n_expert": n_expert, "n_expert_used": n_expert_used,
         "max_order": max_order, "top_m": top_m, "table_size": table_size,
         "n_enabled": n_enabled, "mask": mask, "budgets": budgets, "slots": slots,
+        "lead": lead,
         "model_fp": model_fp, "tokenizer_fp": tokenizer_fp, "n_entries": n_entries,
         "enabled": [il for il in range(n_layer) if mask[il // 8] & (1 << (il % 8))],
     }
@@ -229,9 +252,12 @@ def main():
     parser.add_argument("--top-m", type=int, default=6)
     parser.add_argument("--min-support", type=int, default=1)
     parser.add_argument("--resident-c", type=int, default=8)
-    parser.add_argument("--layer-threshold", type=float, default=0.45,
-                        help="minimum per-read efficiency (reads that hit / reads) for a "
-                             "layer to be prefetched (default 0.45)")
+    parser.add_argument("--lead", type=int, default=1,
+                        help="decode steps ahead the profile predicts (default 1 = next step); "
+                             "the lead is stored in the profile and read by the runtime")
+    parser.add_argument("--layer-threshold", type=float, default=0.30,
+                        help="minimum per-layer precision (routed / predicted) for a "
+                             "layer to be prefetched (default 0.30)")
     parser.add_argument("--layer-limit", type=int, default=0,
                         help="cap on the number of enabled layers (0 = no cap)")
     parser.add_argument("--max-reads-per-step", type=float, default=0.0,
@@ -245,24 +271,25 @@ def main():
     n_layer = d["header"]["n_layer"]
     ref_budget = min(d["header"]["n_expert_used"], args.top_m)
 
-    # selection: leave-one-session-out per-layer efficiency, averaged
-    folds = selection_folds(d, orders, ref_budget, args.min_support, args.resident_c)
+    # selection: leave-one-session-out per-layer precision, averaged
+    folds = selection_folds(d, orders, ref_budget, args.min_support, args.resident_c, args.lead)
     stats = layer_stats(folds, n_layer)
 
     total_miss = sum(s["miss_per_step"] for s in stats) or 1.0
     if args.sweep:
         # the same held-out folds realize each selection (cross-session when the
         # inputs are multiple sessions)
-        print("per-layer cross-session efficiency and realized value at budget %d" % ref_budget)
-        print("| layer | eff (select) | reads/step | help/step |")
+        print("per-layer cross-session precision and realized value at budget %d (lead %d)" % (
+            ref_budget, args.lead))
+        print("| layer | precision | reads/step | help/step |")
         print("| --- | --- | --- | --- |")
         for s in stats:
-            print("| %d | %.3f | %.1f | %.1f |" % (s["layer"], s["efficiency"], s["reads_per_step"], s["help_per_step"]))
+            print("| %d | %.3f | %.1f | %.1f |" % (s["layer"], s["precision"], s["reads_per_step"], s["help_per_step"]))
         print()
         print("threshold sweep (selected and realized on the held-out folds)")
         print("| threshold | layers | reads/step | covered | reads useful |")
         print("| --- | --- | --- | --- | --- |")
-        for threshold in [0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60]:
+        for threshold in [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]:
             sel = select_layers(stats, threshold, args.layer_limit, args.max_reads_per_step)
             sel_set = set(sel)
             chosen = [s for s in stats if s["layer"] in sel_set]
@@ -278,17 +305,18 @@ def main():
         print("no layer passed the threshold; nothing written")
         return
     print("enabled layers (%d): %s" % (len(selected), ", ".join(str(il) for il in selected)))
-    print("| layer | eff | reads/step | help/step |")
+    print("| layer | precision | reads/step | help/step |")
     print("| --- | --- | --- | --- |")
     for s in sorted(stats, key=lambda s: s["layer"]):
         if s["layer"] in set(selected):
-            print("| %d | %.3f | %.1f | %.1f |" % (s["layer"], s["efficiency"], s["reads_per_step"], s["help_per_step"]))
+            print("| %d | %.3f | %.1f | %.1f |" % (s["layer"], s["precision"], s["reads_per_step"], s["help_per_step"]))
 
-    entries, keys_per_order = build_entries(d, orders, args.top_m, args.min_support, selected)
-    meta = {"selected": selected, "top_m": args.top_m, "max_order": max(orders)}
+    entries, keys_per_order = build_entries(d, orders, args.top_m, args.min_support, selected, args.lead)
+    meta = {"selected": selected, "top_m": args.top_m, "max_order": max(orders), "lead": args.lead}
     table_size, mask_bytes = write_profile(args.output, d, meta, entries)
-    print("wrote %s: %d entries, %d slots, %d enabled layers, %.1f MiB" % (
-        args.output, len(entries), table_size, len(selected), os.path.getsize(args.output) / 1048576.0))
+    print("wrote %s: %d entries, %d slots, %d enabled layers, lead %d, %.1f MiB" % (
+        args.output, len(entries), table_size, len(selected), args.lead,
+        os.path.getsize(args.output) / 1048576.0))
 
     if args.verify:
         prof = read_profile(args.output)
@@ -297,6 +325,7 @@ def main():
         checked = 0
         for order in orders:
             ids, table = key_ids_for_order(d["tokens"], d["seg"], order)
+            ids = shift_keys(ids, d["seg"], args.lead)
             lookup_table = [None] * len(table)
             for tup, idx in table.items():
                 lookup_table[idx] = tup

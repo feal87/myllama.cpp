@@ -154,16 +154,17 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
             ngram_predict = std::make_unique<llama_expert_predict>(ngram_profile_path,
                     (int32_t) model.hparams.n_layer(), (int32_t) model.hparams.n_expert);
             const size_t n_layer = (size_t) model.hparams.n_layer();
-            ngram_predicted.resize(n_layer);
             ngram_pred_layer.assign(n_layer, 0);
             ngram_hit_layer.assign(n_layer, 0);
             prev_ngram_pred_layer.assign(n_layer, 0);
             prev_ngram_hit_layer.assign(n_layer, 0);
+            const int32_t profile_lead = ngram_predict->lead();
+            ngram_lead = profile_lead;
             LLAMA_LOG_INFO("%s: expert prediction profile %s: max order %d, top %d, %d/%d layers, "
-                           "prefetching up to %d expert(s) per step\n",
+                           "lead %d, prefetching up to %d expert(s) per step\n",
                            __func__, ngram_profile_path, ngram_predict->max_order(),
                            ngram_predict->top_m(), ngram_predict->n_enabled(),
-                           ngram_predict->n_layer(), ngram_prefetch_max);
+                           ngram_predict->n_layer(), ngram_lead, ngram_prefetch_max);
         } catch (const std::exception & e) {
             LLAMA_LOG_WARN("%s: %s, expert prefetch disabled\n", __func__, e.what());
             ngram_predict.reset();
@@ -920,15 +921,12 @@ void llama_hot_expert_cache::observe_decode_finish() {
         // no layer produced an observable top-k this step, but the token still
         // belongs in the recording: a missing step would shift every following
         // n-gram window by one token
+        std::lock_guard<std::mutex> lock(mu);
         if (ngram_file != nullptr) {
-            std::lock_guard<std::mutex> lock(mu);
             write_ngram_step();
         }
         if (ngram_predict) {
-            std::lock_guard<std::mutex> lock(mu);
-            for (std::vector<int32_t> & v : ngram_predicted) {
-                v.clear();
-            }
+            ngram_advance_prediction();
         }
         return;  // nothing was staged (no observed layer)
     }
@@ -938,6 +936,13 @@ void llama_hot_expert_cache::observe_decode_finish() {
     // one lock for the whole ubatch (the old per-layer lock/unlock was 48
     // uncontended acquisitions per decode token on the same mutex)
     std::lock_guard<std::mutex> lock(mu);
+
+    // the prediction this step scores: the front of the queue targets exactly
+    // this step (made `ngram_lead` steps ago, or in-step for lead 0)
+    const std::vector<std::vector<int32_t>> * pred_score = nullptr;
+    if (ngram_predict && !ngram_pending.empty() && ngram_pending.front().first == ngram_step) {
+        pred_score = &ngram_pending.front().second;
+    }
 
     // with the disk stage active, RAM residency is decided by the decode-cache
     // slot actually holding the bytes, not by the pin state
@@ -955,8 +960,8 @@ void llama_hot_expert_cache::observe_decode_finish() {
 
         // score this step's prediction against what the layer just routed: of
         // the predicted experts, how many the layer actually selected (precision)
-        if (ngram_predict) {
-            const std::vector<int32_t> & pred = ngram_predicted[(size_t) il];
+        if (pred_score != nullptr) {
+            const std::vector<int32_t> & pred = (*pred_score)[(size_t) il];
             for (const int32_t pid : pred) {
                 n_ngram_pred_routes++;
                 ngram_pred_layer[(size_t) il]++;
@@ -1044,9 +1049,16 @@ void llama_hot_expert_cache::observe_decode_finish() {
     write_ngram_step();
 
     if (ngram_predict) {
-        for (std::vector<int32_t> & v : ngram_predicted) {
-            v.clear();
-        }
+        ngram_advance_prediction();
+    }
+}
+
+void llama_hot_expert_cache::ngram_advance_prediction() {
+    // the step just observed is done: drop its prediction (scored or not), so a
+    // gap in the observed layers cannot leave a stale entry at the front. The
+    // next prediction is made by note_output_token at the start of the next step
+    while (!ngram_pending.empty() && ngram_pending.front().first <= ngram_step) {
+        ngram_pending.pop_front();
     }
 }
 
@@ -2093,19 +2105,20 @@ void llama_hot_expert_cache::note_output_token(int32_t token) {
         ngram_have_token = true;
     }
     if (ngram_predict) {
-        // predict the experts of the step about to run and hand the disk stage
-        // the read list: it reads the non-resident ones into the L2 pool in
-        // layer order while the graph computes
-        const bool matched = ngram_predict->predict(token, ngram_predicted);
-        if (matched) {
+        ngram_step++;
+
+        // predict from the token the previous step sampled, which is this
+        // step's input. The profile's lead sets how far ahead the target is
+        // (lead 1 = the next step). Issued here, at the start of the step, so
+        // the read-ahead runs during this step's compute instead of the gap
+        // right before the step that needs it
+        std::vector<std::vector<int32_t>> pred;
+        if (ngram_predict->predict(token, pred)) {
             n_ngram_matched++;
-        } else {
-            for (std::vector<int32_t> & v : ngram_predicted) {
-                v.clear();
-            }
         }
+        ngram_pending.emplace_back(ngram_step + (int64_t) ngram_lead, std::move(pred));
         if (disk_stage != nullptr && disk_stage->is_active()) {
-            disk_stage->prefetch(ngram_predicted, ngram_prefetch_max);
+            disk_stage->prefetch(ngram_pending.back().second, ngram_prefetch_max, ngram_lead);
         }
     }
 }
@@ -2241,6 +2254,7 @@ void llama_hot_expert_cache::on_prompt_begin() {
     }
     if (ngram_predict) {
         ngram_predict->on_turn_begin();
+        ngram_pending.clear();
     }
 
     // fresh epoch for the periodic decay clock: do not fire a scheduled halving

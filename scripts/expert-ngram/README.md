@@ -101,38 +101,36 @@ python scripts/expert-ngram/export_profile.py coding.prof session1.rec session2.
 
 The exporter builds the table from every turn of the inputs, and chooses the
 per-layer allowlist from leave-one-session-out folds (a turn-parity split when
-there is one file). `--sweep` prints the per-layer efficiency and the realized
-coverage/efficiency for several thresholds without writing a file.
+there is one file). `--sweep` prints the per-layer precision and the realized
+coverage/read-efficiency for several thresholds without writing a file.
 
 ### Choosing the layer threshold
 
-The threshold is the minimum per-read efficiency (prefetch reads that hit /
-reads) for a layer to be enabled. It is an I/O economics choice, not a
-correctness bar, so it is a knob. `--sweep` on the two DS4 coding sessions gave:
+The threshold is the minimum per-layer precision (routed / predicted) for a
+layer to be enabled. It is an I/O economics choice, not a correctness bar, so it
+is a knob. Selection uses the n-gram-only predictor (no static fallback), which
+is what the runtime implements. `--sweep` on the four DS4 sessions at lead 1
+(predict the next step) gave:
 
 | threshold | layers | reads/step | demand misses covered | reads useful |
 | --- | --- | --- | --- | --- |
-| 0.25 | 25 | 72.7 | 21.4% | 47.5% |
-| 0.30 | 17 | 52.2 | 17.9% | 55.2% |
-| 0.35 | 16 | 49.4 | 17.4% | 56.6% |
-| 0.40 | 10 | 32.9 | 13.5% | 66.1% |
-| 0.45 | 6 | 21.6 | 10.6% | 79.2% |
-| 0.50 | 5 | 18.3 | 9.6% | 84.5% |
-| 0.60 | 3 | 12.3 | 7.6% | 100.0% |
+| 0.20 | 43 | 108.4 | 15.1% | 22.2% |
+| 0.25 | 41 | 103.3 | 14.5% | 22.4% |
+| 0.30 | 23 | 61.2 | 9.8% | 25.6% |
+| 0.35 | 5 | 12.9 | 2.3% | 28.6% |
 
-Start at 0.40-0.45 (the knee): roughly two thirds to four fifths of the reads pay
-off. Drop toward 0.30 only if a hidden stall is worth much more than a read
-(NVMe, parallel reads); raise toward 0.50 on a bandwidth-bound disk. The layer
-ranking is stable across sessions, so the choice transfers.
+Precision falls with the lead, so raise the threshold as you predict further
+ahead. Any precision below 1 means the read-ahead reads more than it saves; the
+threshold picks how much read amplification the drive can hide behind compute.
 
-## Profile format (`LENGPROF` v1, little-endian)
+## Profile format (`LENGPROF` v2, little-endian)
 
-Header, 68 bytes:
+Header, 72 bytes:
 
 | offset | size | field |
 | --- | --- | --- |
 | 0 | 8 | magic `LENGPROF` |
-| 8 | 4 | version (1) |
+| 8 | 4 | version (2) |
 | 12 | 4 | n_layer |
 | 16 | 4 | n_expert |
 | 20 | 4 | n_expert_used |
@@ -141,9 +139,15 @@ Header, 68 bytes:
 | 32 | 4 | table_size (power of two) |
 | 36 | 4 | n_enabled |
 | 40 | 4 | layer_mask_bytes = ceil(n_layer/8) |
-| 44 | 8 | model fingerprint |
-| 52 | 8 | tokenizer fingerprint |
-| 60 | 8 | n_entries |
+| 44 | 4 | lead (decode steps ahead the table predicts) |
+| 48 | 8 | model fingerprint |
+| 56 | 8 | tokenizer fingerprint |
+| 64 | 8 | n_entries |
+
+Version 1 (68 bytes, same layout without `lead`) is still read and treated as
+lead 0. The runtime reads the lead from the profile and issues the read-ahead at
+the end of the step for lead >= 1 (so the reads land in the gap before the step
+that needs them), or at the step's start for lead 0.
 
 Then, in order:
 
