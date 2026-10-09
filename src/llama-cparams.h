@@ -98,6 +98,9 @@ struct llama_cparams {
     int32_t  n_moe_cache_inserts;      // max expert uploads per decode step, across all cached layers (global)
     float    n_moe_cache_drift_percent;// rebuild the per-layer layout when it drifts more than this percent from
                                        // the ideal composition for the current ranking (0 = disabled)
+    uint64_t n_moe_cache_decay_tokens; // rank the VRAM tier by recent decode routing counts halved every N tokens
+                                       // (0 = share the hot-expert cache's long-term ranking)
+    uint64_t n_moe_cache_rebalance_tokens; // content tokens between VRAM content rebalances (0 = default 256)
 
     // batch/prefill read-ahead of the routed-but-unpinned MoE expert rows
     // (--hot-experts-prefetch; multi-token ubatches only). Starts the hot-expert

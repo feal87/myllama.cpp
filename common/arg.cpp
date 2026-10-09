@@ -3300,6 +3300,42 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--moe-expert-cache-decay-tokens"}, "N",
+        string_format(
+            "rank the VRAM MoE expert cache by its own RECENT routing counts instead of\n"
+            "the shared long-term ranking, halved every N single-token decode tokens\n"
+            "(default: %" PRIu64 ", 0 = share the long-term ranking). The RAM/disk tier\n"
+            "keeps the long-term ranking, so the VRAM tier can track a topic change\n"
+            "without churning the RAM set. A short window re-converges fast but makes\n"
+            "the top set noisy; 128-512 is the useful range. Only the decoder writes\n"
+            "the counts, so only single-token decode ubatches age the window",
+            params.n_moe_cache_decay_tokens
+        ),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --moe-expert-cache-decay-tokens must be >= 0");
+            }
+            params.n_moe_cache_decay_tokens = (uint64_t) value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_DECAY_TOKENS"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-rebalance-tokens"}, "N",
+        string_format(
+            "content tokens between VRAM MoE expert cache rebalances (default: %" PRIu64
+            ", 0 = default). Each rebalance refreshes the ranking snapshot and reconciles\n"
+            "the cached experts with it, so this bounds how fast the VRAM set can follow a\n"
+            "topic change. Lowering it (for example 128) reacts sooner at the cost of more\n"
+            "re-ranking work on the decode thread; it does not affect the RAM, L2 or disk tiers",
+            params.n_moe_cache_rebalance_tokens
+        ),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --moe-expert-cache-rebalance-tokens must be >= 0");
+            }
+            params.n_moe_cache_rebalance_tokens = (uint64_t) value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_REBALANCE_TOKENS"));
+    add_opt(common_arg(
         {"--dense-vram-tensors"}, "REGEX[,REGEX...]",
         "decode-only promotion of host-resident dense weights into the VRAM the MoE\n"
         "expert cache reclaims from the prefill compute buffer (--moe-expert-cache-*).\n"

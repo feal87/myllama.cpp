@@ -267,6 +267,18 @@ public:
     // the slot at any time. false when (il, id) is not a filled resident
     bool resident_copy(int il, int32_t id, const size_t sz[3], void * dst, size_t dst_cap) const;
 
+    // true when (il, id) is present in the L2 pool, so the VRAM upload can source
+    // it even when it is not a filled RAM resident (the RAM pool is full on a
+    // topic change). Read on the decode thread only
+    bool l2_present(int il, int32_t id) const;
+
+    // copy the L2 copy of (il, id)'s three rows (gate, up, down, in that order)
+    // into dst, which must have room for gate_sz + up_sz + down_sz bytes. Same
+    // byte layout as resident_copy. Runs on the VRAM upload worker: holds the L2
+    // lock across the copy so the decode thread cannot reuse the slot under it.
+    // false when (il, id) has no L2 copy
+    bool l2_copy(int il, int32_t id, const size_t sz[3], void * dst, size_t dst_cap);
+
     // publish (il, id) as VRAM-served: its table entry becomes the sentinel, so
     // the host mul_mat_id skips it, and its RAM slot (when still held) is freed
     // for the next promotion. Only call between graphs, after the device upload

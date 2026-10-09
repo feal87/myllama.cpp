@@ -1750,6 +1750,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_moe_cache_budget_bytes = params.n_moe_cache_budget_mib * 1024ull * 1024ull;
     cparams.n_moe_cache_inserts      = params.n_moe_cache_inserts;
     cparams.n_moe_cache_drift_percent = params.n_moe_cache_drift_percent;
+    cparams.n_moe_cache_decay_tokens  = params.n_moe_cache_decay_tokens;
+    cparams.n_moe_cache_rebalance_tokens = params.n_moe_cache_rebalance_tokens;
     cparams.dense_vram_tensors       = params.dense_vram_tensors.empty() ? nullptr : params.dense_vram_tensors.c_str();
     cparams.hot_experts_prefetch     = params.hot_experts_prefetch;
     cparams.disk_stage_sparse_max    = params.disk_stage_sparse_max;

@@ -10,6 +10,13 @@
 // still spins up the observation engine (n_pin_experts = 0) so nothing is
 // mlock'd but the counts above are maintained.
 //
+// With a recent window (--moe-expert-cache-decay-tokens), the VRAM tier instead
+// ranks by a second, VRAM-only count table halved every N decode tokens, so it
+// can follow a topic change within a prompt while the RAM/disk tier keeps the
+// long-term counts. In dio mode the upload also sources from the disk stage's L2
+// pool when the target is not a filled RAM resident, since the RAM pool is full
+// and the recent experts live in the L2.
+//
 // Lifecycle:
 //  - requested via llama_context_params (CLI --moe-expert-cache-budget-mib +
 //    --moe-expert-cache-inserts). Requires the hot-expert ranking engine (the
@@ -116,8 +123,14 @@ class llama_moe_cache {
     // drift_percent: rebuild the per-layer layout when its slot counts differ
     //           from the ideal composition for the current ranking by more than
     //           this percent (0 = disabled: keep the layout fixed between prompts)
+    // rebalance_tokens: content tokens between content rebalances: the ranking
+    //           snapshot is refreshed and the residents reconciled every N decode
+    //           tokens, so this bounds how fast the VRAM set can follow a topic
+    //           change (0 = default 256). VRAM-only; the RAM/L2/disk tiers do not
+    //           read it
     llama_moe_cache(const llama_model & model, llama_hot_expert_cache * hot,
-                    uint64_t budget_bytes, int32_t max_inserts, float drift_percent);
+                    uint64_t budget_bytes, int32_t max_inserts, float drift_percent,
+                    uint64_t rebalance_tokens);
     ~llama_moe_cache();
 
     llama_moe_cache(const llama_moe_cache &) = delete;

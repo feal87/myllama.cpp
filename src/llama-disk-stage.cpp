@@ -663,6 +663,10 @@ struct llama_disk_stage::impl {
     std::vector<std::vector<int32_t>> warm_loaded;
     std::unordered_map<const ggml_tensor *, int32_t> table_layer; // cache id table -> layer id
     std::mutex   cache_mu;       // guards resident_slot / free_slots and table writes
+    // guards the L2 SLRU structure (slot_of + slot data) against the VRAM upload
+    // worker's l2_copy: the decode thread reuses a slot under this lock, so a
+    // snapshot cannot be overwritten mid-copy. Lock order: cache_mu -> l2_mu
+    std::mutex   l2_mu;
     std::mutex   io_mu;          // one reaper at a time: the IOCP is shared by all reads
     int32_t      n_trans = 0;    // transient slots per layer, 0 when no cache
     // per layer: the graph emitted a cold pass for it, so the split path applies.
@@ -1183,13 +1187,20 @@ struct llama_disk_stage::impl {
         }
     }
 
-    static void evict_push(evict_pool & ep, int64_t key, int32_t slot, uint8_t seg) {
+    static void evict_push_unlocked(evict_pool & ep, int64_t key, int32_t slot, uint8_t seg) {
         std::list<int64_t> & l = seg != 0 ? ep.prot : ep.prob;
         l.push_front(key);
         ep.iter_of[(size_t) slot] = l.begin();
         ep.seg[(size_t) slot] = seg;
         ep.slot_key[(size_t) slot] = key;
         ep.slot_of[key] = slot;
+    }
+
+    // publish a key -> slot mapping. l2_mu excludes the VRAM upload worker's
+    // l2_copy, which reads slot_of and the slot bytes without reusing them
+    void evict_push(evict_pool & ep, int64_t key, int32_t slot, uint8_t seg) {
+        std::lock_guard<std::mutex> lk(l2_mu);
+        evict_push_unlocked(ep, key, slot, seg);
     }
 
     // demote the protected LRU into probation so protected stays at its cap
@@ -1211,8 +1222,10 @@ struct llama_disk_stage::impl {
     }
 
     // a free slot, or the probation LRU's slot; protected is the fallback when
-    // probation is empty. -1 when every slot is reserved by a pending store
+    // probation is empty. -1 when every slot is reserved by a pending store.
+    // l2_mu keeps the reuse from landing on a slot l2_copy is reading
     int32_t evict_take_slot(evict_pool & ep) {
+        std::lock_guard<std::mutex> lk(l2_mu);
         if (!ep.free_slots.empty()) {
             const int32_t s = ep.free_slots.back();
             ep.free_slots.pop_back();
@@ -1258,18 +1271,6 @@ struct llama_disk_stage::impl {
         return slot;
     }
 
-    // a demotion (recently resident expert): insert into protected
-    int32_t evict_alloc_prot(int pool, int64_t key) {
-        evict_pool & ep = evict_pools[(size_t) pool];
-        const int32_t slot = evict_take_slot(ep);
-        if (slot < 0) {
-            return -1;
-        }
-        evict_push(ep, key, slot, 1);
-        evict_trim(ep);
-        return slot;
-    }
-
     // reserve a slot for an expert the worker will store into: the slot leaves
     // the free list but is not published, so no hit can read it and no eviction
     // can reuse it before the store lands. -1 when the pool has no slot to spare
@@ -1277,19 +1278,16 @@ struct llama_disk_stage::impl {
         return evict_take_slot(evict_pools[(size_t) pool]);
     }
 
-    // publish a reserved slot once its store has landed
-    void evict_finalize(int pool, int64_t key, int32_t slot) {
+    // publish a reserved slot once its store has landed. seg 1 inserts directly
+    // into protected, which is what a demotion (a recently resident expert) wants
+    void evict_finalize(int pool, int64_t key, int32_t slot, uint8_t seg = 0) {
         evict_pool & ep = evict_pools[(size_t) pool];
-        evict_push(ep, key, slot, 0);
+        evict_push(ep, key, slot, seg);
         evict_trim(ep);
     }
 
-    int32_t evict_put(int pool, int64_t key) {
-        const int32_t slot = evict_touch(pool, key);
-        return slot >= 0 ? slot : evict_alloc_prot(pool, key);
-    }
-
     void evict_remove(int pool, int64_t key) {
+        std::lock_guard<std::mutex> lk(l2_mu);
         evict_pool & ep = evict_pools[(size_t) pool];
         const auto it = ep.slot_of.find(key);
         if (it == ep.slot_of.end()) {
@@ -1334,6 +1332,9 @@ struct llama_disk_stage::impl {
     // the dedicated perm_buf and prefill never writes them, so their entries and
     // tables must stay valid across the staging-slab reuse
     void evict_clear_transient() {
+        // exclude the VRAM upload worker's l2_copy: it reads slot_of and the slot
+        // bytes, which the clear below drops
+        std::lock_guard<std::mutex> lk(l2_mu);
         for (evict_pool & ep : evict_pools) {
             if (!ep.permanent) {
                 evict_clear_pool(ep);
@@ -5215,18 +5216,24 @@ void llama_disk_stage::resident_remove(int il, int32_t id, bool keep_l2) {
     if (keep_l2 && epid >= 0 && c.resident_filled[id] != 0) {
         impl::evict_pool & ep = p.evict_pools[(size_t) epid];
         const int64_t      key = ((int64_t) il << 32) | (uint32_t) id;
-        const int32_t      eslot = p.evict_put(epid, key);
-        if (eslot >= 0) {
-            for (int r = 0; r < 3; ++r) {
-                const size_t len = p.layer_regions[il][r].stride;
-                if (len == 0) {
-                    continue;
+        // only demote when the expert is not already in the L2: the bytes are the
+        // same, and the copy must land in a reserved (unpublished) slot so the
+        // VRAM upload worker's l2_copy can never read a half-written one
+        if (p.evict_touch(epid, key) < 0) {
+            const int32_t eslot = p.evict_reserve(epid);
+            if (eslot >= 0) {
+                for (int r = 0; r < 3; ++r) {
+                    const size_t len = p.layer_regions[il][r].stride;
+                    if (len == 0) {
+                        continue;
+                    }
+                    std::memcpy(ep.data[r] + (size_t) eslot * ep.stride[r],
+                                pool.data[r] + (size_t) slot * pool.slot_stride[r], len);
                 }
-                std::memcpy(ep.data[r] + (size_t) eslot * ep.stride[r],
-                            pool.data[r] + (size_t) slot * pool.slot_stride[r], len);
+                p.evict_finalize(epid, key, eslot, /*seg =*/ 1);  // demotions enter protected
+                p.n_l2_demotions++;
+                p.evict_populated = true;
             }
-            p.n_l2_demotions++;
-            p.evict_populated = true;
         }
     }
 
@@ -5312,6 +5319,71 @@ bool llama_disk_stage::resident_copy(int il, int32_t id, const size_t sz[3], voi
             return false;  // caller buffer too small for this role
         }
         std::memcpy(out + off, pool.data[role] + (size_t) slot * pool.slot_stride[role], len);
+        off += len;
+    }
+    return true;
+#else
+    GGML_UNUSED(il);
+    GGML_UNUSED(id);
+    GGML_UNUSED(sz);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(dst_cap);
+    return false;
+#endif
+}
+
+bool llama_disk_stage::l2_present(int il, int32_t id) const {
+#if defined(_WIN32)
+    impl & p = *pimpl;
+    if (!p.active || il < 0 || il >= (int) p.cache.size()) {
+        return false;
+    }
+    const int epid = p.evict_pool_for(il);
+    if (epid < 0 || id < 0) {
+        return false;
+    }
+    return p.evict_has(epid, ((int64_t) il << 32) | (uint32_t) id);
+#else
+    GGML_UNUSED(il);
+    GGML_UNUSED(id);
+    return false;
+#endif
+}
+
+bool llama_disk_stage::l2_copy(int il, int32_t id, const size_t sz[3], void * dst, size_t dst_cap) {
+#if defined(_WIN32)
+    impl & p = *pimpl;
+    if (!p.active || il < 0 || il >= (int) p.cache.size() || dst == nullptr) {
+        return false;
+    }
+    const int epid = p.evict_pool_for(il);
+    if (epid < 0 || id < 0) {
+        return false;
+    }
+    impl::evict_pool & ep = p.evict_pools[(size_t) epid];
+    const int64_t key = ((int64_t) il << 32) | (uint32_t) id;
+
+    // hold l2_mu across the copy: the decode thread reuses a slot (evict_take_slot)
+    // only while holding it, so the bytes cannot be overwritten mid-copy. This
+    // runs on the VRAM upload worker, the only other reader of the L2
+    std::lock_guard<std::mutex> lk(p.l2_mu);
+    const auto it = ep.slot_of.find(key);
+    if (it == ep.slot_of.end()) {
+        return false;
+    }
+    const int32_t slot = it->second;
+
+    size_t off = 0;
+    char * out = (char *) dst;
+    for (int role = 0; role < 3; ++role) {
+        const size_t len = p.layer_regions[il][role].stride;
+        if (len == 0 || ep.stride[role] == 0) {
+            continue;
+        }
+        if (len > sz[role] || off + len > dst_cap) {
+            return false;
+        }
+        std::memcpy(out + off, ep.data[role] + (size_t) slot * ep.stride[role], len);
         off += len;
     }
     return true;

@@ -479,6 +479,14 @@ extern "C" {
         float    n_moe_cache_drift_percent;// rebuild the per-layer layout when its slot counts drift more than
                                            // this percent from the ideal composition for the current ranking
                                            // (0 = keep the layout fixed between prompt boundaries)
+        uint64_t n_moe_cache_decay_tokens; // rank the VRAM tier by its own recent routing counts, halved every N
+                                           // single-token decode tokens, instead of the shared long-term ranking,
+                                           // so a topic change re-converges the cache without churning the RAM tier
+                                           // (0 = share the long-term ranking)
+        uint64_t n_moe_cache_rebalance_tokens; // content tokens between VRAM content rebalances: the ranking
+                                           // snapshot is refreshed and the residents reconciled every N decode
+                                           // tokens, so this is the floor on how fast the VRAM set can move
+                                           // (0 = default 256)
 
         // Decode-only promotion of host-resident dense weights into the VRAM
         // reclaimed from the prefill compute buffer (the same pool the MoE expert

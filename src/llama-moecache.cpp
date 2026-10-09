@@ -28,8 +28,9 @@
 // is fed by single-token decode ubatches only, see llama-hot-experts.h)
 static constexpr uint64_t kMinProfileContentTokens = 100;
 
-// content tokens between content rebalances (each rebalance reconciles the
-// residents with the current global ranking)
+// default content tokens between content rebalances (each rebalance reconciles
+// the residents with the current global ranking). Overridable per context via
+// --moe-expert-cache-rebalance-tokens
 static constexpr uint64_t kRebalanceContentTokens = 256;
 
 // bytes shaved off the user's MoE cache base budget per failed pool allocation.
@@ -102,6 +103,7 @@ struct llama_moe_cache::impl {
     uint64_t budget_extra = 0;       // prefill compute bytes reclaimed for decode (VRAM swap)
     const int32_t  max_inserts;
     const float    drift_percent;    // 0 = keep the layout fixed between prompt rebuilds
+    const uint64_t rebalance_tokens; // content tokens between content rebalances (> 0)
     bool activated = false;
     bool activated_once = false; // a layout was built at least once (survives suspend)
     bool failed    = false;
@@ -146,10 +148,15 @@ struct llama_moe_cache::impl {
     uint64_t last_rebalance = 0;
     uint64_t n_ticks        = 0;
     uint64_t n_rebalances   = 0;
+    uint64_t n_rebuilds     = 0; // layout (re)builds after the initial activation
+    uint64_t n_drift_rebuilds = 0; // ... triggered by the drift check
     uint64_t n_resident_changes = 0;
     uint64_t n_uploads_queued   = 0;
     uint64_t n_uploads_succeeded = 0;
     uint64_t n_uploads_failed  = 0;
+    uint64_t n_uploads_ram     = 0; // sourced from a filled disk-cache RAM resident
+    uint64_t n_uploads_l2      = 0; // sourced from the disk stage's L2 pool (dio)
+    uint64_t n_target_unavailable = 0; // ranking candidates skipped: not resident and not in L2
     uint32_t n_reports        = 0;
 
     // previous report's counters, for the interval rates (see print_stats). The
@@ -250,9 +257,10 @@ struct llama_moe_cache::impl {
     }
 
     impl(const llama_model & model_, llama_hot_expert_cache * hot_,
-         uint64_t budget_, int32_t inserts_, float drift_percent_) :
+         uint64_t budget_, int32_t inserts_, float drift_percent_, uint64_t rebalance_) :
         model(model_), hot(hot_), budget_bytes(budget_), budget_base(budget_),
-        max_inserts(inserts_), drift_percent(drift_percent_), layer_idx(model_.layers.size(), -1) {}
+        max_inserts(inserts_), drift_percent(drift_percent_), rebalance_tokens(rebalance_),
+        layer_idx(model_.layers.size(), -1) {}
 
     // allocate the device pool for the current budget. On failure shave 25 MiB
     // off the base budget and retry, so a busy device both keeps the cache
@@ -384,6 +392,7 @@ bool llama_moe_cache::fill_upload_queue(llama_moe_cache::impl * p) {
         size_t  li_job   = 0;
         int32_t e_job    = -1;
         int32_t slot_job = -1;
+        bool    from_l2  = false;
         std::shared_ptr<std::vector<char>> snap;
 
         // reserve a free slot and take the next candidate under p->mtx
@@ -432,12 +441,18 @@ bool llama_moe_cache::fill_upload_queue(llama_moe_cache::impl * p) {
                 }
             }
             snap = std::make_shared<std::vector<char>>(total);
+            // source of the upload: the disk decode cache's filled RAM slot, or,
+            // when the recent target is not a resident (the RAM pool is full on a
+            // topic change), the L2 pool where the recently routed experts live
             if (!p->disk->resident_copy(ls.pub.il, e_job, sz, snap->data(), total)) {
-                // no longer a filled RAM resident: free the slot again
-                std::lock_guard<std::mutex> lk(p->mtx);
-                ls.slot_target[slot_job] = -1;
-                p->n_used_slots--;
-                continue;
+                if (!p->disk->l2_copy(ls.pub.il, e_job, sz, snap->data(), total)) {
+                    // source gone (evicted from both): free the slot again
+                    std::lock_guard<std::mutex> lk(p->mtx);
+                    ls.slot_target[slot_job] = -1;
+                    p->n_used_slots--;
+                    continue;
+                }
+                from_l2 = true;
             }
         }
 
@@ -453,6 +468,11 @@ bool llama_moe_cache::fill_upload_queue(llama_moe_cache::impl * p) {
             }
             p->todo.push_back({ li_job, e_job, slot_job, false, std::move(snap) });
             p->n_uploads_queued++;
+            if (from_l2) {
+                p->n_uploads_l2++;
+            } else {
+                p->n_uploads_ram++;
+            }
         }
         any = true;
         room--;
@@ -462,15 +482,19 @@ bool llama_moe_cache::fill_upload_queue(llama_moe_cache::impl * p) {
 }
 
 llama_moe_cache::llama_moe_cache(const llama_model & model, llama_hot_expert_cache * hot,
-                                 uint64_t budget_bytes, int32_t max_inserts, float drift_percent) {
+                                 uint64_t budget_bytes, int32_t max_inserts, float drift_percent,
+                                 uint64_t rebalance_tokens) {
     if (hot == nullptr || budget_bytes == 0) {
         return; // disabled (missing ranking source or no capacity requested)
     }
     if (max_inserts <= 0) {
         max_inserts = 2;
     }
+    if (rebalance_tokens == 0) {
+        rebalance_tokens = kRebalanceContentTokens;
+    }
 
-    pimpl = std::make_unique<impl>(model, hot, budget_bytes, max_inserts, drift_percent);
+    pimpl = std::make_unique<impl>(model, hot, budget_bytes, max_inserts, drift_percent, rebalance_tokens);
 }
 
 llama_moe_cache::~llama_moe_cache() {
@@ -1095,6 +1119,9 @@ void llama_moe_cache::activate(bool relayout) {
     // decode graph rebuild on the same ubatch (the initial activation also
     // flips the moe_cache pointer in the graph params from null to non-null)
     p->layout_gen++;
+    if (relayout) {
+        p->n_rebuilds++;
+    }
 
     // one (re)build per prompt: anchor the epoch so this prompt does not rebuild
     // again; the next on_prompt_begin() re-arms it at the following boundary
@@ -1398,9 +1425,13 @@ bool llama_moe_cache::apply_target() {
                     if ((int32_t) d.size() >= n_slots) {
                         break;
                     }
-                    // keep it if VRAM already serves it, else it must be a filled
-                    // RAM resident to be uploadable now
-                    if (!ls.resident[e] && p->disk_mode && !p->disk->resident_filled(ls.pub.il, e)) {
+                    // keep it if VRAM already serves it; else it must be uploadable
+                    // now: a filled RAM resident, or (dio) present in the disk
+                    // stage's L2 pool, which the upload worker sources as a fallback
+                    if (!ls.resident[e] && p->disk_mode &&
+                            !p->disk->resident_filled(ls.pub.il, e) &&
+                            !p->disk->l2_present(ls.pub.il, e)) {
+                        p->n_target_unavailable++;
                         continue;
                     }
                     d.push_back(e);
@@ -1453,8 +1484,10 @@ bool llama_moe_cache::apply_target() {
                 if (p->inflight_mark[(size_t) e] == stamp) {
                     continue; // upload already in flight
                 }
-                if (p->disk_mode && !p->disk->resident_filled(ls.pub.il, e)) {
-                    continue; // lost its RAM slot since the target was built
+                if (p->disk_mode && !p->disk->resident_filled(ls.pub.il, e) &&
+                        !p->disk->l2_present(ls.pub.il, e)) {
+                    p->n_target_unavailable++;
+                    continue; // lost both its RAM slot and its L2 copy
                 }
                 ls.pending_q.push_back(e);
                 queued = true;
@@ -1556,7 +1589,7 @@ void llama_moe_cache::tick(int64_t n_content_tokens) {
     //    rebalances internally) instead of just realigning the content, so the
     //    two do not upload twice
     bool queued = false;
-    if (p->n_content - p->last_rebalance >= kRebalanceContentTokens) {
+    if (p->n_content - p->last_rebalance >= p->rebalance_tokens) {
         p->last_rebalance = p->n_content;
         if (p->drift_percent > 0.0f && p->epoch_rebuilt) {
             const float drift = layout_drift();
@@ -1566,6 +1599,7 @@ void llama_moe_cache::tick(int64_t n_content_tokens) {
             } else if (drift * 100.0f > p->drift_percent) {
                 LLAMA_LOG_INFO("%s: MoE expert cache layout drift %.1f%% > %.1f%% - rebuilding the layout\n",
                         __func__, drift * 100.0f, p->drift_percent);
+                p->n_drift_rebuilds++;
                 activate(/*relayout =*/ true);
             } else {
                 LLAMA_LOG_INFO("%s: MoE expert cache layout drift %.1f%% <= %.1f%% - keeping the layout\n",
@@ -1613,10 +1647,15 @@ void llama_moe_cache::print_stats() {
     size_t   n_new         = 0;  // residents that arrived since the previous report
     uint64_t n_ticks       = 0;
     uint64_t n_rebalances  = 0;
+    uint64_t n_rebuilds    = 0;
+    uint64_t n_drift_rebuilds = 0;
     uint64_t n_changes     = 0;
     uint64_t n_queued      = 0;
     uint64_t n_served      = 0;
     uint64_t n_failed      = 0;
+    uint64_t n_ram         = 0;
+    uint64_t n_l2          = 0;
+    uint64_t n_unavail     = 0;
     uint32_t n_reports     = 0;
     uint64_t budget_bytes  = 0;
     uint64_t pool_bytes    = 0;
@@ -1630,10 +1669,15 @@ void llama_moe_cache::print_stats() {
 
         n_ticks         = p->n_ticks;
         n_rebalances    = p->n_rebalances;
+        n_rebuilds      = p->n_rebuilds;
+        n_drift_rebuilds = p->n_drift_rebuilds;
         n_changes       = p->n_resident_changes;
         n_queued        = p->n_uploads_queued;
         n_served        = p->n_uploads_succeeded;
         n_failed        = p->n_uploads_failed;
+        n_ram           = p->n_uploads_ram;
+        n_l2            = p->n_uploads_l2;
+        n_unavail       = p->n_target_unavailable;
         n_reports       = p->n_reports;
         budget_bytes    = p->budget_bytes;
         n_layers_total  = 0;
@@ -1761,12 +1805,22 @@ void llama_moe_cache::print_stats() {
          d_total ? 100.0 * d_hit / d_total : 0.0, d_hit, d_total);
 
     line("  churn    : %.1f%% of the residents changed (%" PRIu64 "/%zu) | %" PRIu64 " resident changes"
-         " | %" PRIu64 " rebalances",
+         " | %" PRIu64 " rebalances, %" PRIu64 " layout rebuilds (%" PRIu64 " from drift)",
          n_res_total ? 100.0 * n_new / n_res_total : 0.0, (uint64_t) n_new, n_res_total,
-         n_changes, n_rebalances);
+         n_changes, n_rebalances, n_rebuilds, n_drift_rebuilds);
 
     line("  uploads  : %" PRIu64 " queued, %" PRIu64 " served, %" PRIu64 " failed | %" PRIu64 " ticks",
          n_queued, n_served, n_failed, n_ticks);
+
+    line("  source   : %" PRIu64 " uploads from RAM residents, %" PRIu64 " from the L2 | %" PRIu64 " ranking candidates skipped (not resident, not in L2)",
+         n_ram, n_l2, n_unavail);
+
+    const uint64_t recent_window = p->hot->recent_decay_tokens();
+    if (recent_window > 0) {
+        line("  rank     : recent window, VRAM counts halved every %" PRIu64 " decode tokens", recent_window);
+    } else {
+        line("%s", "  rank     : shared long-term ranking (--moe-expert-cache-decay-tokens 0)");
+    }
 
     if (n_layers_cached > 0) {
         std::string row = "  layers   :";

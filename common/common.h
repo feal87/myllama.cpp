@@ -563,6 +563,9 @@ struct common_params {
     uint64_t n_moe_cache_budget_mib = 0;   // total device memory to reserve up-front for the cache, in MiB (0 = no cap)
     int32_t  n_moe_cache_inserts    = 2;   // max expert uploads queued to the upload worker at once, across all cached layers
     float    n_moe_cache_drift_percent = 0.0f; // rebuild the layout when it drifts more than this percent from the ideal composition (0 = disabled)
+    uint64_t n_moe_cache_decay_tokens = 0; // VRAM tier ranks by its own recent routing counts halved every N decode
+                                           // tokens, instead of the shared long-term ranking (0 = shared ranking)
+    uint64_t n_moe_cache_rebalance_tokens = 256; // content tokens between VRAM content rebalances (0 = default 256)
 
     // decode-only promotion of host-resident dense weights into the VRAM the MoE
     // cache reclaims from the prefill compute buffer. Comma-separated std::regex

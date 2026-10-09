@@ -163,6 +163,8 @@ llama_context::llama_context(
     cparams.n_moe_cache_budget_bytes = params.n_moe_cache_budget_bytes;
     cparams.n_moe_cache_inserts      = params.n_moe_cache_inserts;
     cparams.n_moe_cache_drift_percent = params.n_moe_cache_drift_percent;
+    cparams.n_moe_cache_decay_tokens  = params.n_moe_cache_decay_tokens;
+    cparams.n_moe_cache_rebalance_tokens = params.n_moe_cache_rebalance_tokens;
     cparams.hot_experts_prefetch     = params.hot_experts_prefetch;
     cparams.disk_stage_sparse_max    = params.disk_stage_sparse_max;
     cparams.disk_stage_drop_fraction  = params.disk_stage_drop_fraction;
@@ -290,7 +292,7 @@ llama_context::llama_context(
                                                         : cparams.n_pin_hot_experts;
             hot_experts = std::make_unique<llama_hot_expert_cache>(
                 model, n_pin_effective, cparams.n_pin_hot_experts_budget_bytes,
-                cparams.n_pin_hot_experts_decay_tokens, cparams.n_pin_hot_experts_prompt_decay,
+                cparams.n_pin_hot_experts_decay_tokens, cparams.n_moe_cache_decay_tokens, cparams.n_pin_hot_experts_prompt_decay,
                 cparams.n_pin_hot_experts_min_count,
                 cparams.hot_experts_prefetch,
                 cparams.n_pin_hot_experts > 0 || moe_requested || disk_active || cparams.expert_profile_path != nullptr,
@@ -327,7 +329,8 @@ llama_context::llama_context(
             // (maybe_activate).
             moe_cache = std::make_unique<llama_moe_cache>(
                 model, hot_experts.get(), cparams.n_moe_cache_budget_bytes,
-                cparams.n_moe_cache_inserts, cparams.n_moe_cache_drift_percent);
+                cparams.n_moe_cache_inserts, cparams.n_moe_cache_drift_percent,
+                cparams.n_moe_cache_rebalance_tokens);
             if (moe_cache && disk_stage != nullptr) {
                 moe_cache->set_disk_stage(disk_stage.get());
             }
@@ -5216,6 +5219,8 @@ llama_context_params llama_context_default_params() {
         /*.n_moe_cache_budget_bytes    =*/ 0,
         /*.n_moe_cache_inserts         =*/ 2,
         /*.n_moe_cache_drift_percent   =*/ 0.0f,
+        /*.n_moe_cache_decay_tokens    =*/ 0,
+        /*.n_moe_cache_rebalance_tokens =*/ 256,
         /*.dense_vram_tensors          =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,

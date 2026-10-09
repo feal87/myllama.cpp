@@ -103,6 +103,10 @@ class llama_hot_expert_cache {
     // budget_bytes:      hard cap on total bytes locked across ALL layers combined (0 = unlimited, NOT recommended)
     // decay_interval:    halve all usage counts every N decode tokens (0 = disabled, lifetime
     //                    counts); prefill tokens neither count nor age the ranking
+    // recent_decay_interval: halve a SECOND, VRAM-only count table every N decode tokens
+    //                    (0 = no recent table). The VRAM MoE tier ranks from it (see
+    //                    llama_moe_cache), so it can track a topic change while the RAM pin
+    //                    set keeps the long-term counts
     // prompt_decay:      divide all usage counts by N at every prompt boundary
     //                    (<= 1 = keep the counts across prompts)
     // min_pin_count:     usage-count floor below which an expert is never mlock'd: a one-off
@@ -124,6 +128,7 @@ class llama_hot_expert_cache {
                            int32_t             n_pin_experts,
                            uint64_t            budget_bytes,
                            uint64_t            decay_interval,
+                           uint64_t            recent_decay_interval,
                            uint64_t            prompt_decay,
                            uint64_t            min_pin_count,
                            bool                prefetch_enabled,
@@ -192,6 +197,10 @@ class llama_hot_expert_cache {
     // decode tokens observed (single-token ubatches only; prefill ubatches do
     // not feed the ranking and do not advance its clock)
     uint64_t content_tokens() const;
+
+    // length of the VRAM-only recent window in decode tokens (0 = the VRAM tier
+    // shares the long-term ranking). Only for the VRAM tier's stats report
+    uint64_t recent_decay_tokens() const;
 
     // The experts currently served from VRAM are reported through this query so
     // the RAM tier skips them (and prefetches nothing for them). The callback
@@ -318,6 +327,10 @@ class llama_hot_expert_cache {
         uint32_t n_experts = 0;
         // per-expert usage count, indexed by expert id (hot path of the ranking)
         std::vector<uint64_t> counts;
+        // VRAM-only recent usage count (empty when recent_decay_interval == 0): the
+        // VRAM tier ranks from this one so it tracks the recent routing mix while
+        // the RAM tier keeps the long-term `counts`
+        std::vector<uint64_t> recent_counts;
         // non-decaying decode-only counts for the optional profile export
         std::vector<uint64_t> profile_counts;
         // per-expert pin bookkeeping mirror, indexed by expert id: bit 0 =
@@ -499,6 +512,11 @@ class llama_hot_expert_cache {
     // halve all usage counts (and the rank keys of the pinned entries)
     void decay_counts();
 
+    // halve the recent-only counts; they are not ranked by an ordered set, so no
+    // rebuild is needed. Floors at 0, so a stale expert drops out of the ranking
+    // instead of lingering at 1 the way the long-term counts do
+    void decay_recent_counts();
+
     // write and reset the current decode profile
     void write_profile();
 
@@ -517,6 +535,7 @@ class llama_hot_expert_cache {
     std::vector<int32_t> n_pinned_layer; // residents per layer (disk cache path)
     const uint64_t budget_bytes;     // 0 = unlimited
     const uint64_t decay_interval;   // 0 = lifetime counts (no aging)
+    const uint64_t recent_decay_interval; // 0 = no VRAM-only recent ranking
     const uint64_t prompt_decay;     // count divisor at every prompt start (<= 1 = off)
     const uint64_t min_pin_count;    // usage-count floor for pinning (0 = any routed expert)
     const bool     prefetch_enabled; // read-ahead routed-but-unpinned expert rows (--hot-experts-prefetch)
@@ -528,6 +547,8 @@ class llama_hot_expert_cache {
     uint64_t       profile_tokens = 0;
     uint64_t       profile_routes = 0;
     uint64_t       n_tokens_seen = 0;  // tokens since the last decay
+    uint64_t       n_recent_tokens = 0; // tokens since the last recent-count decay
+    uint64_t       n_recent_decays = 0; // recent-count halvings (stats)
     int64_t        n_tokens_cur  = 0;  // tokens of the ubatch being computed (ask-phase gate)
     // per-observation scratch, reused instead of per-call allocation: observation
     // runs once per layer per ubatch on the compute thread, so nothing here is

@@ -18,6 +18,7 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
                                                int32_t             n_pin_experts,
                                                uint64_t            budget_bytes,
                                                uint64_t            decay_interval,
+                                               uint64_t            recent_decay_interval,
                                                uint64_t            prompt_decay,
                                                uint64_t            min_pin_count,
                                                bool                prefetch_enabled,
@@ -28,6 +29,7 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
     n_pin(n_pin_experts),
     budget_bytes(budget_bytes),
     decay_interval(decay_interval),
+    recent_decay_interval(recent_decay_interval),
     prompt_decay(prompt_decay),
     min_pin_count(min_pin_count),
     prefetch_enabled(prefetch_enabled),
@@ -119,6 +121,9 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
     if (prompt_decay > 1) {
         LLAMA_LOG_INFO("%s: dividing all usage counts by %" PRIu64 " at every prompt start\n", __func__, prompt_decay);
     }
+    if (recent_decay_interval > 0) {
+        LLAMA_LOG_INFO("%s: VRAM tier ranks by recent routing, halved every %" PRIu64 " decode tokens\n", __func__, recent_decay_interval);
+    }
 
 }
 
@@ -190,6 +195,7 @@ void llama_hot_expert_cache::print_stats(bool final_report, uint64_t ram_hit, ui
     uint64_t prev_routed         = 0;
     uint64_t n_reserved          = 0;
     uint64_t n_prompt_decays     = 0;
+    uint64_t recent_decays       = 0;
     size_t   n_inflight          = 0;
     size_t   n_queued            = 0;
     size_t   n_held_unfilled     = 0;
@@ -235,6 +241,7 @@ void llama_hot_expert_cache::print_stats(bool final_report, uint64_t ram_hit, ui
         prev_routed         = ram_total > 0 ? prev_ext_total : prev_routed_total;
         n_reserved          = n_bytes_reserved;
         n_prompt_decays     = n_decays_prompt;
+        recent_decays       = n_recent_decays;
         base_count          = n_base;
         base_switches       = n_base_switches;
         base_admitted       = n_base_admitted;
@@ -378,8 +385,8 @@ void llama_hot_expert_cache::print_stats(bool final_report, uint64_t ram_hit, ui
 
     const std::string window     = decay_interval > 0 ? "every " + std::to_string(decay_interval) + " tokens" : "off";
     const std::string divisor    = prompt_decay > 1 ? std::to_string(prompt_decay) : "off (1)";
-    line("  decays   : %" PRIu64 " total, %" PRIu64 " periodic (%s), %" PRIu64 " at prompt start (divisor %s)",
-         decays, decays - n_prompt_decays, window.c_str(), n_prompt_decays, divisor.c_str());
+    line("  decays   : %" PRIu64 " total, %" PRIu64 " periodic (%s), %" PRIu64 " at prompt start (divisor %s), %" PRIu64 " recent",
+         decays, decays - n_prompt_decays, window.c_str(), n_prompt_decays, divisor.c_str(), recent_decays);
 
     // base set feedback: how much of the decode routing the base experts serve and
     // how many of them were ever routed (a large gap to n_base means dead weight)
@@ -767,6 +774,7 @@ void llama_hot_expert_cache::observe_decode_finish() {
         // flat per-expert tables, indexed by routed expert id
         const int   n_experts = (int) ls.n_experts;
         uint64_t *  counts    = ls.counts.data();
+        uint64_t *  recent_counts = ls.recent_counts.empty() ? nullptr : ls.recent_counts.data();
         uint64_t *  profile_counts = profile_file != nullptr ? ls.profile_counts.data() : nullptr;
         uint8_t *   pin_state = ls.pin_state.data();
 
@@ -807,6 +815,9 @@ void llama_hot_expert_cache::observe_decode_finish() {
                 n_distinct++;  // first route of this (layer, expert)
             }
             c++;
+            if (recent_counts != nullptr) {
+                recent_counts[id]++;
+            }
             if (profile_counts != nullptr) {
                 profile_counts[id]++;
                 profile_routes++;
@@ -849,6 +860,9 @@ void llama_hot_expert_cache::resolve_tensors(int il, layer_state & ls) {
     // expert ids are validated against this range on the hot path
     ls.n_experts = (uint32_t) repr->ne[2];
     ls.counts.assign(ls.n_experts, 0);
+    if (recent_decay_interval > 0) {
+        ls.recent_counts.assign(ls.n_experts, 0);
+    }
     if (profile_file != nullptr) {
         ls.profile_counts.assign(ls.n_experts, 0);
     }
@@ -1769,6 +1783,16 @@ void llama_hot_expert_cache::on_ubatch_begin(int64_t n_tokens) {
             decay_counts();
         }
     }
+
+    // the VRAM tier's recent window ages on its own clock, independent of the
+    // long-term ranking the RAM tier keeps
+    if (recent_decay_interval > 0) {
+        n_recent_tokens += n_tokens;
+        while (n_recent_tokens >= recent_decay_interval) {
+            n_recent_tokens -= recent_decay_interval;
+            decay_recent_counts();
+        }
+    }
 }
 
 void llama_hot_expert_cache::decay_counts() {
@@ -1792,6 +1816,22 @@ void llama_hot_expert_cache::decay_counts() {
     rebuild_pinned_rank();
 
     n_decays++;
+}
+
+void llama_hot_expert_cache::decay_recent_counts() {
+    std::lock_guard<std::mutex> lock(mu);
+
+    for (size_t il = 0; il < layers.size(); ++il) {
+        auto & ls = layers[il];
+        if (!ls.resolved_tensors) {
+            continue;
+        }
+        for (uint64_t & c : ls.recent_counts) {
+            c /= 2;  // floor at 0: a stale expert leaves the VRAM ranking
+        }
+    }
+
+    n_recent_decays++;
 }
 
 // JSON string escaper for the profile writer. Byte tokens detokenize to valid
@@ -1925,6 +1965,11 @@ void llama_hot_expert_cache::on_prompt_begin() {
                 c = new_count;
             }
         }
+        // the recent window is already short, but a new prompt must not carry the
+        // turn before it into the VRAM ranking either (floor at 0 so it can empty)
+        for (uint64_t & c : ls.recent_counts) {
+            c /= prompt_decay;
+        }
     }
 
     // the counts the pinned experts are ranked by changed: rebuild the ordered
@@ -2003,18 +2048,26 @@ uint64_t llama_hot_expert_cache::content_tokens() const {
     return n_content_tokens;
 }
 
+uint64_t llama_hot_expert_cache::recent_decay_tokens() const {
+    return recent_decay_interval;
+}
+
 void llama_hot_expert_cache::all_counts(std::vector<std::tuple<int, int32_t, uint64_t>> & out) const {
     std::lock_guard<std::mutex> lock(mu);
 
     out.clear();
     out.reserve(n_distinct);
+    // the VRAM tier asks through this accessor: with a recent window configured
+    // it ranks by the VRAM-only counts, so the RAM tier keeps the long-term ones
+    const bool use_recent = recent_decay_interval > 0;
     for (size_t il = 0; il < layers.size(); ++il) {
         const auto & ls = layers[il];
         if (!ls.resolved_tensors) {
             continue;
         }
+        const std::vector<uint64_t> & table = use_recent ? ls.recent_counts : ls.counts;
         for (uint32_t id = 0; id < ls.n_experts; ++id) {
-            const uint64_t c = ls.counts[(size_t) id];
+            const uint64_t c = table[(size_t) id];
             if (c > 0) {
                 out.emplace_back((int) il, (int32_t) id, c);
             }
@@ -2037,13 +2090,17 @@ int32_t llama_hot_expert_cache::assign_global_capacity(uint64_t budget_bytes,
     // its first slot is granted, so the final layout always fits the budget.
     std::vector<std::tuple<uint64_t, int, int32_t>> all;
     all.reserve(n_distinct);
+    // a recent window ranks the VRAM layout by the VRAM-only counts (see
+    // all_counts): the long-term table keeps driving the RAM/disk tier
+    const bool use_recent = recent_decay_interval > 0;
     for (size_t il = 0; il < layers.size(); ++il) {
         const auto & ls = layers[il];
         if (!ls.resolved_tensors) {
             continue;
         }
+        const std::vector<uint64_t> & table = use_recent ? ls.recent_counts : ls.counts;
         for (uint32_t id = 0; id < ls.n_experts; ++id) {
-            const uint64_t c = ls.counts[(size_t) id];
+            const uint64_t c = table[(size_t) id];
             if (c > 0) {
                 all.emplace_back(c, (int) il, (int32_t) id);
             }
