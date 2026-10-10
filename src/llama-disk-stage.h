@@ -180,6 +180,11 @@ public:
     // read once its contents changed
     void evict_invalidate();
 
+    // tells the stage which side of the VRAM swap is active. While prefilling,
+    // the external L2 pools alias the decode-promoted dense weights, so no L2
+    // write may target them (see resident_remove)
+    void set_prefill(bool prefill);
+
     // the graph records, per layer, whether it emitted a cold pass for it. The The
     // decode fill consults this to pick the split or the synchronous path, so a
     // layer without a cold pass never hands a batch to the worker

@@ -710,10 +710,12 @@ struct llama_disk_stage::impl {
         // permanent pools are backed by the dedicated --disk-stage-l2-permanent-mib
         // buffer and are NOT cleared when a prefill reuses the staging slabs
         bool     permanent = false;
+        bool     external  = false; // pool is laid over the decode-promoted dense host memory
     };
     std::vector<evict_pool> evict_pools;
     std::vector<int>        evict_pool_id;    // layer -> pool, -1 when not pooled
     bool                    evict_populated = false; // pools hold entries a prefill would clobber
+    bool                    prefill_mode    = true;  // external pools alias dense weights, no writes allowed
 
     // per-layer expert -> L2 slot table the graph remaps through, plus the public
     // view. The pool's weight tensors are shared; only the table is per layer
@@ -734,6 +736,7 @@ struct llama_disk_stage::impl {
         ggml_backend_buffer_t buf;
         char *  base;
         size_t  size;
+        bool    external = false; // dense host memory (decode-promoted weights)
     };
     std::vector<ggml_backend_buffer_t> extra_l2_bufs; // wrapped external regions, freed with the stage
     // dedicated, mlocked backing for the permanent L2 pools. Allocated once and
@@ -3010,7 +3013,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                 // the L2 tensors as weights and keeps them on the host
                                 ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
                                 p.extra_l2_bufs.push_back(buf);
-                                l2_regions.push_back({ buf, (char *) r.first, r.second });
+                                l2_regions.push_back({ buf, (char *) r.first, r.second, true });
                             }
 
                             // group the stageable layers by expert-bundle type: a
@@ -3215,6 +3218,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                 impl::evict_pool ep;
                                 ep.cap       = cap;
                                 ep.permanent = g < region_permanent.size() && region_permanent[g] != 0;
+                                ep.external  = reg.external;
                                 ep.sentinel  = cap - 1; // never filled, skipped by the graph
                                 // protected gets three quarters: one-shot misses
                                 // enter probation and cannot displace a re-read
@@ -4792,6 +4796,10 @@ void llama_disk_stage::evict_invalidate() {
     p.evict_invalidate();
 }
 
+void llama_disk_stage::set_prefill(bool prefill) {
+    pimpl->prefill_mode = prefill;
+}
+
 void llama_disk_stage::fill_cache_begin(int il, const int32_t * ids, int64_t n_ids, const float * probs) {
 #if defined(_WIN32)
     impl & p = *pimpl;
@@ -5213,7 +5221,13 @@ void llama_disk_stage::resident_remove(int il, int32_t id, bool keep_l2) {
     // resident is a recent-hot expert, so it is the best pool candidate. A slot
     // that was never filled holds no valid data, so skip it
     const int epid = p.evict_pool_for(il);
-    if (keep_l2 && epid >= 0 && c.resident_filled[id] != 0) {
+    // the external pools are laid over the decode-promoted dense weights, so
+    // during prefill those bytes are weights again: writing a demoted expert into
+    // them would corrupt the model. The transient pools are cleared at the start
+    // of every prefill anyway, so the demotion is pointless while prefilling
+    const bool demote_l2 = keep_l2 && epid >= 0 && c.resident_filled[id] != 0 &&
+            !(p.prefill_mode && p.evict_pools[(size_t) epid].external);
+    if (demote_l2) {
         impl::evict_pool & ep = p.evict_pools[(size_t) epid];
         const int64_t      key = ((int64_t) il << 32) | (uint32_t) id;
         // only demote when the expert is not already in the L2: the bytes are the

@@ -4843,6 +4843,11 @@ void llama_context::vram_swap(bool to_prefill) {
     synchronize();
 
     if (to_prefill) {
+        // from here on the dense host regions are weights again, so no L2 write
+        // may target an external pool
+        if (disk_stage) {
+            disk_stage->set_prefill(true);
+        }
         // decode -> prefill: hand the VRAM back to the compute buffers. Restore
         // the dense host originals first so the prefill graph builds against the
         // CPU copies (and the device pool is released before the compute buffers
@@ -4912,6 +4917,9 @@ void llama_context::vram_swap(bool to_prefill) {
             moe_cache->resume_base();
         } else {
             moe_cache->resume();
+        }
+        if (disk_stage) {
+            disk_stage->set_prefill(false);
         }
         vram_prefill_mode = false;
     }
