@@ -976,8 +976,10 @@ struct llama_disk_stage::impl {
     static constexpr int sim_ref_p = 3;  // report reference P = 16
     static constexpr int sim_ref_s = 5;  // report reference S = 0.75
     uint64_t sim_cold      = 0;
-    uint64_t sim_fired[sim_n_p][sim_n_s] = {}; // in-window and resident
-    uint64_t sim_open[sim_n_p][sim_n_s]  = {}; // in-window, residency ignored
+    uint64_t sim_fired[sim_n_p][sim_n_s] = {};  // in-window and resident
+    uint64_t sim_usable[sim_n_p][sim_n_s] = {}; // in-window and resident or L2
+    uint64_t sim_open[sim_n_p][sim_n_s]  = {};  // in-window, residency ignored
+    uint64_t sim_vram[sim_n_p][sim_n_s]  = {};  // in-window vram, and no usable spare
     uint64_t sim_top_fired = 0;
     uint64_t sim_ref_n     = 0;
     double   sim_ref_loss  = 0.0;
@@ -2165,8 +2167,10 @@ void llama_disk_stage::print_calibration() {
             }
         };
         sim_table("subst sim resident (% of cold, spare resident)", p.sim_fired);
+        sim_table("subst sim usable   (% of cold, resident or L2 spare)", p.sim_usable);
         sim_table("subst sim open     (% of cold, spare may be cold)", p.sim_open);
-        out += "               (window [S, 1/S] of the cold score; open - resident = ranking headroom)\n";
+        sim_table("subst sim vram     (% of cold, no usable spare, vram one)", p.sim_vram);
+        out += "               (window [S, 1/S] of the cold score; open - usable = cold spares, usable - resident = L2)\n";
         // median of |c - e| / layer_mass from the histogram
         uint64_t med_bin = 0;
         {
@@ -4129,6 +4133,12 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                 (epid >= 0 && p.evict_has(epid, ((int64_t) il << 32) | (uint32_t) id));
     };
 
+    // an L2 entry can serve as a substitution spare only when the split-hot
+    // graph gave this layer an L2 pass
+    const bool l2_spare_ok = epid >= 0 && il >= 0 && il < (int) p.l2.size() &&
+            p.l2[(size_t) il].table != nullptr &&
+            il < (int) p.split_cold.size() && p.split_cold[(size_t) il] != 0;
+
     // the decode worker owns its own read queue, so it reads through the decode
     // handle when one exists
     const auto job_handle = [&p](const impl::region & r) {
@@ -4277,12 +4287,6 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                 static const int   sim_p[impl::sim_n_p] = { 2, 4, 8, 16 };
                 static const float sim_s[impl::sim_n_s] = { 0.50f, 0.55f, 0.60f, 0.65f, 0.70f,
                                                             0.75f, 0.80f, 0.85f, 0.90f, 0.95f };
-                const auto spare_available = [&](int32_t sid) {
-                    // the table+keep substitution can only point at a host
-                    // resident slot, so vram and l2-only spares do not count
-                    return sid >= 0 && sid < (int32_t) c.resident_slot.size() &&
-                            c.resident_slot[sid] >= 0 && c.resident_filled[sid] != 0;
-                };
                 for (int64_t i = 0; i < n_ids; ++i) {
                     const int32_t id = ids[i];
                     if (id < 0 || id >= (int32_t) c.resident_slot.size()) {
@@ -4300,16 +4304,27 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                     // wins, not the highest overall
                     float e_res[impl::sim_n_p][impl::sim_n_s];
                     float e_open[impl::sim_n_p][impl::sim_n_s];
+                    bool  has_usable[impl::sim_n_p][impl::sim_n_s];
+                    bool  has_vram[impl::sim_n_p][impl::sim_n_s];
                     for (int pi = 0; pi < impl::sim_n_p; ++pi) {
                         for (int si = 0; si < impl::sim_n_s; ++si) {
-                            e_res[pi][si]  = -1.0f;
-                            e_open[pi][si] = -1.0f;
+                            e_res[pi][si]      = -1.0f;
+                            e_open[pi][si]     = -1.0f;
+                            has_usable[pi][si] = false;
+                            has_vram[pi][si]   = false;
                         }
                     }
                     for (int pi = 0; pi < impl::sim_n_p; ++pi) {
                         for (int k = 0; k < sim_p[pi] && k < (int) sppool.size(); ++k) {
+                            const int32_t bid = sppool[(size_t) k].second;
+                            if (bid < 0 || bid >= (int32_t) c.resident_slot.size()) {
+                                continue;
+                            }
                             const float e        = sppool[(size_t) k].first;
-                            const bool  resident = spare_available(sppool[(size_t) k].second);
+                            const bool  resident = c.resident_slot[bid] >= 0 && c.resident_filled[bid] != 0;
+                            const bool  l2       = !resident && l2_spare_ok &&
+                                    p.evict_has(epid, ((int64_t) il << 32) | (uint32_t) bid);
+                            const bool  vram     = c.vram[bid] != 0;
                             for (int si = 0; si < impl::sim_n_s; ++si) {
                                 const float s = sim_s[si];
                                 if (e > cs / s || e < s * cs) {
@@ -4321,6 +4336,12 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                                 if (resident && e_res[pi][si] < 0.0f) {
                                     e_res[pi][si] = e;
                                 }
+                                if (resident || l2) {
+                                    has_usable[pi][si] = true;
+                                }
+                                if (vram) {
+                                    has_vram[pi][si] = true;
+                                }
                             }
                         }
                     }
@@ -4331,6 +4352,11 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                             }
                             if (e_res[pi][si] >= 0.0f) {
                                 p.sim_fired[pi][si]++;
+                            }
+                            if (has_usable[pi][si]) {
+                                p.sim_usable[pi][si]++;
+                            } else if (has_vram[pi][si]) {
+                                p.sim_vram[pi][si]++;
                             }
                         }
                     }
@@ -4380,13 +4406,6 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
             subst_scale.assign((size_t) n_ids, 1.0f);
             subst_used.clear();
             double layer_subst_mass = 0.0;
-            // an L2 entry is a usable spare too: its bytes are already local, so
-            // pointing the cold id at its slot saves the read like a resident
-            // spare does. Only layers whose split-hot graph has an L2 pass can
-            // consume the remap
-            const bool l2_spare_ok = epid >= 0 && il >= 0 && il < (int) p.l2.size() &&
-                    p.l2[(size_t) il].table != nullptr &&
-                    il < (int) p.split_cold.size() && p.split_cold[(size_t) il] != 0;
             if (p.substitute_enabled() && !sppool.empty()) {
                 const bool   layer_cap    = p.drop_max_mass > 0.0f;
                 const double layer_budget = (double) p.drop_max_mass * layer_mass;
