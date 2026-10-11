@@ -769,6 +769,7 @@ struct llama_disk_stage::impl {
     uint64_t n_dropped_routes = 0;
     uint64_t n_dropped_bytes  = 0;
     uint64_t n_subst_routes   = 0;
+    uint64_t n_subst_l2_routes = 0;
     uint64_t n_subst_bytes    = 0;
     double   n_routed_mass    = 0.0;
     double   n_cold_mass      = 0.0;
@@ -835,6 +836,7 @@ struct llama_disk_stage::impl {
     // substitution decision of the current fill, per routed position
     std::vector<uint8_t>                 fs_subst;
     std::vector<int32_t>                 fs_subst_slot;
+    std::vector<uint8_t>                 fs_subst_l2;   // 1 = the slot is an L2 slot
     std::vector<float>                   fs_subst_scale;
     std::vector<int32_t>                 fs_subst_used;
     std::vector<pool_copy>               fs_res_fills;    // L2 slot -> resident slot promotion, after the disk batch
@@ -963,16 +965,19 @@ struct llama_disk_stage::impl {
     std::vector<double>    probe_rel_mass = std::vector<double>(probe_n_rel, 0.0);
 
     // substitution simulation (--disk-stage-drop-probe): for each cold routed
-    // selection, whether a resident spare just outside the top-k is close enough
-    // in score to take its place. P is the number of non-selected experts
-    // considered by score, S the spare score floor relative to the cold expert.
-    // Accounting only, nothing is substituted
-    static constexpr int sim_n_p   = 3; // P = 2, 4, 8
-    static constexpr int sim_n_s   = 5; // S = 0.50, 0.70, 0.80, 0.90, 0.95
-    static constexpr int sim_ref_p = 1; // report reference P = 4
-    static constexpr int sim_ref_s = 3; // report reference S = 0.90
+    // selection, whether a spare just outside the top-k is close enough in score
+    // to take its place. P is the number of non-selected experts considered by
+    // score, S the spare score floor relative to the cold expert. sim_fired
+    // requires the spare to be resident (what the table+keep substitution can use
+    // now); sim_open ignores residency and is the ceiling any ranking could get
+    // to. Accounting only, nothing is substituted
+    static constexpr int sim_n_p   = 4;  // P = 2, 4, 8, 16
+    static constexpr int sim_n_s   = 10; // S = 0.50 .. 0.95, step 0.05
+    static constexpr int sim_ref_p = 3;  // report reference P = 16
+    static constexpr int sim_ref_s = 5;  // report reference S = 0.75
     uint64_t sim_cold      = 0;
-    uint64_t sim_fired[sim_n_p][sim_n_s] = {};
+    uint64_t sim_fired[sim_n_p][sim_n_s] = {}; // in-window and resident
+    uint64_t sim_open[sim_n_p][sim_n_s]  = {}; // in-window, residency ignored
     uint64_t sim_top_fired = 0;
     uint64_t sim_ref_n     = 0;
     double   sim_ref_loss  = 0.0;
@@ -1912,10 +1917,10 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
         line("  config    : window %.2f-%.2f, pool %d",
              (double) p.substitute_rel, 1.0 / (double) p.substitute_rel, (int) p.substitute_pool);
         line("  substituted: %.1f%% cumulative (%" PRIu64 "/%" PRIu64 ") | %.1f%% this interval (%" PRIu64 "/%" PRIu64
-             ") | %s skipped",
+             ") | %s skipped | %" PRIu64 " from L2",
              pct(p.n_subst_routes, base_sub), p.n_subst_routes, base_sub,
              pct(d_substituted, d_base_sub), d_substituted, d_base_sub,
-             report_volume(p.n_subst_bytes).c_str());
+             report_volume(p.n_subst_bytes).c_str(), p.n_subst_l2_routes);
     }
     const std::string sec_sub = out.substr(s_sub);
 
@@ -2136,26 +2141,32 @@ void llama_disk_stage::print_calibration() {
     out += row_m + "\n";
 
     if (p.sim_cold > 0) {
-        static const int   sim_p[impl::sim_n_p] = { 2, 4, 8 };
-        static const float sim_s[impl::sim_n_s] = { 0.50f, 0.70f, 0.80f, 0.90f, 0.95f };
-        std::string row_s = "  subst sim :   S    ";
-        for (const float s : sim_s) {
-            snprintf(cell, sizeof(cell), "%5.2f ", (double) s);
-            row_s += cell;
-        }
-        out += row_s + "\n";
-        for (int pi = 0; pi < impl::sim_n_p; ++pi) {
-            std::string row_p;
-            snprintf(cell, sizeof(cell), "                 P=%-2d ", sim_p[pi]);
-            row_p += cell;
-            for (int si = 0; si < impl::sim_n_s; ++si) {
-                snprintf(cell, sizeof(cell), "%5.1f ",
-                        100.0 * (double) p.sim_fired[pi][si] / (double) p.sim_cold);
-                row_p += cell;
+        static const int   sim_p[impl::sim_n_p] = { 2, 4, 8, 16 };
+        static const float sim_s[impl::sim_n_s] = { 0.50f, 0.55f, 0.60f, 0.65f, 0.70f,
+                                                    0.75f, 0.80f, 0.85f, 0.90f, 0.95f };
+        const auto sim_table = [&](const char * title, const uint64_t (*tbl)[impl::sim_n_s]) {
+            out += "  ";
+            out += title;
+            out += "\n               S    ";
+            for (const float s : sim_s) {
+                snprintf(cell, sizeof(cell), "%5.2f ", (double) s);
+                out += cell;
             }
-            out += row_p + "\n";
-        }
-        out += "               (% of cold with a resident spare in [S, 1/S] of the cold score)\n";
+            out += "\n";
+            for (int pi = 0; pi < impl::sim_n_p; ++pi) {
+                snprintf(cell, sizeof(cell), "               P=%-2d ", sim_p[pi]);
+                out += cell;
+                for (int si = 0; si < impl::sim_n_s; ++si) {
+                    snprintf(cell, sizeof(cell), "%5.1f ",
+                            100.0 * (double) tbl[pi][si] / (double) p.sim_cold);
+                    out += cell;
+                }
+                out += "\n";
+            }
+        };
+        sim_table("subst sim resident (% of cold, spare resident)", p.sim_fired);
+        sim_table("subst sim open     (% of cold, spare may be cold)", p.sim_open);
+        out += "               (window [S, 1/S] of the cold score; open - resident = ranking headroom)\n";
         // median of |c - e| / layer_mass from the histogram
         uint64_t med_bin = 0;
         {
@@ -2171,8 +2182,9 @@ void llama_disk_stage::print_calibration() {
             }
         }
         const double med_pct = 100.0 * ((double) med_bin + 0.5) / (double) impl::sim_rel_bins * impl::sim_rel_max;
-        line("  subst cost: fires (S=0.90, P=4) %" PRIu64 " of %" PRIu64 " cold | spare weaker %.1f%%, stronger/equal %.1f%%"
+        line("  subst cost: fires (S=%.2f, P=%d) %" PRIu64 " of %" PRIu64 " cold | spare weaker %.1f%%, stronger/equal %.1f%%"
              " | top-expert substitutions %" PRIu64 " | %s of reads avoidable",
+             (double) sim_s[impl::sim_ref_s], sim_p[impl::sim_ref_p],
              p.sim_ref_n, p.sim_cold,
              p.sim_ref_n ? 100.0 * (double) p.sim_ref_weaker / (double) p.sim_ref_n : 0.0,
              p.sim_ref_n ? 100.0 * (double) p.sim_ref_stronger / (double) p.sim_ref_n : 0.0,
@@ -4166,6 +4178,7 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
         std::vector<uint8_t> & drop        = p.fs_drop;
         std::vector<uint8_t> & subst       = p.fs_subst;
         std::vector<int32_t> & subst_slot  = p.fs_subst_slot;
+        std::vector<uint8_t> & subst_l2    = p.fs_subst_l2;
         std::vector<float>   & subst_scale = p.fs_subst_scale;
         std::vector<int32_t> & subst_used  = p.fs_subst_used;
         bool drop_planned = false;
@@ -4261,8 +4274,9 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
             // resident spare from just outside the top-k come close enough in
             // score to stand in? Accounting only, the routing is untouched
             if (p.drop_probe) {
-                static const int   sim_p[impl::sim_n_p] = { 2, 4, 8 };
-                static const float sim_s[impl::sim_n_s] = { 0.50f, 0.70f, 0.80f, 0.90f, 0.95f };
+                static const int   sim_p[impl::sim_n_p] = { 2, 4, 8, 16 };
+                static const float sim_s[impl::sim_n_s] = { 0.50f, 0.55f, 0.60f, 0.65f, 0.70f,
+                                                            0.75f, 0.80f, 0.85f, 0.90f, 0.95f };
                 const auto spare_available = [&](int32_t sid) {
                     // the table+keep substitution can only point at a host
                     // resident slot, so vram and l2-only spares do not count
@@ -4282,40 +4296,45 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                     const float cs = probs[i];
                     // two-sided window: the spare must sit inside the ratio
                     // [S, 1/S] of the cold score. A spare that is much stronger
-                    // is not a stand-in, so the highest resident spare inside
-                    // the window wins, not the highest overall
-                    float e_best[impl::sim_n_p][impl::sim_n_s];
-                    for (auto & e_row : e_best) {
-                        for (float & e_val : e_row) {
-                            e_val = -1.0f;
+                    // is not a stand-in, so the highest spare inside the window
+                    // wins, not the highest overall
+                    float e_res[impl::sim_n_p][impl::sim_n_s];
+                    float e_open[impl::sim_n_p][impl::sim_n_s];
+                    for (int pi = 0; pi < impl::sim_n_p; ++pi) {
+                        for (int si = 0; si < impl::sim_n_s; ++si) {
+                            e_res[pi][si]  = -1.0f;
+                            e_open[pi][si] = -1.0f;
                         }
                     }
                     for (int pi = 0; pi < impl::sim_n_p; ++pi) {
                         for (int k = 0; k < sim_p[pi] && k < (int) sppool.size(); ++k) {
-                            if (!spare_available(sppool[(size_t) k].second)) {
-                                continue;
-                            }
-                            const float e = sppool[(size_t) k].first;
+                            const float e        = sppool[(size_t) k].first;
+                            const bool  resident = spare_available(sppool[(size_t) k].second);
                             for (int si = 0; si < impl::sim_n_s; ++si) {
-                                if (e_best[pi][si] >= 0.0f) {
-                                    continue;
-                                }
                                 const float s = sim_s[si];
                                 if (e > cs / s || e < s * cs) {
                                     continue;
                                 }
-                                e_best[pi][si] = e;
+                                if (e_open[pi][si] < 0.0f) {
+                                    e_open[pi][si] = e;
+                                }
+                                if (resident && e_res[pi][si] < 0.0f) {
+                                    e_res[pi][si] = e;
+                                }
                             }
                         }
                     }
                     for (int pi = 0; pi < impl::sim_n_p; ++pi) {
                         for (int si = 0; si < impl::sim_n_s; ++si) {
-                            if (e_best[pi][si] >= 0.0f) {
+                            if (e_open[pi][si] >= 0.0f) {
+                                p.sim_open[pi][si]++;
+                            }
+                            if (e_res[pi][si] >= 0.0f) {
                                 p.sim_fired[pi][si]++;
                             }
                         }
                     }
-                    const float ref = e_best[impl::sim_ref_p][impl::sim_ref_s];
+                    const float ref = e_res[impl::sim_ref_p][impl::sim_ref_s];
                     if (ref >= 0.0f) {
                         p.sim_ref_n++;
                         p.sim_ref_loss += (double) (cs - ref) / (double) cs;
@@ -4349,17 +4368,25 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                     }
                 }
             }
-            // substitution: replace a cold routed expert with a nearby resident
-            // one, so neither the read nor the renormalization is paid. The top
+            // substitution: replace a cold routed expert with a nearby host
+            // spare, so neither the read nor the renormalization is paid. The top
             // expert is never substituted, the spare must sit inside the score
-            // window [S, 1/S] and be host-resident, and the table points the
-            // cold id at the spare slot while keep scales its weight to the
-            // spare score
+            // window [S, 1/S] and be RAM- or L2-resident, and the matching table
+            // points the cold id at the spare slot while keep scales its weight
+            // to the spare score
             subst.assign((size_t) n_ids, 0);
             subst_slot.assign((size_t) n_ids, -1);
+            subst_l2.assign((size_t) n_ids, 0);
             subst_scale.assign((size_t) n_ids, 1.0f);
             subst_used.clear();
             double layer_subst_mass = 0.0;
+            // an L2 entry is a usable spare too: its bytes are already local, so
+            // pointing the cold id at its slot saves the read like a resident
+            // spare does. Only layers whose split-hot graph has an L2 pass can
+            // consume the remap
+            const bool l2_spare_ok = epid >= 0 && il >= 0 && il < (int) p.l2.size() &&
+                    p.l2[(size_t) il].table != nullptr &&
+                    il < (int) p.split_cold.size() && p.split_cold[(size_t) il] != 0;
             if (p.substitute_enabled() && !sppool.empty()) {
                 const bool   layer_cap    = p.drop_max_mass > 0.0f;
                 const double layer_budget = (double) p.drop_max_mass * layer_mass;
@@ -4393,8 +4420,11 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                         if (bid < 0 || bid >= (int32_t) c.resident_slot.size()) {
                             continue;
                         }
-                        if (c.resident_slot[bid] < 0 || c.resident_filled[bid] == 0) {
-                            continue; // only host residents can be pointed at
+                        const bool res_spare = c.resident_slot[bid] >= 0 && c.resident_filled[bid] != 0;
+                        const bool l2_spare  = !res_spare && l2_spare_ok &&
+                                p.evict_has(epid, ((int64_t) il << 32) | (uint32_t) bid);
+                        if (!res_spare && !l2_spare) {
+                            continue; // not host-resident and not an L2 entry
                         }
                         bool used = false;
                         for (const int32_t u : subst_used) {
@@ -4412,18 +4442,31 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                     if (best < 0) {
                         continue;
                     }
-                    const float  e       = sppool[(size_t) best].first;
-                    const double perturb = std::fabs((double) cs - (double) e);
+                    const int32_t best_id = sppool[(size_t) best].second;
+                    const float   e       = sppool[(size_t) best].first;
+                    const double  perturb = std::fabs((double) cs - (double) e);
                     if (layer_cap && layer_subst_mass + perturb > layer_budget) {
                         continue;
                     }
                     if (token_cap && p.tok_dropped_mass + layer_subst_mass + perturb > token_budget) {
                         continue;
                     }
+                    // resolve the spare to a slot here. For an L2 entry the touch
+                    // also promotes it, so this token's own reads cannot evict it
+                    int32_t slot  = c.resident_slot[best_id];
+                    uint8_t is_l2 = 0;
+                    if (slot < 0 || c.resident_filled[best_id] == 0) {
+                        slot = p.evict_touch(epid, ((int64_t) il << 32) | (uint32_t) best_id);
+                        if (slot < 0) {
+                            continue; // the L2 entry went away between the scan and here
+                        }
+                        is_l2 = 1;
+                    }
                     subst[(size_t) i]       = 1;
-                    subst_slot[(size_t) i]  = c.resident_slot[sppool[(size_t) best].second];
+                    subst_slot[(size_t) i]  = slot;
+                    subst_l2[(size_t) i]    = is_l2;
                     subst_scale[(size_t) i] = e / cs;
-                    subst_used.push_back(sppool[(size_t) best].second);
+                    subst_used.push_back(best_id);
                     layer_subst_mass += perturb;
                 }
             }
@@ -4497,10 +4540,21 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                 ((float *) c.keep->data)[id] = dropped ? 0.0f : (substituted ? subst_scale[(size_t) i] : 1.0f);
             }
             if (substituted) {
-                // the position reads the spare's resident slot instead of a
-                // transient read for this id; keep scaled the gathered weight
-                // from the cold score to the spare score
-                table[id] = subst_slot[(size_t) i];
+                // the position reads the spare's slot instead of a transient read
+                // for this id; keep scaled the gathered weight from the cold score
+                // to the spare score. A RAM spare goes through the resident table;
+                // an L2 spare through the L2 table, marked as an L2 hit so its
+                // compute runs in the pass that does not wait for a read
+                if (subst_l2[(size_t) i] && l2_table != nullptr && skip_hit != nullptr && skip_miss != nullptr) {
+                    const int32_t eslot = subst_slot[(size_t) i];
+                    table[id]        = pool.sentinel; // the resident pass must skip it
+                    l2_table[id]     = eslot;
+                    skip_hit[eslot]  = 0;
+                    skip_miss[eslot] = 1;
+                    p.n_subst_l2_routes++;
+                } else {
+                    table[id] = subst_slot[(size_t) i];
+                }
                 p.n_subst_routes++;
                 if (probs != nullptr) {
                     const double cw = (double) probs[i];
