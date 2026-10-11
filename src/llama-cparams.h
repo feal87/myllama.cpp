@@ -93,8 +93,8 @@ struct llama_cparams {
     // (see llama-moecache.h). The shared routing ranking is observed by the
     // hot-expert engine, which llama_context spins up automatically when this
     // tier is requested even if pinning (n_pin_hot_experts) is off.
-    uint64_t n_moe_cache_budget_bytes; // total device memory reserved up-front for the whole cache (dummy slots and
-                                       // device tables included; the final layout always fits within it) (0 = no cap)
+    uint64_t n_moe_cache_budget_bytes; // total device memory reserved up-front for the whole cache (device tables
+                                       // included; the final layout always fits within it) (0 = no cap)
     int32_t  n_moe_cache_inserts;      // max expert uploads per decode step, across all cached layers (global)
     float    n_moe_cache_drift_percent;// rebuild the per-layer layout when it drifts more than this percent from
                                        // the ideal composition for the current ranking (0 = disabled)

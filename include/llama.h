@@ -470,8 +470,8 @@ extern "C" {
         // recently routed experts from VRAM instead. The routing ranking is
         // observed automatically when this tier is requested, so --pin-hot-experts
         // is NOT required (without it nothing is mlock'd). See llama-moecache.h.
-        uint64_t n_moe_cache_budget_bytes; // total device memory reserved up-front for the whole cache: expert slots,
-                                           // the per-layer dummy slot and the device tables (0 = no cap). The per-layer
+        uint64_t n_moe_cache_budget_bytes; // total device memory reserved up-front for the whole cache: expert slots
+                                           // and the per-layer device tables (0 = no cap). The per-layer
                                            // layout is carved from this pool once routing is observed and always fits
         int32_t  n_moe_cache_inserts;      // max expert uploads queued to the upload worker at once, across all
                                            // cached layers (0 = auto: 2). The worker uploads continuously while

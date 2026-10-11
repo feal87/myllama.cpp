@@ -50,25 +50,27 @@
 //    mid-prompt (the default keeps the per-prompt once-at-100-tokens rebuild)
 //
 // Memory accounting: budget_bytes is the exact total device footprint of the
-// cache (expert slots + the per-layer dummy slot + the device tables). The
-// budget hand-out (llama_hot_expert_cache::assign_global_capacity) charges the
-// one-time per-layer cost when a layer's first slot is granted, so whatever the
-// routing profile decides, the resulting layout always fits inside the pool.
+// cache (expert slots + the per-layer device tables). The budget hand-out
+// (llama_hot_expert_cache::assign_global_capacity) charges the one-time
+// per-layer cost when a layer's first slot is granted, so whatever the routing
+// profile decides, the resulting layout always fits inside the pool.
 //
 // Mechanism (no custom kernels):
 //  - per cached layer, companion tensors in the device buffer type of that
-//    layer's router (ffn_gate_inp), with ne[2] == slots + 1:
+//    layer's router (ffn_gate_inp), with ne[2] == slots:
 //      fused gate_up layout : c_gate (one tensor covering gate+up)
 //      separate gate/up      : c_gate + c_up
-//    plus c_down for the down projection. Slot `slots` is permanently zero
-//    (the "dummy" slot).
-//  - an I32 table[1, n_expert] maps expert id -> slot, or `slots` when not
+//    plus c_down for the down projection.
+//  - an I32 table[1, n_expert] maps expert id -> slot, or slot 0 when not
 //    resident. Device copy (ggml_get_rows remaps ids for the cache-side
-//    mul_mat_id chain) + host copy (CPU mul_mat_id skip via src[3], zeroing the
-//    dst rows of residents).
+//    mul_mat_id chain) + host copy (CPU mul_mat_id skip via src[3], which keeps
+//    the `slots` sentinel).
+//  - an F32 mask[1, n_expert] is 1 for a resident and 0 otherwise. The cache
+//    chain multiplies the activation by the gathered mask, so a non-resident
+//    reads slot 0 but contributes exactly zero: no zero-weight sentinel row.
 //  - host and device down projections are summed: residents contribute 0 via
 //    the CPU chain (skip) and non-residents contribute 0 via the cache chain
-//    (dummy slot), so the merge is exact by construction.
+//    (mask), so the merge is exact by construction.
 //  - decode-only (n_tokens == 1); prefill/batch ubatches build the stock graph.
 
 #include "ggml-backend.h"
@@ -87,7 +89,7 @@ class llama_disk_stage;
 struct llama_moe_cache_layer {
     int il = -1;
 
-    int32_t n_slots = 0; // capacity; the dummy slot index is n_slots
+    int32_t n_slots = 0; // slot capacity
 
     // layout: fused = one gate+up tensor (gate_src == up_src), else separate
     bool fused = false;
@@ -96,13 +98,14 @@ struct llama_moe_cache_layer {
     const ggml_tensor * up_src   = nullptr; // ffn_up_exps, or the fused tensor again
     const ggml_tensor * d_src    = nullptr; // host authoritative down weights
 
-    // device cache tensors, ne[2] == n_slots + 1 (last slot all zeros)
+    // device cache tensors, ne[2] == n_slots
     ggml_tensor * c_gate  = nullptr; // fused: the gate+up tensor; separate: gate tensor
     ggml_tensor * c_up    = nullptr; // separate layout only (null when fused)
     ggml_tensor * c_down  = nullptr;
 
-    ggml_tensor * dev_table  = nullptr; // I32 [1, n_expert] on the device: expert id -> slot or n_slots
-    ggml_tensor * host_table = nullptr; // same content in host memory (CPU mul_mat_id skip via src[3])
+    ggml_tensor * dev_table  = nullptr; // I32 [1, n_expert] on the device: expert id -> slot, or 0 when not resident
+    ggml_tensor * dev_mask   = nullptr; // F32 [1, n_expert] on the device: 1 = resident, 0 = not resident
+    ggml_tensor * host_table = nullptr; // same slots in host memory (CPU mul_mat_id skip via src[3]); non-resident = n_slots
 };
 
 class llama_moe_cache {
@@ -114,8 +117,8 @@ class llama_moe_cache {
     //           requested budget does not fit, 25 MiB are shaved off this base
     //           and the allocation retried. The per-layer
     //           layout is carved from it once routing has been observed, and the
-    //           budget hand-out guarantees the layout always fits (dummy slot +
-    //           device tables included). 0 = disabled
+    //           budget hand-out guarantees the layout always fits (device tables
+    //           included). 0 = disabled
     // max_inserts: max expert uploads queued to the async upload worker at once,
     //           GLOBAL across all cached layers (0 = default 2). The worker
     //           uploads continuously while experts are pending, so this caps

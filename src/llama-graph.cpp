@@ -2330,8 +2330,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // reason to keep a layer out of the cache: the device chain mirrors the
         // host activation exactly (see the mc_swiglu lambda below). Keeping the
         // layer out while still uploading its experts to the VRAM tier is what
-        // silently zeroed those experts: the host chain skips VRAM-served ids
-        // and the sentinel row is never filled.
+        // silently zeroed those experts: the host chain skips VRAM-served ids, so
+        // if the cache chain is not built for the layer those ids contribute
+        // nothing at all.
         if (gate_up_exps && !gate_exps) {
             mc = moe_cache->lookup(il); // fused layout
             if (mc && !mc->fused) {
@@ -2589,21 +2590,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * mc_slot_ids = ggml_get_rows(ctx0, mc->dev_table, selected_experts); // [1, n_expert_used, n_tokens]
         mc_slot_ids = ggml_reshape_2d(ctx0, mc_slot_ids, selected_experts->ne[0], selected_experts->ne[1]);
 
-        // a routed expert that is not resident maps to the sentinel slot, whose
-        // weights are all zero. src[3] marks the op as a cache-side mul_mat_id
-        // and op_params[1] carries the sentinel, so the device mul_mat_id skips
-        // that slot instead of computing zeros for it.
-        const auto mc_set_skip = [&](ggml_tensor * t) {
-            t->src[3]       = mc->dev_table;
-            t->op_params[1] = mc->n_slots;
-        };
+        // a routed expert that is not resident maps to slot 0. The per-expert
+        // mask is 1 for a resident and 0 otherwise; multiplying the activation
+        // by it zeroes the non-resident rows, so their contribution to the sum
+        // below is exactly zero and the cache needs no zero-weight sentinel row
+        ggml_tensor * mc_mask = ggml_get_rows(ctx0, mc->dev_mask, selected_experts); // [1, n_expert_used, n_tokens]
+        cb(mc_mask, "ffn_moe_cache_mask", il);
 
         ggml_tensor * mc_act = nullptr;
         if (mc->fused) {
             // one fused gate+up mul_mat_id, then split into gate and up views
             ggml_tensor * mc_gu = ggml_mul_mat_id(ctx0, mc->c_gate, mc_inp, mc_slot_ids); // [n_ff*2, n_expert_used, n_tokens]
             cb(mc_gu, "ffn_moe_cache_gate_up", il);
-            mc_set_skip(mc_gu);
 
             const int64_t mc_n_ff = mc_gu->ne[0] / 2;
             ggml_tensor * mc_gate = ggml_view_3d(ctx0, mc_gu, mc_n_ff, mc_gu->ne[1], mc_gu->ne[2], mc_gu->nb[1], mc_gu->nb[2], 0);
@@ -2614,15 +2612,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_tensor * mc_up   = ggml_mul_mat_id(ctx0, mc->c_up,   mc_inp, mc_slot_ids);
             cb(mc_gate, "ffn_moe_cache_gate", il);
             cb(mc_up,   "ffn_moe_cache_up",   il);
-            mc_set_skip(mc_gate);
-            mc_set_skip(mc_up);
             mc_act = mc_swiglu(mc_gate, mc_up);
         }
         cb(mc_act, "ffn_moe_cache_swiglu", il);
 
+        // mask after the GLU, not on the gate/up inputs, so the CUDA
+        // MMID+MMID+GLU fusion subgraph is left intact
+        mc_act = ggml_mul(ctx0, mc_act, mc_mask);
+        cb(mc_act, "ffn_moe_cache_masked", il);
+
         ggml_tensor * mc_down = ggml_mul_mat_id(ctx0, mc->c_down, mc_act, mc_slot_ids); // [n_embd, n_expert_used, n_tokens]
         cb(mc_down, "ffn_moe_cache_down", il);
-        mc_set_skip(mc_down);
 
         // merge: each routed expert is computed on exactly one side, so the sum
         // is the exact host-only result (up to fp rounding on the cached side)

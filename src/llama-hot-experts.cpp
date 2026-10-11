@@ -2086,7 +2086,7 @@ int32_t llama_hot_expert_cache::assign_global_capacity(uint64_t budget_bytes,
 
     // walk the global ranking by count descending; an expert is kept only if its
     // whole cost still fits in the remaining budget (experts are indivisible).
-    // Each layer also pays its one-time fixed cost (dummy slot + tables) when
+    // Each layer also pays its one-time fixed cost (tables + padding) when
     // its first slot is granted, so the final layout always fits the budget.
     std::vector<std::tuple<uint64_t, int, int32_t>> all;
     all.reserve(n_distinct);

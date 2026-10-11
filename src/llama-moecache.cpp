@@ -109,8 +109,8 @@ struct llama_moe_cache::impl {
     bool failed    = false;
 
     // reserved at context creation (reserve()): the cacheable layers and the
-    // single device pool all of their cache tensors (slots + dummy + tables)
-    // are carved from at activation
+    // single device pool all of their cache tensors (slots + tables) are carved
+    // from at activation
     std::vector<candidate> cands;
     ggml_backend_buffer_t  pool = nullptr;
 
@@ -356,17 +356,24 @@ static size_t expert_fixed_overhead(ggml_backend_buffer_type_t buft, const ggml_
 // per expert. Caller holds the impl mutex; no graph is running.
 static void sync_tables(llama_moe_cache_layer & pub, const std::vector<int32_t> & slot_expert) {
     const int32_t n_expert = (int32_t) pub.gate_src->ne[2];
-    const int32_t dummy    = pub.n_slots;
 
-    std::vector<int32_t> tbl(n_expert, dummy);
+    // device table: expert -> slot, non-resident -> slot 0 (a valid row, which
+    // the cache chain masks off); host table keeps the n_slots sentinel the CPU
+    // mul_mat_id skips on. The mask is 1 exactly for the residents
+    std::vector<int32_t> dev_tbl(n_expert, 0);
+    std::vector<int32_t> host_tbl(n_expert, pub.n_slots);
+    std::vector<float>   mask(n_expert, 0.0f);
     for (int32_t s = 0; s < pub.n_slots; ++s) {
         const int32_t e = slot_expert[s];
         if (e >= 0 && e < n_expert) {
-            tbl[e] = s;
+            dev_tbl[e]  = s;
+            host_tbl[e] = s;
+            mask[e]     = 1.0f;
         }
     }
-    ggml_backend_tensor_set(pub.dev_table,  tbl.data(), 0, n_expert*sizeof(int32_t));
-    ggml_backend_tensor_set(pub.host_table, tbl.data(), 0, n_expert*sizeof(int32_t));
+    ggml_backend_tensor_set(pub.dev_table,  dev_tbl.data(),  0, n_expert*sizeof(int32_t));
+    ggml_backend_tensor_set(pub.host_table, host_tbl.data(), 0, n_expert*sizeof(int32_t));
+    ggml_backend_tensor_set(pub.dev_mask,   mask.data(),     0, n_expert*sizeof(float));
 }
 
 // move pending experts to the upload worker's queue, one per layer per pass, up
@@ -727,14 +734,15 @@ bool llama_moe_cache::compute_layout_caps(std::vector<int32_t> & caps) const {
     std::vector<size_t> fixed_bytes(p->model.layers.size(), 0);
     for (const auto & c : p->cands) {
         bytes_per_layer[c.il] = c.nbytes_1slot;
-        // the dummy slot, the device table, the per-tensor alignment padding,
+        // the device tables (slots + mask), the per-tensor alignment padding,
         // plus whatever the backend adds on top of the tensor data
         size_t overhead = expert_fixed_overhead(buft, c.gate_src);
         if (!c.fused) {
             overhead += expert_fixed_overhead(buft, c.up_src);
         }
         overhead += expert_fixed_overhead(buft, c.d_src);
-        fixed_bytes[c.il] = c.nbytes_1slot + (size_t) c.n_expert*sizeof(int32_t) + 4*align + overhead;
+        const size_t tables = (size_t) c.n_expert*(sizeof(int32_t) + sizeof(float));
+        fixed_bytes[c.il] = tables + 5*align + overhead;
     }
     if (p->hot->assign_global_capacity(pool_size, bytes_per_layer, fixed_bytes, caps) <= 0) {
         return false;
@@ -803,7 +811,7 @@ void llama_moe_cache::activate(bool relayout) {
     // shared ranking first). A layer earns a slot only when one of its experts
     // is actually among the hottest model-wide, so hot layers end up with many
     // slots and cold layers with none. Each layer also pays a one-time fixed
-    // cost when it earns its first slot (the dummy slot, the device table and
+    // cost when it earns its first slot (the device tables and
     // the tensor alignment padding), so the layout carved into the pool below
     // always fits inside the reserved budget.
     // size against the pool actually held, not budget_bytes: the reclaimed
@@ -954,21 +962,23 @@ void llama_moe_cache::activate(bool relayout) {
         ls.key_gate  = c.key_gate;
         ls.key_up    = c.key_up;
 
-        pub.c_gate = ggml_new_tensor_3d(ctx_dev, c.gate_src->type, c.gate_src->ne[0], c.gate_src->ne[1], n_slots + 1);
+        pub.c_gate = ggml_new_tensor_3d(ctx_dev, c.gate_src->type, c.gate_src->ne[0], c.gate_src->ne[1], n_slots);
         ggml_format_name(pub.c_gate, "moe_cache_gate.%d", c.il);
         ls.uploads.push_back({pub.c_gate, c.gate_src, 0});
 
         if (!c.fused) {
-            pub.c_up = ggml_new_tensor_3d(ctx_dev, c.up_src->type, c.up_src->ne[0], c.up_src->ne[1], n_slots + 1);
+            pub.c_up = ggml_new_tensor_3d(ctx_dev, c.up_src->type, c.up_src->ne[0], c.up_src->ne[1], n_slots);
             ggml_format_name(pub.c_up, "moe_cache_up.%d", c.il);
             ls.uploads.push_back({pub.c_up, c.up_src, 1});
         }
-        pub.c_down = ggml_new_tensor_3d(ctx_dev, c.d_src->type, c.d_src->ne[0], c.d_src->ne[1], n_slots + 1);
+        pub.c_down = ggml_new_tensor_3d(ctx_dev, c.d_src->type, c.d_src->ne[0], c.d_src->ne[1], n_slots);
         ggml_format_name(pub.c_down, "moe_cache_down.%d", c.il);
         ls.uploads.push_back({pub.c_down, c.d_src, 2});
 
         pub.dev_table = ggml_new_tensor_2d(ctx_dev, GGML_TYPE_I32, 1, c.n_expert);
         ggml_format_name(pub.dev_table, "moe_cache_tbl.%d", c.il);
+        pub.dev_mask = ggml_new_tensor_2d(ctx_dev, GGML_TYPE_F32, 1, c.n_expert);
+        ggml_format_name(pub.dev_mask, "moe_cache_mask.%d", c.il);
 
         // bind this layer's cache tensors into the shared pool
         for (ggml_tensor * t = ggml_get_first_tensor(ctx_dev); t != nullptr; t = ggml_get_next_tensor(ctx_dev, t)) {
@@ -1014,8 +1024,8 @@ void llama_moe_cache::activate(bool relayout) {
     p->inflight_mark.assign((size_t) p->max_n_expert, 0);
     p->mark_stamp = 0;
 
-    // zero the whole pool once: the dummy slot (n_slots) of every cached layer
-    // must stay zeros for the cache-side mul_mat chain to contribute nothing
+    // zero the whole pool once: slots start empty, so the cache chain reads
+    // zeros for a layer before its first upload lands
     ggml_backend_buffer_clear(p->pool, 0);
 
     // host buffer for the CPU-side tables
@@ -1027,12 +1037,10 @@ void llama_moe_cache::activate(bool relayout) {
         return;
     }
 
-    // everything uncached -> dummy slot n_slots, in both the device and host tables
+    // everything starts uncached: slot 0 + mask 0 in the device tables, the
+    // n_slots sentinel in the host table (sync_tables builds all three)
     for (auto & ls : p->layers) {
-        const int32_t n_expert = (int32_t) ls.pub.gate_src->ne[2];
-        std::vector<int32_t> dummy(n_expert, ls.pub.n_slots);
-        ggml_backend_tensor_set(ls.pub.dev_table,  dummy.data(), 0, n_expert*sizeof(int32_t));
-        ggml_backend_tensor_set(ls.pub.host_table, dummy.data(), 0, n_expert*sizeof(int32_t));
+        sync_tables(ls.pub, ls.slot_expert);
     }
 
     // (re)start the upload worker: a per-prompt relayout stopped it above, so
