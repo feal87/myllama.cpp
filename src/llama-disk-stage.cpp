@@ -1980,15 +1980,25 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     const std::string sec_l = out.substr(s_l);
 
     const size_t s_d = out.size();
+    // staged layers that own a decode cache, i.e. the population a split can
+    // come from. split.layers counts one split per layer per token, so dividing
+    // by the interval's tokens gives the layers that needed a read per token
+    int n_layer_cache = 0;
+    for (const impl::cache_layer & c : p.cache) {
+        if (c.table != nullptr) {
+            n_layer_cache++;
+        }
+    }
     // split hot/cold: what the read costs on the critical path. hidden covers the
     // hot pass, outstanding is the part the cold split had to wait for, blocked is
     // the wall time actually spent in fill_cache_wait
     if (split.layers > 0 && d_tokens > 0) {
         const double tk = (double) d_tokens;
         const int64_t worker_us = split.wait_us > split.stall_us ? split.wait_us - split.stall_us : 0;
-        line("  read      : %.2f ms/token drive, %.2f MiB/token over %d split(s) | %.0f%% hidden behind the %.2f ms/token hot pass",
+        line("  read      : %.2f ms/token drive, %.2f MiB/token | %.1f/%d layers/token need a read | %d split(s) | %.0f%% hidden behind the %.2f ms/token hot pass",
              (double) split.read_us / 1000.0 / tk,
-             (double) split.bytes / (1024.0 * 1024.0) / tk, split.layers,
+             (double) split.bytes / (1024.0 * 1024.0) / tk,
+             (double) split.layers / tk, n_layer_cache, split.layers,
              split.read_us > 0 ? 100.0 * (double) split.ovl_us / (double) split.read_us : 0.0,
              (double) split.hot_us / 1000.0 / tk);
         line("  blocked   : %.2f ms/token in fill_cache_wait (%.2f read outstanding on %d of %d split(s), %.2f worker copy/signal)",
