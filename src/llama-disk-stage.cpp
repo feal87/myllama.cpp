@@ -357,10 +357,23 @@ static void disk_stage_plan_l2(
             cnt[bi]--;
             assigned--;
         }
-        size_t pos = 0;
-        for (size_t pi = 0; pi < pl.size(); ++pi) {
-            for (int c = 0; c < cnt[pi]; ++c) {
+        // interleave the layers across the type's pools: layer 0 to the first
+        // pool, layer 1 to the second, and so on. cnt[] still fixes each pool's
+        // share, so a pool only serves layers spread over the whole stack
+        std::vector<int> left = cnt;
+        size_t           pos  = 0;
+        while (pos < n) {
+            bool any = false;
+            for (size_t pi = 0; pi < pl.size() && pos < n; ++pi) {
+                if (left[pi] == 0) {
+                    continue;
+                }
                 region_layers[(size_t) pl[pi]].push_back(types[(size_t) j].layers[pos++]);
+                left[pi]--;
+                any = true;
+            }
+            if (!any) {
+                break;
             }
         }
     }
@@ -3180,9 +3193,20 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                     if (best == l2_groups.size()) {
                                         break;  // no type has a layer to spare
                                     }
-                                    const size_t mid = l2_groups[best].size() / 2;
-                                    std::vector<int> half(l2_groups[best].begin() + mid, l2_groups[best].end());
-                                    l2_groups[best].resize(mid);
+                                    // the new region takes every other layer, so
+                                    // both regions serve the whole stack
+                                    std::vector<int> & g = l2_groups[best];
+                                    std::vector<int>   half;
+                                    half.reserve(g.size() / 2);
+                                    size_t keep = 0;
+                                    for (size_t i = 0; i < g.size(); ++i) {
+                                        if (i % 2 == 0) {
+                                            g[keep++] = g[i];
+                                        } else {
+                                            half.push_back(g[i]);
+                                        }
+                                    }
+                                    g.resize(keep);
                                     l2_groups.push_back(std::move(half));
                                 }
                             }
