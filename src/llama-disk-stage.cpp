@@ -1146,6 +1146,7 @@ struct llama_disk_stage::impl {
     uint64_t prev_l2_hits        = 0;
     uint64_t prev_l2_all_hits    = 0;
     uint64_t prev_l2_misses      = 0;
+    uint64_t prev_l2_all_misses  = 0;
     uint64_t prev_l2_cold        = 0;
     uint64_t prev_l2_evictions   = 0;
     uint64_t prev_l2_demotions   = 0;
@@ -1162,7 +1163,6 @@ struct llama_disk_stage::impl {
     uint64_t prev_dec_substituted   = 0;
     uint64_t prev_dec_tokens        = 0;
     // previous report's funnel bases, for the per-interval tier rates
-    uint64_t prev_base_l2           = 0;
     uint64_t prev_base_sub          = 0;
     uint64_t prev_base_drop         = 0;
     double   prev_dec_routed_mass   = 0.0;
@@ -1826,7 +1826,6 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     const uint64_t d_tokens     = decode_tokens > p.prev_dec_tokens ? decode_tokens - p.prev_dec_tokens : 0;
     const impl::split_acc split = p.split_tot - p.prev_split_tot;
     // funnel bases and the L2 hits over them, for the per-interval tier rates
-    const uint64_t d_base_l2   = base_l2   > p.prev_base_l2   ? base_l2   - p.prev_base_l2   : 0;
     const uint64_t d_base_sub  = base_sub  > p.prev_base_sub  ? base_sub  - p.prev_base_sub  : 0;
     const uint64_t d_base_drop = base_drop > p.prev_base_drop ? base_drop - p.prev_base_drop : 0;
     const uint64_t d_l2_all    = p.n_l2_all_hits > p.prev_l2_all_hits ? p.n_l2_all_hits - p.prev_l2_all_hits : 0;
@@ -1952,14 +1951,17 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     const std::string sec_drop = out.substr(s_drop);
 
     const size_t s_l = out.size();
-    // the L2 rate is over the RAM misses it works on, the same base the funnel
-    // uses. The warm-phase rate excludes the lookups served before the pool
+    // the L2 only sees the routes that were not substituted or dropped, so its
+    // rate is over its own lookups, not the wider RAM-miss base the funnel
+    // counts. The warm-phase rate excludes the lookups served before the pool
     // warmed, so it is printed apart
-    const uint64_t l2_served = base_l2 > base_sub ? base_l2 - base_sub : 0;
+    const uint64_t l2_lookups      = p.n_l2_all_hits + p.n_l2_all_misses;
+    const uint64_t d_l2_all_miss   = p.n_l2_all_misses > p.prev_l2_all_misses ? p.n_l2_all_misses - p.prev_l2_all_misses : 0;
+    const uint64_t d_l2_lookups    = d_l2_all + d_l2_all_miss;
     line("  hit       : %.1f%% cumulative (%" PRIu64 "/%" PRIu64 ") | %.1f%% this interval (%" PRIu64 "/%" PRIu64
          ") | warm-phase %.1f%% | %" PRIu64 " skipped cold",
-         pct(l2_served, base_l2), l2_served, base_l2,
-         pct(d_l2_all, d_base_l2), d_l2_all, d_base_l2,
+         pct(p.n_l2_all_hits, l2_lookups), p.n_l2_all_hits, l2_lookups,
+         pct(d_l2_all, d_l2_lookups), d_l2_all, d_l2_lookups,
          lookups ? 100.0 * p.n_l2_hits / lookups : 0.0, p.n_l2_cold);
 
     line("  l2 served : %s avoided this interval (%s promoted) | %s total",
@@ -2053,6 +2055,7 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     p.prev_l2_hits           = p.n_l2_hits;
     p.prev_l2_all_hits       = p.n_l2_all_hits;
     p.prev_l2_misses         = p.n_l2_misses;
+    p.prev_l2_all_misses     = p.n_l2_all_misses;
     p.prev_l2_cold           = p.n_l2_cold;
     p.prev_l2_evictions      = p.n_l2_evictions;
     p.prev_l2_demotions      = p.n_l2_demotions;
@@ -2074,7 +2077,6 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     p.drop_worst_mass        = 0.0;
     p.drop_worst_token_mass  = 0.0;
     p.prev_dec_tokens        = decode_tokens;
-    p.prev_base_l2           = base_l2;
     p.prev_base_sub          = base_sub;
     p.prev_base_drop         = base_drop;
     p.prev_split_tot         = p.split_tot;
