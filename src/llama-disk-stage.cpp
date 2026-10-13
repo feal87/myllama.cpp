@@ -280,15 +280,18 @@ static void disk_stage_plan_l2(
         }
     }
 
-    // per-type pools: fixed regions (index < R) and permanent pools (>= R)
+    // per-type pools in the order layers are assigned to them: permanent pools
+    // (>= R) first, they survive prefill, then the fixed regions (< R). The
+    // interleave below walks this list, so a permanent pool takes the earliest
+    // layers of its type
     std::vector<std::vector<int>> pools_of((size_t) k);
+    for (size_t p = 0; p < perm_pools.size(); ++p) {
+        pools_of[(size_t) perm_pools[p].first].push_back(R + (int) p);
+    }
     for (int i = 0; i < R; ++i) {
         if (best_assign[(size_t) i] >= 0) {
             pools_of[(size_t) best_assign[(size_t) i]].push_back(i);
         }
-    }
-    for (size_t p = 0; p < perm_pools.size(); ++p) {
-        pools_of[(size_t) perm_pools[p].first].push_back(R + (int) p);
     }
 
     const auto region_cap = [&](int region, int type) -> size_t {
@@ -724,6 +727,7 @@ struct llama_disk_stage::impl {
         // buffer and are NOT cleared when a prefill reuses the staging slabs
         bool     permanent = false;
         bool     external  = false; // pool is laid over the decode-promoted dense host memory
+        std::vector<int32_t> layers; // layers this pool serves, for the startup report
     };
     std::vector<evict_pool> evict_pools;
     std::vector<int>        evict_pool_id;    // layer -> pool, -1 when not pooled
@@ -3314,6 +3318,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                 p.evict_pools.push_back(std::move(ep));
 
                                 impl::evict_pool & pool = p.evict_pools.back();
+                                pool.layers = l2_groups[g];
                                 for (int jl : l2_groups[g]) {
                                     p.evict_pool_id[jl] = pid;
                                     impl::l2_layer & L = p.l2[(size_t) jl];
@@ -3386,11 +3391,15 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                                    __func__, n_pooled, n_staged, n_staged - n_pooled);
                                 }
                                 for (size_t k = 0; k < p.evict_pools.size(); ++k) {
-                                    LLAMA_LOG_INFO("%s:   L2 pool %zu%s: %d slots, strides %zu/%zu/%zu bytes\n",
+                                    std::string pool_layers;
+                                    for (int32_t layer : p.evict_pools[k].layers) {
+                                        pool_layers += (pool_layers.empty() ? "" : ",") + std::to_string(layer);
+                                    }
+                                    LLAMA_LOG_INFO("%s:   L2 pool %zu%s: %d slots, strides %zu/%zu/%zu bytes, layers %s\n",
                                                    __func__, k, p.evict_pools[k].permanent ? " (permanent)" : "",
                                                    p.evict_pools[k].cap,
                                                    p.evict_pools[k].stride[0], p.evict_pools[k].stride[1],
-                                                   p.evict_pools[k].stride[2]);
+                                                   p.evict_pools[k].stride[2], pool_layers.c_str());
                                 }
                             }
                         }
