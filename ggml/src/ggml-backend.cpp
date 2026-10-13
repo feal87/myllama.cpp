@@ -1074,6 +1074,9 @@ struct ggml_backend_sched {
     ggml_backend_sched_node_prepare_callback callback_node_prepare;
     void * callback_node_prepare_user_data;
 
+    ggml_backend_sched_node_computed_callback callback_node_computed;
+    void * callback_node_computed_user_data;
+
     ggml_backend_sched_copy_callback callback_copy;
     void * callback_copy_user_data;
 
@@ -2139,6 +2142,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // host-side read of the nodes that just computed, before a later split
+        // reuses their buffers. The hook runs per node, so it must be cheap
+        if (sched->callback_node_computed) {
+            for (int j = 0; j < split->graph.n_nodes; j++) {
+                sched->callback_node_computed(split->graph.nodes[j], sched->callback_node_computed_user_data);
+            }
+        }
+
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
@@ -2369,6 +2380,12 @@ void ggml_backend_sched_set_node_prepare_callback(ggml_backend_sched_t sched, gg
     GGML_ASSERT(sched);
     sched->callback_node_prepare = callback;
     sched->callback_node_prepare_user_data = user_data;
+}
+
+void ggml_backend_sched_set_node_computed_callback(ggml_backend_sched_t sched, ggml_backend_sched_node_computed_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_node_computed = callback;
+    sched->callback_node_computed_user_data = user_data;
 }
 
 void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data) {

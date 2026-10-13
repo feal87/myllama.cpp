@@ -2106,8 +2106,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (disk_stage != nullptr) {
         ggml_backend_sched_set_node_prepare_callback(sched.get(),
                 llama_disk_stage::node_prepare_callback, disk_stage.get());
+        // the real-impact read is decode-only; keep it off the prefill graph so
+        // the per-node hook does not add a second traversal there
+        const bool measure = ubatch.n_tokens == 1 && disk_stage->drops_enabled();
+        ggml_backend_sched_set_node_computed_callback(sched.get(),
+                measure ? llama_disk_stage::node_computed_callback : nullptr,
+                measure ? disk_stage.get() : nullptr);
     } else {
         ggml_backend_sched_set_node_prepare_callback(sched.get(), nullptr, nullptr);
+        ggml_backend_sched_set_node_computed_callback(sched.get(), nullptr, nullptr);
     }
 
     if (hot_experts) {

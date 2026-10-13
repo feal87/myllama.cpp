@@ -296,6 +296,10 @@ public:
 
     bool is_active() const;
 
+    // true when the cache-aware drop lever is on, so the caller can skip the
+    // post-compute measurement hook entirely when nothing is dropped
+    bool drops_enabled() const;
+
     // Aggregate DIO cache counters and current state for the server metrics exporter.
     void stats_snapshot(llama_expert_stats & out) const;
 
@@ -327,6 +331,12 @@ public:
     // table lookup, so the routed ids are already host-side and the graph is not
     // chunked. user_data is the llama_disk_stage
     static void node_prepare_callback(struct ggml_tensor * node, void * user_data);
+
+    // ggml_backend_sched_node_computed_callback: read the weighted expert output
+    // of a layer that just computed, to measure the real per-expert output norm
+    // the drop lever removes. Fires after the split compute, while the buffer is
+    // still intact, so the graph is not chunked. user_data is the llama_disk_stage
+    static void node_computed_callback(struct ggml_tensor * node, void * user_data);
 
 private:
     struct impl;

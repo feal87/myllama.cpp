@@ -341,6 +341,13 @@ extern "C" {
     // be cheap.
     typedef void (*ggml_backend_sched_node_prepare_callback)(struct ggml_tensor * node, void * user_data);
 
+    // Called for every node of a split right after the split was computed, while
+    // the node buffers are still intact (the allocator may reuse a dead buffer
+    // in a later split). Lets a hook read computed outputs, e.g. measure a MoE
+    // expert's contribution, without breaking the graph into chunks. The hook
+    // runs per node, so it must be cheap.
+    typedef void (*ggml_backend_sched_node_computed_callback)(struct ggml_tensor * node, void * user_data);
+
     // Callback while copying input weights of a split
     // if the user returns false the scheduler simply copies the entire weight
     // the callback is called only for input weights in host buffers
@@ -402,6 +409,7 @@ extern "C" {
 
     // Set a callback to be called for every node before its split is computed
     GGML_API void                 ggml_backend_sched_set_node_prepare_callback(ggml_backend_sched_t sched, ggml_backend_sched_node_prepare_callback callback, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_node_computed_callback(ggml_backend_sched_t sched, ggml_backend_sched_node_computed_callback callback, void * user_data);
 
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
