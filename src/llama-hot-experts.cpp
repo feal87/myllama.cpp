@@ -2092,6 +2092,10 @@ bool llama_hot_expert_cache::has_ngram_predict() const {
     return ngram_predict != nullptr;
 }
 
+int32_t llama_hot_expert_cache::ngram_top_m() const {
+    return ngram_predict ? ngram_predict->top_m() : 0;
+}
+
 void llama_hot_expert_cache::note_output_token(int32_t token) {
     if (profile_file == nullptr && ngram_file == nullptr && ngram_predict == nullptr) {
         return;

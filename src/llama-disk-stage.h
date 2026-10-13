@@ -86,6 +86,16 @@ struct llama_disk_stage_l2_layer {
     // misses. Every other slot (the other segment and the sentinel) is 1
     ggml_tensor * skip_hit  = nullptr; // I32 [n_slots]
     ggml_tensor * skip_miss = nullptr; // I32 [n_slots]
+    // --expert-ngram-profile: the global double-buffered prefetch buffer. The
+    // gate/up/down tensors are shared per expert-bundle type and hold 2*top_m
+    // slots; the layer's `pref_table` maps an expert to a slot of the half the
+    // graph is consuming, and `pref_mask` is 0 on that half. All null when the
+    // feature is off
+    ggml_tensor * pref_gate  = nullptr; // [n_ff, n_embd, 2*top_m]
+    ggml_tensor * pref_up    = nullptr;
+    ggml_tensor * pref_down  = nullptr;
+    ggml_tensor * pref_table = nullptr; // I32 [n_expert], expert id -> pref slot
+    ggml_tensor * pref_mask  = nullptr; // I32 [2*top_m]
 };
 
 class llama_disk_stage {
@@ -199,6 +209,16 @@ public:
     // drop the pending prefetch list and wait out the worker, so the staging
     // slabs can be reused by a prefill or reclaimed by the dense demotion
     void prefetch_drain();
+
+    // --expert-ngram-profile: allocate the global double-buffered prefetch
+    // buffer, 2*top_m slots per expert-bundle type. Called once after the
+    // profile is loaded and before the first graph build; top_m <= 0 keeps the
+    // feature off. The buffer is separate from the L2 pool and never touches
+    // its LRU
+    void enable_prefetch(int32_t top_m, int32_t max_reads);
+
+    // top_m the prefetch buffer was sized with, 0 when disabled
+    int32_t prefetch_top_m() const;
 
     // the graph records, per layer, whether it emitted a cold pass for it. The The
     // decode fill consults this to pick the split or the synchronous path, so a

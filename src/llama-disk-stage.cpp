@@ -736,7 +736,6 @@ struct llama_disk_stage::impl {
         std::vector<std::list<int64_t>::iterator> iter_of;   // slot -> position
         std::vector<int64_t>                      slot_key;  // slot -> key, -1 when empty
         std::vector<uint8_t>                      seg;       // slot -> 0 probation, 1 protected
-        std::vector<uint8_t>                      pref;      // slot -> 1 when the read-ahead filled it and the demand has not used it yet
         std::vector<int32_t>                      free_slots;
         uint64_t hits      = 0; // counted only once the RAM tier is warm
         uint64_t misses    = 0;
@@ -759,6 +758,8 @@ struct llama_disk_stage::impl {
         ggml_tensor * table     = nullptr; // I32 [1, n_expert], expert id -> L2 slot
         ggml_tensor * skip_hit  = nullptr; // I32 [1, cap], 0 on a hit slot
         ggml_tensor * skip_miss = nullptr; // I32 [1, cap], 0 on a miss slot
+        ggml_tensor * pref_table = nullptr; // I32 [1, n_expert], expert id -> pref slot
+        ggml_tensor * pref_mask  = nullptr; // I32 [1, 2*top_m], 0 on the layer's half
         llama_disk_stage_l2_layer pub;
     };
     std::vector<l2_layer> l2;
@@ -1108,45 +1109,81 @@ struct llama_disk_stage::impl {
     int64_t trace_n_cold = 0;
     int64_t trace_n_vram = 0;
 
-    // --expert-ngram-profile prefetch: a dedicated worker reads the predicted
-    // experts of the step into L2 slots ahead of the layer that routes them. It
-    // takes FREE slots only (never evicts one the decode may still execute) and
-    // yields the shared decode completion port to the demand fill, so it cannot
-    // delay a layer's read
+    // --expert-ngram-profile prefetch: one double-buffered pool per
+    // expert-bundle type, 2*top_m slots each and separate from the L2. While
+    // the graph consumes the half of layer N, a dedicated worker reads layer
+    // N+1's predicted experts into the other half; a half is freed as soon as
+    // the graph passes its layer, so the buffer is strictly transient and never
+    // touches the L2 pool or its LRU
+    struct pref_pool {
+        char *   data[3]   = { nullptr, nullptr, nullptr };
+        size_t   stride[3] = { 0, 0, 0 };
+        int32_t  half      = 0; // slots per half (top_m)
+        int32_t  cap       = 0; // 2*half
+        int32_t  layer[2]  = { -1, -1 }; // layer whose read fills the half, -1 free
+        uint8_t  state[2]  = { 0, 0 };   // 0 free, 1 reading, 2 ready
+        ggml_tensor * gate = nullptr;
+        ggml_tensor * up   = nullptr;
+        ggml_tensor * down = nullptr;
+        std::vector<int32_t> slot_of[2]; // expert -> slot within the half, -1 absent
+        std::vector<int32_t> slot_id[2]; // slot within the half -> expert, -1 empty
+        std::vector<uint8_t> used[2];    // slot -> 1 when the demand served an id from it
+        int32_t              filled[2] = { 0, 0 }; // entries filled per half
+    };
+    std::vector<pref_pool>  pref_pools;
+    std::vector<int32_t>    layer_pref;    // layer -> pref pool, -1
+    std::vector<int32_t>    layer_layout;  // layer -> expert-bundle type, -1
+    // per expert-bundle type: the pooled source tensors and strides
+    struct pref_type_info {
+        const ggml_tensor * t[3] = { nullptr, nullptr, nullptr };
+        size_t              stride[3] = { 0, 0, 0 };
+        int32_t             n_expert = 0;
+    };
+    std::vector<pref_type_info> pref_types;
+    ggml_backend_buffer_t   pref_buf     = nullptr;
+    ggml_backend_buffer_t   pref_tab_buf = nullptr;
+    ggml_context *          pref_ctx     = nullptr;
+    int32_t                 pref_top_m = 0;
+    int32_t                 pref_max_reads = 0;
+    bool                    pref_on    = false;
+    // the active step's prediction in layer order, plus the ones queued by lead
+    std::vector<std::vector<int32_t>> pref_active;
+    std::unordered_map<uint64_t, std::vector<std::vector<int32_t>>> pref_pending;
+    uint64_t                pref_call = 0;
+    // worker mailbox: the compute thread posts the next layer's read here
+    bool     pref_req_ready = false;
+    int32_t  pref_req_pool  = -1;
+    int32_t  pref_req_half  = -1;
+    int32_t  pref_req_layer = -1;
+    std::vector<int32_t> pref_req_ids;
     std::thread             pref_io;
     std::mutex              pref_mu;
-    std::condition_variable pref_cv;
-    std::condition_variable pref_idle_cv;
-    std::vector<std::pair<int, int32_t>> pref_queue; // (layer, expert id), layer order
-    size_t                  pref_pos     = 0;
-    bool                    pref_running = false;
-    bool                    pref_stop    = false;
+    std::condition_variable pref_cv;       // worker: a request was posted
+    std::condition_variable pref_ready_cv; // compute: a half landed
+    std::condition_variable pref_idle_cv;  // drain: the worker is idle
+    bool                    pref_idle = true;
+    bool                    pref_stop = false;
     uint64_t                n_pref_reads = 0;
     uint64_t                n_pref_bytes = 0;
-    uint64_t                n_pref_skip  = 0; // already resident / in L2 / VRAM
-    uint64_t                n_pref_noslot = 0;
+    uint64_t                n_pref_skip  = 0; // predicted but already resident / in L2 / VRAM
+    uint64_t                n_pref_noslot = 0; // prediction wider than a half
     uint64_t                n_pref_offered = 0; // predicted experts considered this run
-    uint64_t                n_pref_hit     = 0; // read-ahead entries the demand later used
+    uint64_t                n_pref_hit     = 0; // buffered entries the demand later used
     uint64_t                n_pref_hit_bytes = 0;
-    uint64_t                n_pref_waste   = 0; // read-ahead entries evicted before any use
+    uint64_t                n_pref_waste   = 0; // buffered entries discarded without use
     uint64_t                n_pref_waste_bytes = 0;
-    uint64_t                n_pref_late    = 0; // reads that finished after their layer was filled
+    uint64_t                n_pref_late    = 0; // reads still in flight when the layer filled
     uint64_t                n_pref_late_bytes = 0;
-    uint64_t                n_pref_late_good = 0; // ... and the layer did route the expert
+    uint64_t                n_pref_late_good = 0;
     uint64_t                n_pref_late_good_bytes = 0;
-    uint64_t                n_pref_late_bad  = 0; // ... and the layer never routed the expert
+    uint64_t                n_pref_late_bad  = 0;
     uint64_t                n_pref_late_bad_bytes = 0;
-    uint64_t                n_pref_passed  = 0; // predicted experts skipped, layer already filled
+    uint64_t                n_pref_passed  = 0; // predicted layers skipped, graph already passed
     uint64_t                n_pref_steps   = 0; // steps with a prediction (reads-per-token budget)
     int32_t                 pref_budget    = 0; // the per-step cap the caller passed (0 = no cap)
-    // layer the demand fill is on right now, reset at every step; a read-ahead
-    // that reaches a layer after this is too late to matter
+    // layer the demand fill is on right now; used to free a prefetch half once
+    // the graph has passed its layer
     int32_t                 dec_cur_fill_il = -1;
-    // decode fill sweeps completed. The late check is armed once dec_fill_gen
-    // reaches the generation recorded at prefetch time, so a read-ahead queued
-    // `lead` steps ahead is not judged late during the issuing step's fill
-    uint64_t                dec_fill_gen = 0;
-    uint64_t                pref_arm_gen = 0;
     // previous report's read-ahead counters, for the interval figures
     uint64_t                prev_n_pref_reads  = 0;
     uint64_t                prev_n_pref_bytes  = 0;
@@ -1165,14 +1202,217 @@ struct llama_disk_stage::impl {
     uint64_t                prev_n_pref_late_bad_bytes = 0;
     uint64_t                prev_n_pref_passed  = 0;
     uint64_t                prev_n_pref_steps   = 0;
-    // keys the demand fill reserved a slot for but has not published yet. The
-    // read-ahead checks it so the two readers never insert the same key, which
-    // would corrupt the SLRU lists
-    std::unordered_set<int64_t> dec_reserved;
-    // (layer, expert) keys the demand has routed so far this step, filled in
-    // layer order. A late read-ahead is "good" when its key is here (the
-    // prediction was right, the read just arrived too late) and "bad" otherwise
-    std::unordered_set<int64_t> dec_routed;
+
+    // ---- prefetch buffer helpers (compute thread unless noted) -------------
+    // free a half, counting the entries the demand never touched as waste and
+    // dropping the layer's table back to its sentinel
+    void pref_free_half(pref_pool & pp, int h) {
+        if (pp.layer[h] < 0) {
+            return;
+        }
+        const int layer = pp.layer[h];
+        for (int32_t k = 0; k < pp.filled[h]; ++k) {
+            if (pp.used[h][(size_t) k] == 0) {
+                n_pref_waste++;
+                for (int r = 0; r < 3; ++r) {
+                    n_pref_waste_bytes += pp.stride[r];
+                }
+            }
+        }
+        if (layer >= 0 && layer < (int) l2.size() && l2[(size_t) layer].pref_table != nullptr) {
+            impl::l2_layer & L  = l2[(size_t) layer];
+            int32_t *        tb = (int32_t *) L.pref_table->data;
+            const int64_t    ne = (int64_t) L.pref_table->ne[0] * L.pref_table->ne[1];
+            for (int64_t e = 0; e < ne; ++e) {
+                tb[e] = pp.cap - 1;
+            }
+        }
+        pp.layer[h]  = -1;
+        pp.state[h]  = 0;
+        pp.filled[h] = 0;
+        std::fill(pp.slot_of[h].begin(), pp.slot_of[h].end(), -1);
+        std::fill(pp.slot_id[h].begin(), pp.slot_id[h].end(), -1);
+        std::fill(pp.used[h].begin(), pp.used[h].end(), 0);
+    }
+
+    // next layer after il with a prediction and a buffer
+    int pref_next_layer(int il) const {
+        for (int x = il + 1; x < (int) pref_active.size(); ++x) {
+            if (pref_active[(size_t) x].empty()) {
+                continue;
+            }
+            if (x >= (int) layer_pref.size() || layer_pref[(size_t) x] < 0) {
+                continue;
+            }
+            if (x >= (int) split_cold.size() || split_cold[(size_t) x] == 0) {
+                continue;
+            }
+            return x;
+        }
+        return -1;
+    }
+
+    // read the ready half for (il, id): returns the global pref slot, or -1
+    int32_t pref_lookup(int il, int32_t id) {
+        std::lock_guard<std::mutex> lk(pref_mu);
+        if (!pref_on || il < 0 || il >= (int) layer_pref.size()) {
+            return -1;
+        }
+        // the graph only has the pref sub-pass for a split layer; without it a
+        // pref-served id would be dropped from the MoE entirely
+        if (il >= (int) split_cold.size() || split_cold[(size_t) il] == 0) {
+            return -1;
+        }
+        const int pool = layer_pref[(size_t) il];
+        if (pool < 0 || pool >= (int) pref_pools.size()) {
+            return -1;
+        }
+        pref_pool & pp = pref_pools[(size_t) pool];
+        for (int h = 0; h < 2; ++h) {
+            if (pp.layer[h] != il || pp.state[h] != 2) {
+                continue;
+            }
+            if (id < 0 || id >= (int32_t) pp.slot_of[h].size()) {
+                return -1;
+            }
+            const int32_t s = pp.slot_of[h][id];
+            if (s >= 0) {
+                pp.used[h][(size_t) s] = 1;
+                n_pref_hit++;
+                for (int r = 0; r < 3; ++r) {
+                    n_pref_hit_bytes += pp.stride[r];
+                }
+                return h * pp.half + s;
+            }
+        }
+        return -1;
+    }
+
+    bool pref_has(int il, int32_t id) {
+        std::lock_guard<std::mutex> lk(pref_mu);
+        if (!pref_on || il < 0 || il >= (int) layer_pref.size()) {
+            return false;
+        }
+        if (il >= (int) split_cold.size() || split_cold[(size_t) il] == 0) {
+            return false;
+        }
+        const int pool = layer_pref[(size_t) il];
+        if (pool < 0 || pool >= (int) pref_pools.size()) {
+            return false;
+        }
+        const pref_pool & pp = pref_pools[(size_t) pool];
+        for (int h = 0; h < 2; ++h) {
+            if (pp.layer[h] == il && pp.state[h] == 2 && id >= 0 &&
+                    id < (int32_t) pp.slot_of[h].size() && pp.slot_of[h][(size_t) id] >= 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // compute side: free the halves the graph has passed, wait for this layer's
+    // half, then post the next predicted layer into a free half
+    void pref_begin_layer(int il) {
+        if (!pref_on || il < 0 || il >= (int) split_cold.size() || split_cold[(size_t) il] == 0) {
+            return;
+        }
+        {
+            std::unique_lock<std::mutex> lk(pref_mu);
+            for (pref_pool & pp : pref_pools) {
+                for (int h = 0; h < 2; ++h) {
+                    if (pp.layer[h] >= 0 && pp.layer[h] < il) {
+                        pref_free_half(pp, h);
+                    }
+                }
+            }
+            for (pref_pool & pp : pref_pools) {
+                for (int h = 0; h < 2; ++h) {
+                    if (pp.layer[h] == il && pp.state[h] == 1) {
+                        pref_ready_cv.wait(lk, [&pp, h, this] { return pp.state[h] != 1 || pref_stop; });
+                    }
+                }
+            }
+            if (pref_stop) {
+                return;
+            }
+        }
+
+        const int next = pref_next_layer(il);
+        if (next < 0 || next >= (int) layer_pref.size() || layer_pref[(size_t) next] < 0) {
+            return;
+        }
+
+        // filter the prediction against what is already resident
+        std::vector<int32_t> ids;
+        {
+            std::lock_guard<std::mutex> cl(cache_mu);
+            const impl::cache_layer * c = (next < (int) cache.size() && cache[(size_t) next].table != nullptr)
+                    ? &cache[(size_t) next] : nullptr;
+            const int epid = evict_pool_for(next);
+            if (c != nullptr) {
+                size_t slot_cap = (size_t) pref_pools[(size_t) layer_pref[(size_t) next]].half;
+                if (pref_max_reads > 0 && (size_t) pref_max_reads < slot_cap) {
+                    slot_cap = (size_t) pref_max_reads;
+                }
+                for (const int32_t id : pref_active[(size_t) next]) {
+                    if (ids.size() >= slot_cap) {
+                        break;
+                    }
+                    if (id < 0 || id >= (int32_t) c->resident_slot.size()) {
+                        continue;
+                    }
+                    if (c->vram[(size_t) id] || c->base[(size_t) id] || c->resident_slot[(size_t) id] >= 0) {
+                        n_pref_skip++;
+                        continue;
+                    }
+                    if (epid >= 0 && evict_has(epid, ((int64_t) next << 32) | (uint32_t) id)) {
+                        n_pref_skip++;
+                        continue;
+                    }
+                    ids.push_back(id);
+                }
+            }
+        }
+        if (ids.empty()) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lk(pref_mu);
+        if (pref_stop) {
+            return;
+        }
+        const int    pool = layer_pref[(size_t) next];
+        pref_pool &  pp   = pref_pools[(size_t) pool];
+        for (int h = 0; h < 2; ++h) {
+            if (pp.layer[h] == next) {
+                return; // already requested
+            }
+        }
+        int h = -1;
+        for (int q = 0; q < 2; ++q) {
+            if (pp.state[q] == 0) {
+                h = q;
+                break;
+            }
+        }
+        if (h < 0) {
+            n_pref_noslot++;
+            return;
+        }
+        pp.layer[h]  = next;
+        pp.state[h]  = 1;
+        pp.filled[h] = 0;
+        std::fill(pp.slot_of[h].begin(), pp.slot_of[h].end(), -1);
+        std::fill(pp.slot_id[h].begin(), pp.slot_id[h].end(), -1);
+        std::fill(pp.used[h].begin(), pp.used[h].end(), 0);
+        pref_req_pool  = pool;
+        pref_req_half  = h;
+        pref_req_layer = next;
+        pref_req_ids   = std::move(ids);
+        pref_req_ready = true;
+        n_pref_offered += pref_req_ids.size();
+        pref_cv.notify_one();
+    }
 
     // split-hot trace: absolute marks of one layer, reported as deltas between
     // the two calls so the read/hot intersection is visible
@@ -1298,11 +1538,6 @@ struct llama_disk_stage::impl {
         }
     }
 
-    // bytes one expert of this pool occupies across its roles
-    static uint64_t evict_slot_bytes(const evict_pool & ep) {
-        return (uint64_t) ep.stride[0] + (uint64_t) ep.stride[1] + (uint64_t) ep.stride[2];
-    }
-
     static void evict_push_unlocked(evict_pool & ep, int64_t key, int32_t slot, uint8_t seg) {
         std::list<int64_t> & l = seg != 0 ? ep.prot : ep.prob;
         l.push_front(key);
@@ -1356,12 +1591,6 @@ struct llama_disk_stage::impl {
         l.pop_back();
         ep.slot_of.erase(key);
         ep.slot_key[(size_t) slot] = -1;
-        if (ep.pref[(size_t) slot] != 0) {
-            // the read-ahead read this expert and eviction arrived before any use
-            n_pref_waste++;
-            n_pref_waste_bytes += evict_slot_bytes(ep);
-            ep.pref[(size_t) slot] = 0;
-        }
         n_l2_evictions++;
         ep.evictions++;
         return slot;
@@ -1381,12 +1610,6 @@ struct llama_disk_stage::impl {
             return -1;
         }
         const int32_t slot = it->second;
-        if (ep.pref[(size_t) slot] != 0) {
-            // the read-ahead fetched this expert and the demand just used it
-            n_pref_hit++;
-            n_pref_hit_bytes += evict_slot_bytes(ep);
-            ep.pref[(size_t) slot] = 0;
-        }
         if (ep.seg[(size_t) slot] == 0) {
             ep.prob.erase(ep.iter_of[(size_t) slot]);
             ep.seg[(size_t) slot] = 1;
@@ -1414,19 +1637,6 @@ struct llama_disk_stage::impl {
         evict_trim(ep);
     }
 
-    // publish a prefetched slot; a key that landed in the meantime (the demand
-    // fill read it first) wins and the extra slot goes back to the free list
-    void evict_finalize_new(int pool, int64_t key, int32_t slot) {
-        evict_pool & ep = evict_pools[(size_t) pool];
-        if (ep.slot_of.count(key) != 0) {
-            ep.free_slots.push_back(slot);
-            return;
-        }
-        evict_push(ep, key, slot, 0);
-        ep.pref[(size_t) slot] = 1;
-        evict_trim(ep);
-    }
-
     void evict_remove(int pool, int64_t key) {
         std::lock_guard<std::mutex> lk(l2_mu);
         evict_pool & ep = evict_pools[(size_t) pool];
@@ -1442,7 +1652,6 @@ struct llama_disk_stage::impl {
         }
         ep.slot_of.erase(it);
         ep.slot_key[(size_t) slot] = -1;
-        ep.pref[(size_t) slot] = 0;
         ep.free_slots.push_back(slot);
     }
 
@@ -1455,7 +1664,6 @@ struct llama_disk_stage::impl {
             ep.free_slots[(size_t) s] = s;
         }
         std::fill(ep.slot_key.begin(), ep.slot_key.end(), (int64_t) -1);
-        std::fill(ep.pref.begin(), ep.pref.end(), (uint8_t) 0);
     }
 
     // Reset a layer's id table to its pool's sentinel (every routed expert then
@@ -1489,7 +1697,6 @@ struct llama_disk_stage::impl {
             }
         }
         evict_populated = false;
-        dec_reserved.clear();
     }
 
     // evict_clear_transient plus a reset of every transient layer's table. Used
@@ -1529,6 +1736,15 @@ struct llama_disk_stage::impl {
         }
         if (perm_buf) {
             ggml_backend_buffer_free(perm_buf);
+        }
+        if (pref_buf) {
+            ggml_backend_buffer_free(pref_buf);
+        }
+        if (pref_tab_buf) {
+            ggml_backend_buffer_free(pref_tab_buf);
+        }
+        if (pref_ctx) {
+            ggml_free(pref_ctx);
         }
         if (ctx) {
             ggml_free(ctx);
@@ -3243,6 +3459,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                             // slot stride is fixed per tensor, so only identical
                             // tensors can share one pool
                             std::vector<std::vector<int>> type_groups;
+                            p.layer_layout.assign((size_t) n_layer, -1);
                             for (int il = 0; il < n_layer; ++il) {
                                 if (!src[il].ok) {
                                     continue;
@@ -3269,6 +3486,20 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                     g = (int) type_groups.size() - 1;
                                 }
                                 type_groups[g].push_back(il);
+                                p.layer_layout[(size_t) il] = g;
+                            }
+
+                            // per-type source info the prefetch buffer sizes from
+                            p.pref_types.clear();
+                            for (const auto & grp : type_groups) {
+                                impl::pref_type_info ti;
+                                const layer_src & a = src[grp[0]];
+                                for (const auto & role : roles) {
+                                    ti.t[role.slot]      = a.t[role.slot];
+                                    ti.stride[role.slot] = a.r[role.slot].stride;
+                                }
+                                ti.n_expert = (int32_t) a.t[0]->ne[2];
+                                p.pref_types.push_back(ti);
                             }
 
                             std::vector<std::vector<int>> l2_groups;
@@ -3489,7 +3720,6 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                 ep.slot_key.assign((size_t) ep.cap, -1);
                                 ep.iter_of.resize((size_t) ep.cap);
                                 ep.seg.assign((size_t) ep.cap, 0);
-                                ep.pref.assign((size_t) ep.cap, 0);
                                 ep.free_slots.resize((size_t) ep.sentinel); // the sentinel is never free
                                 for (int32_t s = 0; s < ep.sentinel; ++s) {
                                     ep.free_slots[(size_t) s] = s;
@@ -4369,7 +4599,8 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
     // slot by dropping the read that would fill it
     const auto available_id = [&](int32_t id) {
         return c.vram[id] || c.base[id] || c.resident_slot[id] >= 0 ||
-                (epid >= 0 && p.evict_has(epid, ((int64_t) il << 32) | (uint32_t) id));
+                (epid >= 0 && p.evict_has(epid, ((int64_t) il << 32) | (uint32_t) id)) ||
+                p.pref_has(il, id);
     };
 
     // an L2 entry can serve as a substitution spare only when the split-hot
@@ -4416,24 +4647,14 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
     p.trace_n_cold = 0;
     p.trace_n_vram = 0;
 
+    // the prefetch buffer paces itself off the layer the fill is on: free the
+    // halves the graph has passed, wait for this layer's half, request the next
+    p.pref_begin_layer(il);
+
     // slot assignment under the lock; the unbuffered reads below run without it
     {
         std::lock_guard<std::mutex> lock(p.cache_mu);
-        // the read-ahead checks this to drop a prediction the graph already passed
-        if (il <= p.dec_cur_fill_il) {
-            // the layer index wrapped: a new decode step, so the routed set starts over
-            p.dec_fill_gen++;
-            p.dec_routed.clear();
-        }
         p.dec_cur_fill_il = il;
-        if (p.iocp_pref != nullptr) {
-            for (int64_t i = 0; i < n_ids; ++i) {
-                const int32_t id = ids[i];
-                if (id >= 0) {
-                    p.dec_routed.insert(((int64_t) il << 32) | (uint32_t) id);
-                }
-            }
-        }
 
         // cache-aware opportunistic dropping: mark the cold, weak experts to
         // skip. The fraction cap and the relative floor need all scores at once,
@@ -4872,6 +5093,14 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                 continue;
             }
 
+            // served by the transient prefetch buffer: the graph computes it
+            // from pref_table on the hot pass, so nothing is read and the L2 is
+            // untouched
+            if (p.pref_lookup(il, id) >= 0) {
+                table[id] = pool.sentinel;
+                continue;
+            }
+
             // cold: the hot pass skips it, the L2 pool executes it in place
             p.trace_n_cold++;
             p.n_decode_cache_misses++;
@@ -4915,7 +5144,6 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                     }
                     read_to_l2(id, eslot);
                     l2_pending.push_back({ epid, key, eslot });
-                    p.dec_reserved.insert(key);
                 }
                 l2_table[id] = eslot;
                 // the hit and miss sub-passes read the same table through their
@@ -4998,7 +5226,6 @@ void llama_disk_stage::fill_cache(int il, const int32_t * ids, int64_t n_ids, co
         std::lock_guard<std::mutex> lock(p.cache_mu);
         for (const impl::l2_pending & m : p.fs_l2_pending) {
             p.evict_finalize(m.pid, m.key, m.slot);
-            p.dec_reserved.erase(m.key);
         }
         for (const impl::res_pending & m : p.fs_res_pending) {
             p.cache[(size_t) m.il].resident_filled[(size_t) m.id] = 1;
@@ -5101,7 +5328,6 @@ void llama_disk_stage::dec_io_drain() {
     if (!p.dec_io_error) {
         for (const impl::l2_pending & m : p.fs_l2_pending) {
             p.evict_finalize(m.pid, m.key, m.slot);
-            p.dec_reserved.erase(m.key);
         }
         for (const impl::res_pending & m : p.fs_res_pending) {
             impl::cache_layer & c = p.cache[(size_t) m.il];
@@ -5134,227 +5360,362 @@ void llama_disk_stage::set_prefill(bool prefill) {
 void llama_disk_stage::prefetch_drain() {
 #if defined(_WIN32)
     impl & p = *pimpl;
-    if (!p.pref_io.joinable()) {
+    if (!p.pref_on || !p.pref_io.joinable()) {
         return;
     }
-    {
-        std::lock_guard<std::mutex> lk(p.pref_mu);
-        p.pref_queue.clear();
-        p.pref_pos = 0;
-    }
     std::unique_lock<std::mutex> lk(p.pref_mu);
-    p.pref_idle_cv.wait(lk, [&p] { return !p.pref_running; });
+    p.pref_idle_cv.wait(lk, [&p] { return (p.pref_idle && !p.pref_req_ready) || p.pref_stop; });
+#endif
+}
+
+int32_t llama_disk_stage::prefetch_top_m() const {
+    return pimpl->pref_top_m;
+}
+
+void llama_disk_stage::enable_prefetch(int32_t top_m, int32_t max_reads) {
+#if defined(_WIN32)
+    impl & p = *pimpl;
+    if (!p.active || top_m <= 0 || p.pref_types.empty() || p.l2.empty() || p.pref_on) {
+        return;
+    }
+    if (p.iocp_pref == nullptr) {
+        LLAMA_LOG_WARN("%s: no prefetch completion port, --expert-ngram-profile disabled\n", __func__);
+        return;
+    }
+
+    const int32_t cap     = 2 * top_m + 1; // +1 is the never-filled sentinel slot
+    const size_t  n_types = p.pref_types.size();
+
+    // the expert-bundle types that have at least one L2-pooled layer
+    std::vector<char>   type_used(n_types, 0);
+    std::vector<size_t> type_off(n_types, 0);
+    size_t              weights_bytes = 0;
+    for (size_t t = 0; t < n_types; ++t) {
+        bool used = false;
+        for (int il = 0; il < (int) p.l2.size(); ++il) {
+            if (p.evict_pool_id[(size_t) il] >= 0 && p.layer_layout[(size_t) il] == (int) t) {
+                used = true;
+                break;
+            }
+        }
+        if (!used) {
+            continue;
+        }
+        const impl::pref_type_info & ti = p.pref_types[t];
+        size_t per_slot = 0;
+        for (int r = 0; r < 3; ++r) {
+            if (ti.stride[r] > 0) {
+                per_slot += align_up(ti.stride[r], disk_stage_align);
+            }
+        }
+        if (per_slot == 0) {
+            continue;
+        }
+        type_used[t] = 1;
+        type_off[t]  = weights_bytes;
+        weights_bytes += (size_t) cap * per_slot + 2 * disk_stage_align;
+    }
+    if (weights_bytes == 0) {
+        return;
+    }
+
+    ggml_init_params pip = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * (size_t) (n_types * 3 + 2 * p.l2.size() + 16),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    p.pref_ctx = ggml_init(pip);
+    if (p.pref_ctx == nullptr) {
+        return;
+    }
+    p.pref_buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), weights_bytes);
+    if (p.pref_buf == nullptr) {
+        ggml_free(p.pref_ctx);
+        p.pref_ctx = nullptr;
+        return;
+    }
+    ggml_backend_buffer_set_usage(p.pref_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_buffer_clear(p.pref_buf, 0);
+
+    char *               wbase = (char *) ggml_backend_buffer_get_base(p.pref_buf);
+    std::vector<int32_t> type_pool(n_types, -1);
+
+    p.pref_pools.clear();
+    for (size_t t = 0; t < n_types; ++t) {
+        if (type_used[t] == 0) {
+            continue;
+        }
+        const impl::pref_type_info & ti = p.pref_types[t];
+        impl::pref_pool pp;
+        pp.half = top_m;
+        pp.cap  = cap;
+        size_t off = type_off[t];
+        for (int r = 0; r < 3; ++r) {
+            if (ti.stride[r] == 0 || ti.t[r] == nullptr) {
+                continue;
+            }
+            const size_t st = align_up(ti.stride[r], disk_stage_align);
+            pp.stride[r] = st;
+            pp.data[r]   = wbase + off;
+            off += (size_t) cap * st + disk_stage_align;
+            ggml_tensor * wt = ggml_new_tensor_3d(p.pref_ctx, ti.t[r]->type, ti.t[r]->ne[0], ti.t[r]->ne[1], cap);
+            ggml_format_name(wt, "disk_pref_%s.%zu", r == 0 ? "gate" : (r == 1 ? "up" : "down"), t);
+            wt->nb[2] = st;
+            ggml_backend_tensor_alloc(p.pref_buf, wt, pp.data[r]);
+            if (r == 0) {
+                pp.gate = wt;
+            } else if (r == 1) {
+                pp.up = wt;
+            } else {
+                pp.down = wt;
+            }
+        }
+        for (int h = 0; h < 2; ++h) {
+            pp.slot_of[h].assign((size_t) ti.n_expert, -1);
+            pp.slot_id[h].assign((size_t) top_m, -1);
+            pp.used[h].assign((size_t) top_m, 0);
+        }
+        type_pool[t] = (int32_t) p.pref_pools.size();
+        p.pref_pools.push_back(std::move(pp));
+    }
+    if (p.pref_pools.empty()) {
+        ggml_backend_buffer_free(p.pref_buf);
+        p.pref_buf = nullptr;
+        ggml_free(p.pref_ctx);
+        p.pref_ctx = nullptr;
+        return;
+    }
+
+    // per-layer tables and masks
+    size_t tab_bytes = 0;
+    for (int il = 0; il < (int) p.l2.size(); ++il) {
+        const int t = p.layer_layout[(size_t) il];
+        if (t < 0 || type_pool[(size_t) t] < 0) {
+            continue;
+        }
+        tab_bytes += align_up((size_t) p.pref_types[(size_t) t].n_expert * sizeof(int32_t), disk_stage_align);
+        tab_bytes += align_up((size_t) cap * sizeof(int32_t), disk_stage_align);
+    }
+    tab_bytes = std::max<size_t>(tab_bytes, (size_t) disk_stage_align);
+    p.pref_tab_buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), tab_bytes);
+    if (p.pref_tab_buf == nullptr) {
+        p.pref_pools.clear();
+        ggml_backend_buffer_free(p.pref_buf);
+        p.pref_buf = nullptr;
+        ggml_free(p.pref_ctx);
+        p.pref_ctx = nullptr;
+        return;
+    }
+
+    char * tbase = (char *) ggml_backend_buffer_get_base(p.pref_tab_buf);
+    size_t toff  = 0;
+    p.layer_pref.assign(p.l2.size(), -1);
+    for (int il = 0; il < (int) p.l2.size(); ++il) {
+        const int t = p.layer_layout[(size_t) il];
+        if (t < 0 || type_pool[(size_t) t] < 0) {
+            continue;
+        }
+        impl::pref_pool & pp = p.pref_pools[(size_t) type_pool[(size_t) t]];
+        impl::l2_layer &  L  = p.l2[(size_t) il];
+        const int32_t     ne = p.pref_types[(size_t) t].n_expert;
+        p.layer_pref[(size_t) il] = type_pool[(size_t) t];
+
+        L.pref_table = ggml_new_tensor_2d(p.pref_ctx, GGML_TYPE_I32, 1, ne);
+        ggml_format_name(L.pref_table, "disk_pref_table.%d", il);
+        ggml_backend_tensor_alloc(p.pref_tab_buf, L.pref_table, tbase + toff);
+        for (int32_t e = 0; e < ne; ++e) {
+            ((int32_t *) L.pref_table->data)[e] = cap - 1;
+        }
+        toff += align_up((size_t) ne * sizeof(int32_t), disk_stage_align);
+
+        L.pref_mask = ggml_new_tensor_2d(p.pref_ctx, GGML_TYPE_I32, 1, cap);
+        ggml_format_name(L.pref_mask, "disk_pref_mask.%d", il);
+        ggml_backend_tensor_alloc(p.pref_tab_buf, L.pref_mask, tbase + toff);
+        for (int32_t s = 0; s < cap; ++s) {
+            ((int32_t *) L.pref_mask->data)[s] = 1;
+        }
+        toff += align_up((size_t) cap * sizeof(int32_t), disk_stage_align);
+
+        L.pub.pref_gate  = pp.gate;
+        L.pub.pref_up    = pp.up;
+        L.pub.pref_down  = pp.down;
+        L.pub.pref_table = L.pref_table;
+        L.pub.pref_mask  = L.pref_mask;
+    }
+
+    // hold the buffer in RAM: a swapped slot turns a hit into a pagefile read
+    {
+        std::vector<std::pair<void *, size_t>> pin = {
+            { ggml_backend_buffer_get_base(p.pref_buf), ggml_backend_buffer_get_size(p.pref_buf) },
+        };
+        p.lock_l2_regions(pin);
+    }
+
+    p.pref_top_m     = top_m;
+    p.pref_max_reads = max_reads;
+    p.pref_on        = true;
+    p.pref_stop      = false;
+    p.pref_idle      = true;
+    p.pref_call      = 0;
+
+    // the worker: take a posted (pool, half, layer, ids) request, read the
+    // experts into the half, then publish the half and its table. The compute
+    // thread waits on state[h] before it consumes the half, so a late read is
+    // never double-read by the demand path
+    p.pref_io = std::thread([&p]() {
+        for (;;) {
+            int32_t              pool  = -1;
+            int32_t              h     = -1;
+            int32_t              layer = -1;
+            std::vector<int32_t> ids;
+            {
+                std::unique_lock<std::mutex> lk(p.pref_mu);
+                while (!p.pref_stop && !p.pref_req_ready) {
+                    p.pref_idle = true;
+                    p.pref_idle_cv.notify_all();
+                    p.pref_cv.wait(lk);
+                }
+                if (p.pref_stop) {
+                    return;
+                }
+                p.pref_idle = false;
+                pool  = p.pref_req_pool;
+                h     = p.pref_req_half;
+                layer = p.pref_req_layer;
+                ids   = std::move(p.pref_req_ids);
+                p.pref_req_ids.clear();
+                p.pref_req_ready = false;
+            }
+
+            std::vector<disk_stage_job>              jobs;
+            std::vector<std::pair<int32_t, int32_t>> placed; // (expert, slot in half)
+            uint64_t                                 bytes = 0;
+            {
+                std::lock_guard<std::mutex> lk(p.pref_mu);
+                if (pool < 0 || pool >= (int) p.pref_pools.size() || h < 0 || h > 1 ||
+                        layer < 0 || layer >= (int) p.layer_regions.size()) {
+                    continue;
+                }
+                impl::pref_pool &                 pp      = p.pref_pools[(size_t) pool];
+                const std::vector<impl::region> & regions = p.layer_regions[(size_t) layer];
+                int32_t                           k       = 0;
+                for (const int32_t id : ids) {
+                    if (k >= pp.half) {
+                        break;
+                    }
+                    bool any = false;
+                    for (int r = 0; r < 3; ++r) {
+                        const impl::region & sr = regions[(size_t) r];
+                        if (sr.file == nullptr || sr.stride == 0) {
+                            continue;
+                        }
+                        char *       dst = pp.data[r] + ((size_t) h * pp.half + (size_t) k) * pp.stride[r];
+                        const size_t len = align_up(sr.head + sr.stride, disk_stage_align);
+                        const HANDLE hh  = sr.file->h_pref != INVALID_HANDLE_VALUE ? sr.file->h_pref : sr.file->h;
+                        jobs.push_back({ hh, dst, sr.file_off + (size_t) id * sr.stride, len });
+                        bytes += len;
+                        any = true;
+                    }
+                    if (any) {
+                        placed.emplace_back(id, k);
+                        k++;
+                    }
+                }
+            }
+
+            bool err = false;
+            if (!jobs.empty()) {
+                try {
+                    disk_stage_run_jobs(jobs, 32, p.iocp_pref);
+                } catch (...) {
+                    err = true;
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(p.pref_mu);
+                impl::pref_pool & pp = p.pref_pools[(size_t) pool];
+                if (!err) {
+                    for (const auto & [id, k] : placed) {
+                        pp.slot_of[(size_t) h][(size_t) id] = k;
+                        pp.slot_id[(size_t) h][(size_t) k]  = id;
+                    }
+                    pp.filled[(size_t) h] = (int32_t) placed.size();
+                    if (layer < (int) p.l2.size() && p.l2[(size_t) layer].pref_table != nullptr) {
+                        impl::l2_layer & L    = p.l2[(size_t) layer];
+                        int32_t *        tab  = (int32_t *) L.pref_table->data;
+                        int32_t *        mask = (int32_t *) L.pref_mask->data;
+                        const int64_t    ne   = (int64_t) L.pref_table->ne[0] * L.pref_table->ne[1];
+                        for (int64_t e = 0; e < ne; ++e) {
+                            tab[e] = pp.cap - 1;
+                        }
+                        for (const auto & [id, k] : placed) {
+                            tab[id] = h * pp.half + k;
+                        }
+                        for (int32_t s = 0; s < pp.cap; ++s) {
+                            mask[s] = (s / pp.half == h) ? 0 : 1;
+                        }
+                    }
+                    p.n_pref_reads += (uint64_t) placed.size();
+                    p.n_pref_bytes += bytes;
+                    pp.state[(size_t) h] = 2;
+                } else {
+                    pp.layer[(size_t) h] = -1;
+                    pp.state[(size_t) h] = 0;
+                }
+                p.pref_ready_cv.notify_all();
+            }
+        }
+    });
+
+    LLAMA_LOG_INFO("%s: prefetch buffer active, %d pool(s), %d slots each, top_m %d, max %d/step\n",
+                   __func__, (int) p.pref_pools.size(), cap, top_m, max_reads);
 #endif
 }
 
 void llama_disk_stage::prefetch(const std::vector<std::vector<int32_t>> & per_layer, int32_t max_reads, int32_t lead) {
 #if defined(_WIN32)
     impl & p = *pimpl;
-    if (!p.active || p.iocp_pref == nullptr || p.cache.empty() || p.evict_pools.empty()) {
+    if (!p.pref_on) {
         return;
     }
-
-    // a new step: nothing has been filled yet, so a read that reaches a layer
-    // after the demand has moved past it is late. The list targets the step
-    // `lead` sweeps ahead, so arm the late check only when that sweep begins
-    p.dec_cur_fill_il = -1;
-    p.dec_routed.clear();
-    p.pref_arm_gen = p.dec_fill_gen + (uint64_t) (lead > 0 ? lead : 0);
-    p.pref_budget = max_reads;
-    p.n_pref_steps++;
-
-    // the step's read list, built in layer order: the layer the graph reaches
-    // first is queued first, so its read starts first
-    std::vector<std::pair<int, int32_t>> list;
-    for (int il = 0; il < (int) per_layer.size() && il < (int) p.cache.size(); ++il) {
-        impl::cache_layer & c = p.cache[(size_t) il];
-        if (c.table == nullptr || p.evict_pool_for(il) < 0) {
-            continue;
-        }
-        for (const int32_t id : per_layer[(size_t) il]) {
-            if (id < 0 || id >= (int32_t) c.resident_slot.size()) {
-                continue;
-            }
-            if (max_reads > 0 && (int) list.size() >= max_reads) {
-                break;
-            }
-            list.emplace_back(il, id);
-        }
-        if (max_reads > 0 && (int) list.size() >= max_reads) {
-            break;
-        }
-    }
-    p.n_pref_offered += list.size();
-
-    std::lock_guard<std::mutex> lk(p.pref_mu);
+    std::unique_lock<std::mutex> lk(p.pref_mu);
     if (p.pref_stop) {
         return;
     }
-    if (!p.pref_io.joinable()) {
-        // the dedicated reader: it reads each predicted expert into an L2 slot
-        // (free, else the probation LRU) so the layer's fill is a hit
-        p.pref_io = std::thread([&p]() {
-            for (;;) {
-                std::vector<std::pair<int, int32_t>> chunk;
-                {
-                    std::unique_lock<std::mutex> pl(p.pref_mu);
-                    p.pref_cv.wait(pl, [&p] { return p.pref_stop || p.pref_pos < p.pref_queue.size(); });
-                    if (p.pref_stop) {
-                        return;
-                    }
-                    const size_t take = std::min<size_t>(8, p.pref_queue.size() - p.pref_pos);
-                    chunk.assign(p.pref_queue.begin() + p.pref_pos, p.pref_queue.begin() + p.pref_pos + take);
-                    p.pref_pos += take;
-                }
+    // wait out an in-flight read before recycling the halves
+    p.pref_idle_cv.wait(lk, [&p] { return (p.pref_idle && !p.pref_req_ready) || p.pref_stop; });
 
-                struct pending {
-                    int      il;
-                    int      epid;
-                    int32_t  slot;
-                    int64_t  key;
-                    uint64_t bytes;
-                };
-                std::vector<disk_stage_job> jobs;
-                std::vector<pending>        pend;
-                {
-                    std::lock_guard<std::mutex> cl(p.cache_mu);
-                    for (const auto & [il, id] : chunk) {
-                        if (il < 0 || il >= (int) p.cache.size()) {
-                            continue;
-                        }
-                        impl::cache_layer & c = p.cache[(size_t) il];
-                        const int epid = p.evict_pool_for(il);
-                        if (c.table == nullptr || epid < 0 || id < 0 || id >= (int32_t) c.resident_slot.size()) {
-                            continue;
-                        }
-                        const int64_t key = ((int64_t) il << 32) | (uint32_t) id;
-                        if (il <= p.dec_cur_fill_il) {
-                            // the graph already filled this layer: a read now
-                            // cannot help, so do not spend it
-                            p.n_pref_passed++;
-                            continue;
-                        }
-                        if (c.vram[(size_t) id] || c.base[(size_t) id] ||
-                                c.resident_slot[(size_t) id] >= 0 || p.evict_has(epid, key) ||
-                                p.dec_reserved.count(key) != 0) {
-                            p.n_pref_skip++;
-                            continue;
-                        }
-                        // like the demand fill, take a free slot or evict the
-                        // probation LRU: a reserved slot is unpublished, so the
-                        // LRU can never be one a layer is executing right now
-                        const int32_t eslot = p.evict_reserve(epid);
-                        if (eslot < 0) {
-                            p.n_pref_noslot++;
-                            continue;
-                        }
-                        const impl::evict_pool &          ep      = p.evict_pools[(size_t) epid];
-                        const std::vector<impl::region> & regions = p.layer_regions[(size_t) il];
-                        const size_t jobs_before = jobs.size();
-                        uint64_t     bytes       = 0;
-                        for (int r = 0; r < 3; ++r) {
-                            const impl::region & sr = regions[(size_t) r];
-                            if (sr.file == nullptr || sr.stride == 0) {
-                                continue;
-                            }
-                            char *       dst = ep.data[r] + (size_t) eslot * ep.stride[r];
-                            const size_t len = align_up(sr.head + sr.stride, disk_stage_align);
-                            const HANDLE h   = sr.file->h_pref != INVALID_HANDLE_VALUE ? sr.file->h_pref : sr.file->h;
-                            jobs.push_back({ h, dst, sr.file_off + (size_t) id * sr.stride, len });
-                            bytes += len;
-                        }
-                        if (jobs.size() == jobs_before) {
-                            // no readable region for this layer: give the slot back
-                            p.evict_pools[(size_t) epid].free_slots.push_back(eslot);
-                            p.n_pref_skip++;
-                            continue;
-                        }
-                        p.n_pref_reads++;
-                        p.n_pref_bytes += bytes;
-                        pend.push_back({ il, epid, eslot, key, bytes });
-                    }
-                }
-
-                if (!jobs.empty()) {
-                    // its own completion port and handle: the read-ahead overlaps
-                    // the demand reads instead of queueing behind them
-                    bool err = false;
-                    try {
-                        disk_stage_run_jobs(jobs, 32, p.iocp_pref);
-                    } catch (...) {
-                        err = true;
-                    }
-                    if (err) {
-                        // a failed speculative read is not fatal: return the
-                        // slots and let the demand path read the experts again
-                        std::lock_guard<std::mutex> cl(p.cache_mu);
-                        for (const pending & m : pend) {
-                            p.evict_pools[(size_t) m.epid].free_slots.push_back(m.slot);
-                        }
-                        pend.clear();
-                    }
-                }
-
-                {
-                    std::lock_guard<std::mutex> cl(p.cache_mu);
-                    for (const pending & m : pend) {
-                        // the read is only useful if the demand has not already
-                        // reserved the key and the graph has not passed the layer
-                        // in the target step's sweep (dec_fill_gen)
-                        const bool passed = p.dec_fill_gen >= p.pref_arm_gen &&
-                                            m.il <= p.dec_cur_fill_il;
-                        const bool late = p.dec_reserved.count(m.key) != 0 || passed;
-                        if (late) {
-                            const bool routed = p.dec_reserved.count(m.key) != 0 ||
-                                                p.dec_routed.count(m.key) != 0;
-                            p.n_pref_late++;
-                            p.n_pref_late_bytes += m.bytes;
-                            if (routed) {
-                                p.n_pref_late_good++;
-                                p.n_pref_late_good_bytes += m.bytes;
-                            } else {
-                                p.n_pref_late_bad++;
-                                p.n_pref_late_bad_bytes += m.bytes;
-                            }
-                            p.evict_pools[(size_t) m.epid].free_slots.push_back(m.slot);
-                        } else {
-                            p.evict_finalize_new(m.epid, m.key, m.slot);
-                        }
-                    }
-                    if (!pend.empty()) {
-                        // the prefetched entries live on the staging slabs, so a
-                        // prefill must drain the worker and clear the pool first
-                        p.evict_populated = true;
-                    }
-                }
-
-                bool idle = false;
-                {
-                    std::lock_guard<std::mutex> pl(p.pref_mu);
-                    if (p.pref_pos >= p.pref_queue.size()) {
-                        p.pref_running = false;
-                        idle = true;
-                    }
-                }
-                if (idle) {
-                    p.pref_idle_cv.notify_all();
-                }
-                if (p.pref_stop) {
-                    return;
-                }
-            }
-        });
+    // the list targets the step `lead` ahead; activate the one queued for this
+    // step and drop any that are already stale
+    const uint64_t target = p.pref_call + (uint64_t) (lead > 0 ? lead : 0);
+    p.pref_pending[target] = per_layer;
+    auto it = p.pref_pending.find(p.pref_call);
+    if (it != p.pref_pending.end()) {
+        p.pref_active = std::move(it->second);
+        p.pref_pending.erase(it);
+    } else {
+        p.pref_active.clear();
     }
-    p.pref_queue   = std::move(list);
-    p.pref_pos     = 0;
-    if (p.pref_queue.empty() && !p.pref_running) {
-        return; // nothing to read and the worker is idle: leave it asleep
+    for (auto pit = p.pref_pending.begin(); pit != p.pref_pending.end();) {
+        if (pit->first < p.pref_call) {
+            pit = p.pref_pending.erase(pit);
+        } else {
+            ++pit;
+        }
     }
-    p.pref_running = true;
-    p.pref_cv.notify_one();
+    p.pref_call++;
+    p.pref_budget = max_reads;
+    p.n_pref_steps++;
+
+    // a new step: every half holds the previous step's entries, so drop them
+    for (impl::pref_pool & pp : p.pref_pools) {
+        for (int h = 0; h < 2; ++h) {
+            p.pref_free_half(pp, h);
+        }
+    }
 #endif
 }
-
 void llama_disk_stage::fill_cache_begin(int il, const int32_t * ids, int64_t n_ids, const float * probs) {
 #if defined(_WIN32)
     impl & p = *pimpl;

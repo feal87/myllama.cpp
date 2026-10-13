@@ -2636,10 +2636,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // the disk read; the miss mask runs on the split backend and is the only
         // part that waits for the read. The disk batch and the read issue are
         // untouched; only the post-read compute shrinks by the hit share
-        const auto build_l2_sub = [&](ggml_tensor * skip, const char * prefix,
-                                      ggml_backend_t backend) -> ggml_tensor * {
-            ggml_tensor * p_up   = build_lora_mm_id(lc->up,   mc_inp, selected_experts_l2, nullptr);
-            ggml_tensor * p_gate = build_lora_mm_id(lc->gate, mc_inp, selected_experts_l2, nullptr);
+        const auto build_slot_sub = [&](ggml_tensor * w_gate, ggml_tensor * w_up, ggml_tensor * w_down,
+                                        ggml_tensor * sel, ggml_tensor * skip, const char * prefix,
+                                        ggml_backend_t backend) -> ggml_tensor * {
+            ggml_tensor * p_up   = build_lora_mm_id(w_up,   mc_inp, sel, nullptr);
+            ggml_tensor * p_gate = build_lora_mm_id(w_gate, mc_inp, sel, nullptr);
             cb(p_up,   (std::string(prefix) + "up").c_str(),   il);
             cb(p_gate, (std::string(prefix) + "gate").c_str(), il);
             p_up->src[3]         = skip;
@@ -2670,7 +2671,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 p_act = ggml_mul(ctx0, p_g_a, p_up_c);
                 cb(p_act, (std::string(prefix) + "act").c_str(), il);
             }
-            ggml_tensor * p_down = build_lora_mm_id(lc->down, p_act, selected_experts_l2, nullptr);
+            ggml_tensor * p_down = build_lora_mm_id(w_down, p_act, sel, nullptr);
             cb(p_down, (std::string(prefix) + "down").c_str(), il);
             p_down->src[3]       = skip;
             p_down->op_params[0] = 0;
@@ -2684,7 +2685,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         };
 
         // L2 hits on the hot backend: this compute overlaps the disk read
-        ggml_tensor * h_down = build_l2_sub(lc->skip_hit, "ffn_moe_l2hit_", backend_cpu);
+        ggml_tensor * h_down = build_slot_sub(lc->gate, lc->up, lc->down, selected_experts_l2, lc->skip_hit, "ffn_moe_l2hit_", backend_cpu);
         experts = ggml_add(ctx0, experts, h_down);
         cb(experts, "ffn_moe_l2hit_add", il);
         ggml_backend_sched_set_tensor_backend(sched, experts, backend_cpu);
@@ -2693,7 +2694,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // CPU split stays next to the GPU split (the early launch overlap). The
         // "ffn_moe_cold_" prefix is what the node-prepare hook matches to wait
         // for the disk batch and to recognize where the cold split ends
-        ggml_tensor * c_down = build_l2_sub(lc->skip_miss, "ffn_moe_cold_", backend_cpu_split);
+        ggml_tensor * c_down = build_slot_sub(lc->gate, lc->up, lc->down, selected_experts_l2, lc->skip_miss, "ffn_moe_cold_", backend_cpu_split);
         experts = ggml_add(ctx0, experts, c_down);
         cb(experts, "ffn_moe_cold_add", il);
         ggml_backend_sched_set_tensor_backend(sched, experts, backend_cpu_split);
@@ -2703,6 +2704,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_backend_sched_set_tensor_backend(sched, selected_experts_l2, backend_cpu);
         if (selected_experts_l2->src[0] != nullptr) {
             ggml_backend_sched_set_tensor_backend(sched, selected_experts_l2->src[0], backend_cpu);
+        }
+
+        // --expert-ngram-profile: the transient prefetch buffer. The whole half
+        // is in RAM before the layer starts, so this is a hot sub-pass like the
+        // L2 hit one; an id that was not predicted sits at the pref sentinel and
+        // is skipped, so the cold pass above still reads it
+        if (lc->pref_table != nullptr) {
+            ggml_tensor * selected_experts_pf = ggml_reshape_2d(ctx0,
+                    ggml_get_rows(ctx0, lc->pref_table, selected_experts), n_expert_used, n_tokens);
+            cb(selected_experts_pf, "ffn_moe_topk_pref", il);
+            ggml_tensor * pf_down = build_slot_sub(lc->pref_gate, lc->pref_up, lc->pref_down,
+                    selected_experts_pf, lc->pref_mask, "ffn_moe_pref_", backend_cpu);
+            experts = ggml_add(ctx0, experts, pf_down);
+            cb(experts, "ffn_moe_pref_add", il);
+            ggml_backend_sched_set_tensor_backend(sched, experts, backend_cpu);
+            ggml_backend_sched_set_tensor_backend(sched, selected_experts_pf, backend_cpu);
+            if (selected_experts_pf->src[0] != nullptr) {
+                ggml_backend_sched_set_tensor_backend(sched, selected_experts_pf->src[0], backend_cpu);
+            }
         }
     }
 

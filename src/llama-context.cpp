@@ -318,6 +318,11 @@ llama_context::llama_context(
     if (disk_active) {
         if (hot_experts) {
             hot_experts->set_disk_stage(disk_stage.get());
+            // the global prefetch buffer is sized once the profile (top-M) is
+            // known, before the first graph build
+            if (cparams.expert_ngram_profile_path != nullptr) {
+                disk_stage->enable_prefetch(hot_experts->ngram_top_m(), cparams.expert_ngram_prefetch_max);
+            }
             LLAMA_LOG_INFO("%s: disk decode cache is the RAM tier, %d pool(s), up to %d resident slots per pool\n",
                            __func__, disk_stage->n_pools(), disk_stage->resident_capacity());
         } else {

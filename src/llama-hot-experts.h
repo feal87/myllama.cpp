@@ -283,6 +283,10 @@ class llama_hot_expert_cache {
     // even without pinning, so the predict line is emitted at the same cadence
     bool has_ngram_predict() const;
 
+    // top-M of the active --expert-ngram-profile, 0 when none. The disk stage
+    // sizes its global prefetch buffer from this
+    int32_t ngram_top_m() const;
+
     // Prints the periodic stats report via LLAMA_LOG_INFO (verbosity 4): a header
     // line plus one themed line each for the slots, hit rate, churn, memory, locks,
     // ranking, decays, base set, prefetch and the per-layer breakdown. Called by
