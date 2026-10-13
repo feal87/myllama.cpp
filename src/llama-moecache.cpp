@@ -1355,6 +1355,24 @@ const llama_moe_cache_layer * llama_moe_cache::lookup(int il) const {
     return nullptr;
 }
 
+const ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
+    if (!pimpl || !pimpl->activated || w == nullptr) {
+        return nullptr;
+    }
+    for (const auto & ls : pimpl->layers) {
+        if (w == ls.pub.gate_src) {
+            return ls.pub.c_gate;
+        }
+        if (w == ls.pub.up_src) {
+            return ls.pub.fused ? ls.pub.c_gate : ls.pub.c_up;
+        }
+        if (w == ls.pub.d_src) {
+            return ls.pub.c_down;
+        }
+    }
+    return nullptr;
+}
+
 // rebuild the per-layer ranked expert list from the shared decayed ranking.
 // Called at each full rebalance; the list lets apply_target() keep the upload
 // queue topped up every decode token without re-scanning the whole ranking.

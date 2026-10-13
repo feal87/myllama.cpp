@@ -223,6 +223,11 @@ class llama_moe_cache {
     // tensor no longer identifies a layer
     const llama_moe_cache_layer * lookup(int il) const;
 
+    // device copy of the host expert weight `w` (gate/up/down), or nullptr when the
+    // layer is not cached. The Hadamard graph check registers these copies so a
+    // folded expert weight is verified on the cache path too
+    const ggml_tensor * get_experts(const ggml_tensor * w) const;
+
     // called between graph executions (after each ubatch): publishes completed
     // uploads and periodically rebalances content against the current ranking
     void tick(int64_t n_content_tokens);
