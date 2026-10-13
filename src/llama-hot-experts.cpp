@@ -410,24 +410,11 @@ void llama_hot_expert_cache::print_stats(bool final_report, uint64_t ram_hit, ui
     }
 
     if (n_layers_used > 0) {
-        std::string row = "  layers   :";
-        bool wrapped = false;
-        for (size_t il = 0; il < per_layer.size(); ++il) {
-            if (per_layer[il] == 0) {
-                continue;
-            }
-            row += " L" + std::to_string(il) + "=" + std::to_string(per_layer[il]);
-            // wrap after appending: checking first lets the last entry push the
-            // row well past the width
-            if (row.size() > 110 && !wrapped) {
-                out += row;
-                out += '\n';
-                row = "            ";
-                wrapped = true;
-            }
-        }
-        out += row;
-        out += '\n';
+        llama_append_wrapped_row(out, "  layers   :", per_layer.size(), [&per_layer](size_t il) {
+            return per_layer[il] != 0
+                    ? " L" + std::to_string(il) + "=" + std::to_string(per_layer[il])
+                    : std::string();
+        });
     }
 
     LLAMA_LOG_INFO("%s", out.c_str());

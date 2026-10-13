@@ -19,6 +19,7 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <functional>
 #include <list>
 #include <map>
 #include <mutex>
@@ -507,7 +508,8 @@ struct disk_stage_job {
 // complete, from one thread, reaping through an I/O completion port. This is the
 // exact model diskspd uses to saturate the drive; a pool of waiting threads or a
 // WaitForMultipleObjects pump does not hold the depth on this machine.
-static void disk_stage_run_jobs(const std::vector<disk_stage_job> & jobs, int queue_depth, HANDLE iocp) {
+static void disk_stage_run_jobs(const std::vector<disk_stage_job> & jobs, int queue_depth, HANDLE iocp,
+                                const std::function<void()> & on_reads_pending = {}) {
     if (jobs.empty()) {
         return;
     }
@@ -550,6 +552,12 @@ static void disk_stage_run_jobs(const std::vector<disk_stage_job> & jobs, int qu
         for (size_t s = 0; s < n_slots && !failed; ++s) {
             failed = !pump(s);
         }
+    }
+
+    // the queue_depth reads are in flight now: let the caller overlap work with
+    // the drive before this thread blocks on the completions
+    if (!failed && on_reads_pending) {
+        on_reads_pending();
     }
 
     for (;;) {
@@ -806,6 +814,7 @@ struct llama_disk_stage::impl {
         char *       dst;
         size_t       len;
         bool         pre = false; // lands in a resident slot, so it must complete before the hot pass
+        bool         ready = false; // src already holds its bytes (L2 hit): copy while the batch's reads are in flight
     };
 
     // store a frozen bundle into the L2 pool. The destination is not read again
@@ -1075,8 +1084,8 @@ struct llama_disk_stage::impl {
     // queues behind the prefetch reader on io_mu
     std::mutex dec_io_disk_mu;
     // one batch handed to the worker. The reads land the expert bytes in their
-    // L2 slots; the resident promotions run after the reads, since they copy the
-    // bytes the reads just landed
+    // L2 slots; a promotion of a slot this batch is reading waits for the reads,
+    // while a promotion of an already-valid L2 slot rides along with the drive
     struct dec_batch {
         std::vector<disk_stage_job> jobs;
         std::vector<pool_copy>     res_fills;  // L2 slot -> resident slot, after the reads
@@ -1193,6 +1202,11 @@ struct llama_disk_stage::impl {
     uint64_t prev_dec_fill_us    = 0;
     uint64_t prev_dec_fill_calls = 0;
     uint64_t prev_dec_fill_bytes = 0;
+    // per-layer decode reads that went to the drive, counted once the RAM tier is
+    // warm (l2_warm) so the cache-fill phase does not dominate. Cumulative, plus
+    // the previous report's copy for the interval delta
+    std::vector<uint64_t> dec_read_layer;
+    std::vector<uint64_t> prev_dec_read_layer;
     // trace state (compute thread only): previous fill end and layer, plus the
     // running totals of the decode token being traced
     int64_t  trace_prev_us      = 0;
@@ -2025,6 +2039,34 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
              (double) split.stall_us / 1000.0 / tk, split.n_read_limited, split.layers,
              (double) worker_us / 1000.0 / tk);
     }
+    // per-layer warm-phase disk reads, the same L%d=count row the RAM tier
+    // report uses. Totals, then this interval's delta
+    {
+        const size_t n = std::min(p.dec_read_layer.size(), p.prev_dec_read_layer.size());
+        size_t n_used = 0;
+        size_t n_itv  = 0;
+        for (size_t il = 0; il < n; ++il) {
+            if (p.dec_read_layer[il] != 0) {
+                n_used++;
+            }
+            if (p.dec_read_layer[il] != p.prev_dec_read_layer[il]) {
+                n_itv++;
+            }
+        }
+        if (n_used > 0) {
+            llama_append_wrapped_row(out, "  layers   :", n, [&p](size_t il) {
+                return p.dec_read_layer[il] != 0
+                        ? " L" + std::to_string(il) + "=" + std::to_string(p.dec_read_layer[il])
+                        : std::string();
+            });
+        }
+        if (n_itv > 0) {
+            llama_append_wrapped_row(out, "  layers/itv:", n, [&p](size_t il) {
+                const uint64_t d = p.dec_read_layer[il] - p.prev_dec_read_layer[il];
+                return d != 0 ? " L" + std::to_string(il) + "=" + std::to_string(d) : std::string();
+            });
+        }
+    }
     const std::string sec_d = out.substr(s_d);
 
     const size_t s_o = out.size();
@@ -2082,6 +2124,7 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     p.prev_dec_fill_us       = p.n_dec_fill_us;
     p.prev_dec_fill_calls    = p.n_dec_fill_calls;
     p.prev_dec_fill_bytes    = p.n_dec_fill_bytes;
+    p.prev_dec_read_layer    = p.dec_read_layer;
     p.prev_dec_cache_hits    = p.n_decode_cache_hits;
     p.prev_dec_cache_misses  = p.n_decode_cache_misses;
     p.prev_dec_routed_routes = p.n_routed_routes;
@@ -2882,6 +2925,8 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                     p.cache_ctx = ggml_init(cip);
                     if (p.cache_ctx != nullptr) {
                         p.cache.resize(n_layer);
+                        p.dec_read_layer.assign(n_layer, 0);
+                        p.prev_dec_read_layer.assign(n_layer, 0);
                         p.pools.resize(groups.size());
                         size_t off = 0;
                         int    n_cache = 0;
@@ -2919,6 +2964,8 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                             if (p.cache_buf == nullptr) {
                                 p.cache.clear();
                                 p.pools.clear();
+                                p.dec_read_layer.clear();
+                                p.prev_dec_read_layer.clear();
                                 break;
                             }
 
@@ -3276,9 +3323,9 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                 ep.permanent = g < region_permanent.size() && region_permanent[g] != 0;
                                 ep.external  = reg.external;
                                 ep.sentinel  = cap - 1; // never filled, skipped by the graph
-                                // protected gets three quarters: one-shot misses
-                                // enter probation and cannot displace a re-read
-                                ep.prot_cap  = ep.sentinel - std::max(1, ep.sentinel / 4);
+                                // protected gets 70%: one-shot misses enter
+                                // probation and cannot displace a re-read
+                                ep.prot_cap  = ep.sentinel - std::max(1, ep.sentinel * 3 / 10);
                                 size_t off = 0;
                                 for (const auto & role : roles) {
                                     const size_t stride = src[il].r[role.slot].stride;
@@ -3498,12 +3545,24 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                 }
 
                 bool err = false;
+                // a promotion whose source L2 slot already holds its bytes does
+                // not depend on this batch's reads: run it while the drive works
+                // so it never extends the worker's finish time
+                const auto copies_ready = [&batch]() {
+                    for (const impl::pool_copy & cp : batch.res_fills) {
+                        if (cp.ready) {
+                            std::memcpy(cp.dst, cp.src, cp.len);
+                        }
+                    }
+                };
                 try {
                     if (!batch.jobs.empty()) {
                         std::lock_guard<std::mutex> io(p.dec_io_disk_mu);
                         p.trace_split.rd0 = ggml_time_us();
-                        disk_stage_run_jobs(batch.jobs, 32, p.iocp_dec);
+                        disk_stage_run_jobs(batch.jobs, 32, p.iocp_dec, copies_ready);
                         p.trace_split.rd1 = ggml_time_us();
+                    } else {
+                        copies_ready();
                     }
                 } catch (...) {
                     err = true;
@@ -3521,7 +3580,9 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
 
                 if (!err) {
                     for (const impl::pool_copy & cp : batch.res_fills) {
-                        std::memcpy(cp.dst, cp.src, cp.len);
+                        if (!cp.ready) {
+                            std::memcpy(cp.dst, cp.src, cp.len);
+                        }
                     }
                 }
 
@@ -4214,6 +4275,9 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
             char * dst = ep.data[r] + (size_t) eslot * ep.stride[r];
             jobs.push_back({ job_handle(sr), dst, sr.file_off + (size_t) id * sr.stride, expert_read_len[r] });
         }
+        if (p.l2_warm) {
+            p.dec_read_layer[(size_t) il]++;
+        }
     };
 
     // routed ids served from RAM / read from disk / skipped (VRAM), for the trace:
@@ -4717,8 +4781,9 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                 }
 
                 // a reserved resident slot means the ranking promoted the expert:
-                // fill it from the L2 after the reads, so the copy overlaps the
-                // compute instead of blocking the fill
+                // fill it from the L2. A hit's bytes are already valid, so its
+                // copy rides along with the reads (see the worker); a miss copies
+                // after the reads, overlapping the compute
                 if (slot >= 0) {
                     for (int r = 0; r < 3; ++r) {
                         const size_t len = regions[r].stride;
@@ -4726,7 +4791,7 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                             continue;
                         }
                         res_fills.push_back({ ep.data[r] + (size_t) eslot * ep.stride[r],
-                                              pool.data[r] + (size_t) slot * pool.slot_stride[r], len, true });
+                                              pool.data[r] + (size_t) slot * pool.slot_stride[r], len, true, hit });
                         p.n_l2_promo_bytes += len;
                     }
                     p.n_l2_promotions++;

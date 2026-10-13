@@ -120,6 +120,33 @@ void replace_all(std::string & s, const std::string & search, const std::string 
 LLAMA_ATTRIBUTE_FORMAT(1, 2)
 std::string format(const char * fmt, ...);
 
+// append a "label entry entry ..." diagnostic row to out, wrapped at about 110
+// columns. entry(i) returns the i-th entry with its own leading space, or an
+// empty string to skip it. Nothing is appended when no entry is kept
+template <typename F>
+void llama_append_wrapped_row(std::string & out, const std::string & label, size_t n, F && entry) {
+    std::string       row    = label;
+    const std::string indent(label.size(), ' ');
+    for (size_t i = 0; i < n; ++i) {
+        const std::string s = entry(i);
+        if (s.empty()) {
+            continue;
+        }
+        // wrap before the entry that would cross the width, so every line stays
+        // under it and no trailing indent-only line is emitted
+        if (row.size() > indent.size() && row.size() + s.size() > 110) {
+            out += row;
+            out += '\n';
+            row = indent;
+        }
+        row += s;
+    }
+    if (row.size() > indent.size()) {
+        out += row;
+        out += '\n';
+    }
+}
+
 std::string llama_format_tensor_shape(const std::vector<int64_t> & ne);
 std::string llama_format_tensor_shape(const struct ggml_tensor * t);
 
