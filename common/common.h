@@ -565,6 +565,9 @@ struct common_params {
     // per layer and per token (0 = off). See --disk-stage-drop-max-real-mass.
     float    disk_stage_drop_max_real_mass = 0.0f;
     float    disk_stage_drop_max_real_mass_token = 0.0f;
+    // disk stage: ceiling on the estimated routed output-vector perturb a layer
+    // may take from the drop (0 = off). See --disk-stage-drop-max-perturb.
+    float    disk_stage_drop_max_perturb = 0.0f;
     // disk stage: per-layer governor target for the measured real drop impact
     // (0 = off). See --disk-stage-drop-real-target.
     float    disk_stage_drop_real_target = 0.0f;

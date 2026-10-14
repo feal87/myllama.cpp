@@ -3264,6 +3264,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--disk-stage-drop-max-perturb"}, "P",
+        string_format(
+            "with --disk-stage-drop-fraction, hard ceiling on the estimated routed output-vector perturb a single-token decode layer may take from the drop, computed as sqrt(delta^2 / sum (w n)^2) from the stored output norms. This is the quantity the report's perturb numerator is built from, before the shared expert dampens it, so the reported token perturb is normally below the ceiling. The per-token perturb is an energy-weighted rms of the per-layer values, so this ceiling bounds the token too. 0 disables it (default: %.2f)",
+            (double) params.disk_stage_drop_max_perturb
+        ),
+        [](common_params & params, const std::string & value) {
+            const float v = std::stof(value);
+            if (v < 0.0f || v > 1.0f) {
+                throw std::invalid_argument("error: --disk-stage-drop-max-perturb must be in [0, 1]");
+            }
+            params.disk_stage_drop_max_perturb = v;
+        }
+    ));
+    add_opt(common_arg(
         {"--disk-stage-drop-real-target"}, "G",
         string_format(
             "with --disk-stage-drop-fraction, a per-layer governor target for the measured real drop impact. Each layer keeps a short average of its measured real impact; while it runs above G the layer's drop budget is scaled down in steps, and while it runs below G it is scaled back up. At the default fraction this is effectively a per-layer on/off, so it trades skipped reads in the expensive layers for a lower worst-layer impact. 0 disables the governor (default: %.2f)",

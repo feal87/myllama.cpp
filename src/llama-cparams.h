@@ -144,6 +144,9 @@ struct llama_cparams {
     // per layer and per token (--disk-stage-drop-max-real-mass[-token], 0 = off)
     float   disk_stage_drop_max_real_mass;
     float   disk_stage_drop_max_real_mass_token;
+    // disk stage: ceiling on the estimated routed perturb a layer may take from
+    // the drop (--disk-stage-drop-max-perturb, 0 = off)
+    float   disk_stage_drop_max_perturb;
     // disk stage: per-layer governor target for the measured real drop impact
     // (--disk-stage-drop-real-target, 0 = off)
     float   disk_stage_drop_real_target;

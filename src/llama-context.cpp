@@ -261,6 +261,7 @@ llama_context::llama_context(
     cparams.disk_stage_drop_rank_real = params.disk_stage_drop_rank_real;
     cparams.disk_stage_drop_max_real_mass = params.disk_stage_drop_max_real_mass;
     cparams.disk_stage_drop_max_real_mass_token = params.disk_stage_drop_max_real_mass_token;
+    cparams.disk_stage_drop_max_perturb = params.disk_stage_drop_max_perturb;
     cparams.disk_stage_drop_real_target = params.disk_stage_drop_real_target;
     cparams.disk_stage_l2_permanent_bytes = params.disk_stage_l2_permanent_bytes;
 
@@ -305,6 +306,7 @@ llama_context::llama_context(
                 cparams.disk_stage_drop_rank_real,
                 cparams.disk_stage_drop_max_real_mass,
                 cparams.disk_stage_drop_max_real_mass_token,
+                cparams.disk_stage_drop_max_perturb,
                 cparams.disk_stage_drop_real_target,
                 cparams.disk_stage_l2_permanent_bytes,
                 params.dense_vram_tensors != nullptr && params.dense_vram_tensors[0] != '\0'
@@ -2169,6 +2171,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_synchronize(sched.get());
         if (disk_norms) {
             disk_stage->observe_norms_finish();
+            disk_stage->impact_token_end();
         }
         if (hot_obs) {
             hot_experts->observe_decode_finish();
@@ -5407,6 +5410,7 @@ llama_context_params llama_context_default_params() {
         /*.disk_stage_drop_rank_real =*/ true,
         /*.disk_stage_drop_max_real_mass =*/ 0.0f,
         /*.disk_stage_drop_max_real_mass_token =*/ 0.0f,
+        /*.disk_stage_drop_max_perturb =*/ 0.0f,
         /*.disk_stage_drop_real_target =*/ 0.0f,
         /*.disk_stage_l2_permanent_bytes =*/ 0,
         /*.sampler                     =*/ nullptr,

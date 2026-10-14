@@ -594,6 +594,13 @@ extern "C" {
         float disk_stage_drop_max_real_mass;
         float disk_stage_drop_max_real_mass_token;
 
+        // hard ceiling on the estimated routed output-vector perturb a single
+        // layer may take from the drop, sqrt(delta^2 / sum (w n)^2), computed
+        // from the stored norms before the layer runs
+        // (--disk-stage-drop-max-perturb, 0 = off). It bounds the token perturb
+        // too: the token value is an energy-weighted rms of the layer values
+        float disk_stage_drop_max_perturb;
+
         // per-layer governor target: when a layer's measured real drop impact
         // runs above this share its drop budget is scaled down, and scaled back
         // up when it runs below (--disk-stage-drop-real-target, 0 = off)

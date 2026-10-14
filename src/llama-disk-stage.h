@@ -126,6 +126,7 @@ public:
                      float drop_max_mass, float drop_max_mass_token, float substitute_rel, int32_t substitute_pool,
                      bool drop_probe, int32_t drop_measure_every,
                      bool drop_rank_real, float drop_max_real_mass, float drop_max_real_mass_token,
+                     float drop_max_perturb,
                      float drop_real_target, uint64_t permanent_bytes,
                      const std::vector<std::pair<void *, size_t>> & extra_l2_regions);
     ~llama_disk_stage();
@@ -170,6 +171,10 @@ public:
     // end of a decode step, from the graph compute: closes the layer whose cold
     // pass no later split reported and prints the token totals
     void split_token_end();
+
+    // score the finished token's drop impact, once the device norms are in. The
+    // context calls this right after observe_norms_finish()
+    void impact_token_end();
 
     // wait out the decode I/O worker and publish the L2 slots its stores filled.
     // The context calls this before the dense demotion copies the device weights

@@ -2842,6 +2842,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         moe_out = ggml_add(ctx0, moe_out, shexp);
     }
 
+    // disk-stage real-damage measurement: the squared norm of the whole branch,
+    // routed experts plus the shared expert, so the drop perturb can be reported
+    // against the output the layer actually produces. Same decode-only gate as
+    // ffn_moe_out_norm, and read back the same way
+    if (dc != nullptr && dc->force_weights_host && n_tokens == 1) {
+        ggml_tensor * branch_norm = ggml_sum_rows(ctx0, ggml_sqr(ctx0, moe_out));
+        cb(branch_norm, "ffn_branch_out_norm", il);
+        ggml_set_output(branch_norm);
+        ggml_build_forward_expand(gf, branch_norm);
+    }
+
     return moe_out;
 }
 
