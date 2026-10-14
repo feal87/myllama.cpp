@@ -3200,6 +3200,84 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--disk-stage-drop-measure-every"}, "N",
+        string_format(
+            "with --disk-stage-drop-fraction, on one layer fill in every N\n"
+            "do not apply the cache-aware drop. The experts it would have\n"
+            "removed are read and computed anyway, so the true output norm of a\n"
+            "would-be drop is measured and the report can score the stored\n"
+            "per-expert estimate against it. This is a calibration tool: it\n"
+            "costs the disk reads the drop was meant to skip, so it is off by\n"
+            "default (default: %d)",
+            (int) params.disk_stage_drop_measure_every
+        ),
+        [](common_params & params, const std::string & value) {
+            const int v = std::stoi(value);
+            if (v < 0) {
+                throw std::invalid_argument("error: --disk-stage-drop-measure-every must be >= 0");
+            }
+            params.disk_stage_drop_measure_every = v;
+        }
+    ));
+    add_opt(common_arg(
+        {"--disk-stage-drop-rank"}, "R",
+        string_format(
+            "with --disk-stage-drop-fraction, how to rank the cold, below-floor drop candidates. 'score' drops the lowest router score, 'real' drops the smallest estimated real output (score times the measured per-expert output norm), which removes the least real mass for the same skipped read. 'real' needs a per-expert norm estimate, which the post-compute measurement builds up over the run, and falls back to the layer average for experts with none (default: %s)",
+            params.disk_stage_drop_rank_real ? "real" : "score"
+        ),
+        [](common_params & params, const std::string & value) {
+            if (value == "real") {
+                params.disk_stage_drop_rank_real = true;
+            } else if (value == "score") {
+                params.disk_stage_drop_rank_real = false;
+            } else {
+                throw std::invalid_argument("error: --disk-stage-drop-rank must be 'score' or 'real'");
+            }
+        }
+    ));
+    add_opt(common_arg(
+        {"--disk-stage-drop-max-real-mass"}, "M",
+        string_format(
+            "with --disk-stage-drop-fraction, hard ceiling on the estimated real output mass a single-token decode layer may remove, as a fraction of that layer's estimated routed real mass. Same idea as --disk-stage-drop-max-mass, but on the measured quantity the report prints instead of the score proxy. 0 disables the ceiling (default: %.2f)",
+            (double) params.disk_stage_drop_max_real_mass
+        ),
+        [](common_params & params, const std::string & value) {
+            const float v = std::stof(value);
+            if (v < 0.0f || v > 1.0f) {
+                throw std::invalid_argument("error: --disk-stage-drop-max-real-mass must be in [0, 1]");
+            }
+            params.disk_stage_drop_max_real_mass = v;
+        }
+    ));
+    add_opt(common_arg(
+        {"--disk-stage-drop-max-real-mass-token"}, "T",
+        string_format(
+            "with --disk-stage-drop-fraction, the same real-mass ceiling as --disk-stage-drop-max-real-mass, but per single-token decode across all of its MoE layers. The budget is a running total over the token's layer fills. 0 disables the ceiling (default: %.2f)",
+            (double) params.disk_stage_drop_max_real_mass_token
+        ),
+        [](common_params & params, const std::string & value) {
+            const float v = std::stof(value);
+            if (v < 0.0f || v > 1.0f) {
+                throw std::invalid_argument("error: --disk-stage-drop-max-real-mass-token must be in [0, 1]");
+            }
+            params.disk_stage_drop_max_real_mass_token = v;
+        }
+    ));
+    add_opt(common_arg(
+        {"--disk-stage-drop-real-target"}, "G",
+        string_format(
+            "with --disk-stage-drop-fraction, a per-layer governor target for the measured real drop impact. Each layer keeps a short average of its measured real impact; while it runs above G the layer's drop budget is scaled down in steps, and while it runs below G it is scaled back up. At the default fraction this is effectively a per-layer on/off, so it trades skipped reads in the expensive layers for a lower worst-layer impact. 0 disables the governor (default: %.2f)",
+            (double) params.disk_stage_drop_real_target
+        ),
+        [](common_params & params, const std::string & value) {
+            const float v = std::stof(value);
+            if (v < 0.0f || v > 1.0f) {
+                throw std::invalid_argument("error: --disk-stage-drop-real-target must be in [0, 1]");
+            }
+            params.disk_stage_drop_real_target = v;
+        }
+    ));
+    add_opt(common_arg(
         {"--disk-stage-l2-permanent-mib"}, "N",
         string_format(
             "with --load-mode dio, reserve N MiB of dedicated, RAM-locked host\n"

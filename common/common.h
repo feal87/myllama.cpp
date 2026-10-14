@@ -553,6 +553,21 @@ struct common_params {
     // disk stage: measure and report the routed score distribution without
     // dropping anything. See --disk-stage-drop-probe.
     bool     disk_stage_drop_probe =     false;
+    // disk stage: on one layer fill in every N, do not apply the drop so the
+    // experts it would have removed are computed and the stored output-norm
+    // estimate can be scored against the truth (0 = off). Costs the skipped
+    // disk reads on those fills. See --disk-stage-drop-measure-every.
+    int32_t  disk_stage_drop_measure_every = 0;
+    // disk stage: rank the drop candidates by estimated real output impact
+    // (score * measured norm) instead of by score. See --disk-stage-drop-rank.
+    bool     disk_stage_drop_rank_real = true;
+    // disk stage: ceilings on the estimated real output mass the drop removes,
+    // per layer and per token (0 = off). See --disk-stage-drop-max-real-mass.
+    float    disk_stage_drop_max_real_mass = 0.0f;
+    float    disk_stage_drop_max_real_mass_token = 0.0f;
+    // disk stage: per-layer governor target for the measured real drop impact
+    // (0 = off). See --disk-stage-drop-real-target.
+    float    disk_stage_drop_real_target = 0.0f;
     // disk stage: dedicated mlocked L2 pool, in MiB, that survives prefill
     // (0 = off). See --disk-stage-l2-permanent-mib.
     uint64_t disk_stage_l2_permanent_mib = 0;

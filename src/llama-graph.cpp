@@ -2787,6 +2787,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_down_biased", il);
     }
 
+    // disk-stage drop measurement: the per-position squared output norm, reduced
+    // on the node's own backend so a device-served expert (VRAM cache) costs a
+    // few bytes of readback instead of its whole output crossing PCIe. Output
+    // flag keeps the small tensor alive until the caller reads it back. Decode
+    // only: the measurement never runs on a multi-token graph, so do not pay the
+    // extra nodes there
+    if (dc != nullptr && dc->force_weights_host && n_tokens == 1) {
+        ggml_tensor * experts_norm = ggml_sum_rows(ctx0, ggml_sqr(ctx0, experts));
+        cb(experts_norm, "ffn_moe_out_norm", il);
+        ggml_set_output(experts_norm);
+        ggml_build_forward_expand(gf, experts_norm);
+    }
+
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);

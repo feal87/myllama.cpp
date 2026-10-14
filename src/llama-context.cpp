@@ -257,6 +257,11 @@ llama_context::llama_context(
     cparams.disk_stage_drop_substitute_rel  = params.disk_stage_drop_substitute_rel;
     cparams.disk_stage_drop_substitute_pool = params.disk_stage_drop_substitute_pool;
     cparams.disk_stage_drop_probe     = params.disk_stage_drop_probe;
+    cparams.disk_stage_drop_measure_every = params.disk_stage_drop_measure_every;
+    cparams.disk_stage_drop_rank_real = params.disk_stage_drop_rank_real;
+    cparams.disk_stage_drop_max_real_mass = params.disk_stage_drop_max_real_mass;
+    cparams.disk_stage_drop_max_real_mass_token = params.disk_stage_drop_max_real_mass_token;
+    cparams.disk_stage_drop_real_target = params.disk_stage_drop_real_target;
     cparams.disk_stage_l2_permanent_bytes = params.disk_stage_l2_permanent_bytes;
 
     // The hot-expert cache is the shared router-observation engine: it maintains
@@ -296,6 +301,11 @@ llama_context::llama_context(
                 cparams.disk_stage_drop_max_mass_token,
                 cparams.disk_stage_drop_substitute_rel, cparams.disk_stage_drop_substitute_pool,
                 cparams.disk_stage_drop_probe,
+                cparams.disk_stage_drop_measure_every,
+                cparams.disk_stage_drop_rank_real,
+                cparams.disk_stage_drop_max_real_mass,
+                cparams.disk_stage_drop_max_real_mass_token,
+                cparams.disk_stage_drop_real_target,
                 cparams.disk_stage_l2_permanent_bytes,
                 params.dense_vram_tensors != nullptr && params.dense_vram_tensors[0] != '\0'
                     ? llama_dense_vram::find_host_regions(model, params.dense_vram_tensors)
@@ -2147,10 +2157,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // stream-synchronizing reads. Runs before the VRAM tier's tick so its
     // rebalance sees the refreshed counts (same ordering as the old mid-graph
     // observation).
-    if (hot_experts && hot_observe_decode && ubatch.n_tokens == 1) {
-        hot_experts->observe_decode_begin(hot_topk_tensors, sched.get());
+    if (ubatch.n_tokens == 1 && ((hot_experts && hot_observe_decode) || (disk_stage != nullptr && disk_stage->drops_enabled()))) {
+        const bool hot_obs     = hot_experts && hot_observe_decode;
+        const bool disk_norms  = disk_stage != nullptr && disk_stage->drops_enabled();
+        if (hot_obs) {
+            hot_experts->observe_decode_begin(hot_topk_tensors, sched.get());
+        }
+        if (disk_norms) {
+            disk_stage->observe_norms_begin(sched.get());
+        }
         ggml_backend_sched_synchronize(sched.get());
-        hot_experts->observe_decode_finish();
+        if (disk_norms) {
+            disk_stage->observe_norms_finish();
+        }
+        if (hot_obs) {
+            hot_experts->observe_decode_finish();
+        }
     }
 
     // graph boundary: publish the completed MoE expert-cache uploads and schedule
@@ -5381,6 +5403,11 @@ llama_context_params llama_context_default_params() {
         /*.disk_stage_drop_substitute_rel  =*/ 0.0f,
         /*.disk_stage_drop_substitute_pool =*/ 0,
         /*.disk_stage_drop_probe     =*/ false,
+        /*.disk_stage_drop_measure_every =*/ 0,
+        /*.disk_stage_drop_rank_real =*/ true,
+        /*.disk_stage_drop_max_real_mass =*/ 0.0f,
+        /*.disk_stage_drop_max_real_mass_token =*/ 0.0f,
+        /*.disk_stage_drop_real_target =*/ 0.0f,
         /*.disk_stage_l2_permanent_bytes =*/ 0,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,

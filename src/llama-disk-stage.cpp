@@ -662,11 +662,18 @@ struct llama_disk_stage::impl {
         std::vector<uint8_t> vram;            // expert id -> served by the VRAM cache (host chain skips it)
         std::vector<uint8_t> base;            // expert id -> permanent base resident (never evicted)
         // real drop impact: EWMA of the measured output norm ||E_e(x)|| per
-        // expert (0 = not measured yet), and the routed expert ids of the current
-        // fill, saved so the post-compute hook maps output columns to experts.
-        // Compute-thread only
+        // expert (0 = not measured yet), and the routed expert ids, scores and
+        // drop flags of the current fill, saved so the post-compute hook can
+        // map output columns to experts and recompute the impact from the fresh
+        // norms. Compute-thread only
         std::vector<float>   out_norm;
         std::vector<int32_t> meas_ids;
+        std::vector<float>   meas_scores;
+        std::vector<uint8_t> meas_drop;
+        // per-layer governor state: EWMA of the measured real drop impact, and
+        // the budget scale it drives when --disk-stage-drop-real-target is on
+        double real_ewma    = 0.0;
+        float  budget_scale = 1.0f;
         llama_disk_stage_cache_layer pub;     // public view returned by cache_layer()
     };
     ggml_backend_buffer_t cache_buf  = nullptr;
@@ -812,25 +819,75 @@ struct llama_disk_stage::impl {
     double   drop_worst_mass  = 0.0;
     // worst whole-token perturbation share since the last report
     double   drop_worst_token_mass = 0.0;
+    // the same whole-token worst on the measured real mass, so a token-level
+    // spike is visible even when no single layer stands out
+    double   drop_worst_token_real = 0.0;
     // worst single-layer real output perturbation share since the last report:
-    // dropped contribution / measured routed contribution, so a layer whose
-    // dropped experts carry more output than their score suggests stands out
+    // dropped contribution / routed contribution, both computed from the fresh
+    // output norms where they exist and from the per-expert memory where not
     double   drop_worst_real_mass = 0.0;
+    // the same worsts over the whole run, kept next to the per-interval ones so
+    // an interval that drops little cannot hide the risk the run already took
+    double   drop_worst_mass_run       = 0.0;
+    double   drop_worst_real_run       = 0.0;
+    double   drop_worst_token_mass_run = 0.0;
+    double   drop_worst_token_real_run = 0.0;
+    // worst single-layer / whole-token share of the output VECTOR, not of the
+    // weighted-norm mass. The norm pass divides by the sum of the kept weights,
+    // so a drop also scales everything left by 1/(1 - W_D). With the experts
+    // orthogonal (measured cosine ~0.006 on all four models) the removed mass
+    // and that scale-up are both computable from the per-expert norms alone
+    double   drop_worst_perturb           = 0.0;
+    double   drop_worst_perturb_run       = 0.0;
+    double   drop_worst_token_perturb     = 0.0;
+    double   drop_worst_token_perturb_run = 0.0;
     // real drop impact: the drop decision only sees the router score, because
     // the dropped expert is never read. The post-compute hook measures the
-    // output norm ||E_e(x)|| of every expert it can (routed positions of a
-    // computed ffn_moe_weighted) and keeps an EWMA per (layer, expert). A drop
-    // then estimates its removed contribution as score * that norm, so the two
-    // masses below are the removed share on the measured subset and the routed
-    // total over that same subset. Their coverage is reported, since an expert
-    // that is always cold and always dropped is never measured
-    static constexpr float out_norm_alpha = 0.05f;
-    uint64_t n_dropped_measured  = 0; // dropped positions with a known norm
+    // output norm ||E_e(x)|| of every expert it computes and keeps an EWMA per
+    // (layer, expert). A dropped expert, or one the host chain did not run, is
+    // estimated with that memory. The memory is short on purpose: the router
+    // only revisits an expert every few hundred tokens, so a slow average would
+    // describe the distant past instead of the current routing
+    static constexpr float out_norm_alpha = 0.30f;
+    uint64_t n_dropped_measured  = 0; // dropped positions with a stored norm
     uint64_t n_dropped_all       = 0; // dropped positions
-    uint64_t n_routed_measured   = 0; // routed positions with a known norm
+    uint64_t n_routed_measured   = 0; // routed positions measured this token
     uint64_t n_routed_all        = 0; // routed positions considered
-    double   n_dropped_real_mass = 0.0;
-    double   n_routed_real_mass  = 0.0;
+    double   n_dropped_real_mass  = 0.0; // estimated removed output mass
+    double   n_routed_real_mass   = 0.0; // estimated routed output mass
+    double   n_routed_score_all   = 0.0; // score mass of every routed position
+    // perturbation energy, so the run mean is an RMS ratio: sum of ||Y||^2 and
+    // sum of ||delta||^2 over the layers that actually dropped
+    double   n_routed_perturb_e   = 0.0;
+    double   n_dropped_perturb_e  = 0.0;
+    // which test ended the drop loop: would-be reads removed by the candidate
+    // floor, by the per-layer budget, or stopped early by a cap
+    uint64_t n_drop_excl_floor    = 0;
+    uint64_t n_drop_excl_budget   = 0;
+    uint64_t n_drop_stop_cap      = 0;
+
+    // --disk-stage-drop-measure-every: on every N-th single-token decode the
+    // drop is not applied, so the experts it would have removed are computed and
+    // measured and the report can state how far their stored estimate was from
+    // the truth. Off by default: skipping those reads is the point of the drop
+    int64_t  drop_measure_every  = 0;
+    uint64_t n_fill_calls        = 0;
+    uint64_t n_verify            = 0;   // probed dropped experts compared
+    uint64_t n_verify_close      = 0;   // fresh norm within 2x of the estimate
+    double   n_verify_rel_err    = 0.0; // sum |fresh - est| / fresh
+
+    // real drop impact norm readback: the per-expert squared output norm is
+    // reduced in the graph (ffn_moe_out_norm, see build_moe_ffn) on the node's
+    // own backend. A host norm is read in the computed callback; a device norm
+    // (VRAM-served expert) is staged into a pinned host row and folded in after
+    // the caller's single decode sync, so the GPU work rides the idle window and
+    // the CPU only touches a handful of floats per layer
+    struct norm_pending { int il; ggml_tensor * node; };
+    std::vector<norm_pending> norm_pending;
+    ggml_backend_buffer_t     norm_stage_buf   = nullptr;
+    float *                   norm_stage       = nullptr;
+    int64_t                   norm_stage_slots = 0; // floats per layer row
+    int64_t                   norm_stage_layers = 0;
 
     // fill_cache() scratch: the decode fill runs once per layer per token on the
     // compute thread, so reuse these instead of reallocating per call
@@ -882,6 +939,9 @@ struct llama_disk_stage::impl {
     // per-position drop flags of the current fill, reused to avoid a per-layer
     // allocation on the decode hot path
     std::vector<uint8_t>                 fs_drop;
+    // probe flags of the current fill: the positions the drop would have removed
+    // on a --disk-stage-drop-measure-every token, kept so they get measured
+    std::vector<uint8_t>                 fs_probe;
     // cold routed positions of the current fill, ranked by score
     std::vector<int64_t>                 fs_cold;
     // substitution decision of the current fill, per routed position
@@ -915,6 +975,20 @@ struct llama_disk_stage::impl {
     // mass, and per token, as a fraction of the token's routed mass (0 = off)
     float   drop_max_mass = 0.0f;
     float   drop_max_mass_token = 0.0f;
+    // rank the drop candidates by their estimated real impact (score * measured
+    // output norm) instead of by score alone, so the drop removes the least real
+    // output it can for the same skipped read
+    bool    drop_rank_real = true;
+    // hard ceilings on the estimated real output mass the drop removes: per
+    // layer, as a fraction of the layer's routed real mass, and per token, as a
+    // fraction of the token's routed real mass (0 = off). Same idea as
+    // drop_max_mass, but on the measured quantity the report prints
+    float   drop_max_real_mass = 0.0f;
+    float   drop_max_real_mass_token = 0.0f;
+    // per-layer governor target: when a layer's measured real drop impact runs
+    // above this share, its drop budget is scaled down; below it, scaled back up
+    // (0 = off)
+    float   drop_real_target = 0.0f;
     // substitution: replace a cold routed expert with a nearby resident one
     // instead of reading or dropping it. The spare must score inside
     // [substitute_rel, 1/substitute_rel] of the cold score. pool = 0 = off
@@ -924,6 +998,11 @@ struct llama_disk_stage::impl {
     // in split_token_end() and fed by each layer's fill in fill_cache_plan
     double  tok_routed_mass  = 0.0;
     double  tok_dropped_mass = 0.0; // dropped score mass plus substitution |c - e|
+    // the same running budget on the estimated real mass
+    double  tok_routed_real  = 0.0;
+    double  tok_dropped_real = 0.0;
+    double  tok_routed_perturb_e  = 0.0;
+    double  tok_dropped_perturb_e = 0.0;
     bool    drop_probe     = false;
     // dropping and the probe wait until the resident cache is this full, so the
     // warm-up cold experts (not cached yet, not weak) are not dropped
@@ -943,6 +1022,175 @@ struct llama_disk_stage::impl {
     }
     bool drop_enabled() const {
         return drop_fraction > 0.0f || drop_probe || substitute_enabled();
+    }
+
+    // fold one layer's per-position output norms into the impact accounting and
+    // the per-expert memory. Positions computed this token use their fresh norm;
+    // a dropped expert is never computed, so it is estimated from the stored
+    // norm, and a position with no stored norm falls back to the layer's
+    // measured average norm per score
+    void apply_out_norm(int il, const float * sq) {
+        cache_layer & c = cache[il];
+        const int64_t n_used = (int64_t) c.meas_ids.size();
+        if (n_used <= 0 || (int64_t) c.meas_scores.size() != n_used) {
+            return;
+        }
+
+        // the layer's measured average norm per score, for the positions with no
+        // stored norm at all
+        double measured_mass  = 0.0;
+        double measured_score = 0.0;
+        for (int64_t i = 0; i < n_used; ++i) {
+            if (sq[i] > 0.0f) {
+                measured_mass  += (double) c.meas_scores[(size_t) i] * (double) std::sqrt(sq[i]);
+                measured_score += (double) c.meas_scores[(size_t) i];
+            }
+        }
+        const double layer_avg = measured_score > 0.0 ? measured_mass / measured_score : 0.0;
+
+        // real impact of this token: the kept experts contribute their fresh
+        // norm, the dropped one only its stored estimate, so the ratio is not
+        // two stale numbers divided by each other. The same loop accumulates the
+        // two quantities the output-vector perturbation needs: ||Y||^2 as the
+        // sum of (w n)^2 and the dropped share of it, both with the weights
+        // normalized the way the graph normalizes them, over all routed experts
+        double score_sum = 0.0;
+        for (int64_t i = 0; i < n_used; ++i) {
+            score_sum += (double) c.meas_scores[(size_t) i];
+        }
+        double routed_est  = 0.0;
+        double dropped_est = 0.0;
+        double out_sq_all  = 0.0;
+        double out_sq_drop = 0.0;
+        double w_drop      = 0.0;
+        for (int64_t i = 0; i < n_used; ++i) {
+            const int32_t id = c.meas_ids[(size_t) i];
+            const double  sc = (double) c.meas_scores[(size_t) i];
+            const bool    has_stored = id >= 0 && id < (int32_t) c.out_norm.size() && c.out_norm[(size_t) id] > 0.0f;
+            double        norm;
+            if (sq[i] > 0.0f) {
+                norm = (double) std::sqrt(sq[i]);
+            } else if (has_stored) {
+                norm = (double) c.out_norm[(size_t) id];
+            } else {
+                norm = layer_avg;
+            }
+            routed_est += sc * norm;
+            const double w = score_sum > 0.0 ? sc / score_sum : 0.0;
+            out_sq_all += w * w * norm * norm;
+            n_routed_all++;
+            if (sq[i] > 0.0f) {
+                n_routed_measured++;
+            }
+
+            const uint8_t flag = i < (int64_t) c.meas_drop.size() ? c.meas_drop[(size_t) i] : 0;
+            if (flag != 0) {
+                dropped_est += sc * norm;
+                out_sq_drop += w * w * norm * norm;
+                w_drop      += w;
+                n_dropped_all++;
+                if (has_stored) {
+                    n_dropped_measured++;
+                }
+                // --disk-stage-drop-measure-every: this token skipped the drop,
+                // so the fresh norm is the truth the stored estimate stood in for
+                if (flag == 2 && sq[i] > 0.0f && has_stored) {
+                    const double est = (double) c.out_norm[(size_t) id];
+                    n_verify_rel_err += std::fabs(norm - est) / norm;
+                    n_verify++;
+                    if (norm <= 2.0 * est && est <= 2.0 * norm) {
+                        n_verify_close++;
+                    }
+                }
+            }
+        }
+        if (routed_est > 0.0) {
+            n_routed_real_mass  += routed_est;
+            n_dropped_real_mass += dropped_est;
+            const double real = dropped_est / routed_est;
+            if (real > drop_worst_real_mass) {
+                drop_worst_real_mass = real;
+            }
+            if (real > drop_worst_real_run) {
+                drop_worst_real_run = real;
+            }
+            // output-vector perturbation. Removing the experts and renormalizing
+            // over what is left is delta = (W_D/(1-W_D)) * (Y - R), where R is the
+            // dropped experts' weighted output. With orthogonal experts
+            // |Y - R|^2 = |Y|^2 + |R|^2 - 2<Y,R> and all three terms are sums of
+            // (w n)^2. It is the removed mass plus the scale-up of what remains
+            if (w_drop > 0.0 && w_drop < 1.0 && out_sq_all > 0.0) {
+                const double tail = out_sq_all + out_sq_drop / (w_drop * w_drop) - 2.0 * out_sq_drop / w_drop;
+                const double amp  = w_drop / (1.0 - w_drop);
+                const double delta_sq = tail > 0.0 ? amp * amp * tail : 0.0;
+                const double perturb  = std::sqrt(delta_sq / out_sq_all);
+                if (perturb > drop_worst_perturb) {
+                    drop_worst_perturb = perturb;
+                }
+                if (perturb > drop_worst_perturb_run) {
+                    drop_worst_perturb_run = perturb;
+                }
+                n_routed_perturb_e    += out_sq_all;
+                n_dropped_perturb_e   += delta_sq;
+                tok_routed_perturb_e  += out_sq_all;
+                tok_dropped_perturb_e += delta_sq;
+            }
+            // per-layer governor: only a token that actually dropped says
+            // anything about the layer's real impact. The memory is short, and
+            // the budget scale walks in fixed steps toward the target. Gated on
+            // the target so a disabled governor costs nothing
+            if (drop_real_target > 0.0f && dropped_est > 0.0) {
+                static constexpr double adapt_alpha = 0.1;
+                static constexpr float  adapt_step  = 0.1f;
+                c.real_ewma = c.real_ewma > 0.0 ? c.real_ewma + adapt_alpha * (real - c.real_ewma) : real;
+                if (c.real_ewma > (double) drop_real_target) {
+                    c.budget_scale = std::max(0.0f, c.budget_scale - adapt_step);
+                } else {
+                    c.budget_scale = std::min(1.0f, c.budget_scale + adapt_step);
+                }
+            }
+        }
+
+        // fold the fresh norms into the per-expert memory. A dropped or masked
+        // position has no fresh norm, so it keeps its last value
+        for (int64_t i = 0; i < n_used; ++i) {
+            if (!(sq[i] > 0.0f)) {
+                continue;
+            }
+            const int32_t id = c.meas_ids[(size_t) i];
+            if (id < 0 || id >= (int32_t) c.out_norm.size()) {
+                continue;
+            }
+            const float norm = std::sqrt(sq[i]);
+            float &     slot = c.out_norm[(size_t) id];
+            slot = slot > 0.0f ? slot + out_norm_alpha * (norm - slot) : norm;
+        }
+    }
+
+    // pinned host staging for the device norm readback, one row per layer
+    bool ensure_norm_stage(ggml_backend_dev_t dev, int64_t slots, int64_t layers) {
+        if (norm_stage_buf != nullptr && norm_stage_slots >= slots && norm_stage_layers >= layers) {
+            return true;
+        }
+        if (norm_stage_buf != nullptr) {
+            ggml_backend_buffer_free(norm_stage_buf);
+            norm_stage_buf  = nullptr;
+            norm_stage      = nullptr;
+            norm_stage_slots = 0;
+            norm_stage_layers = 0;
+        }
+        ggml_backend_buffer_type_t buft = dev != nullptr ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+        if (buft == nullptr) {
+            return false;
+        }
+        norm_stage_buf = ggml_backend_buft_alloc_buffer(buft, (size_t) slots * (size_t) layers * sizeof(float));
+        if (norm_stage_buf == nullptr) {
+            return false;
+        }
+        norm_stage        = (float *) ggml_backend_buffer_get_base(norm_stage_buf);
+        norm_stage_slots  = slots;
+        norm_stage_layers = layers;
+        return true;
     }
 
     // share of the resident decode slots that hold an expert's bytes
@@ -1452,6 +1700,9 @@ struct llama_disk_stage::impl {
         if (perm_buf) {
             ggml_backend_buffer_free(perm_buf);
         }
+        if (norm_stage_buf) {
+            ggml_backend_buffer_free(norm_stage_buf);
+        }
         if (ctx) {
             ggml_free(ctx);
         }
@@ -1824,15 +2075,12 @@ void llama_disk_stage::node_prepare_callback(struct ggml_tensor * node, void * u
 #endif
 }
 
-// real drop impact: read the per-expert weighted output of a layer that just
-// real drop impact: read the per-expert unweighted output of a layer that just
-// computed and fold its norm into the per-expert EWMA. The target is the host
-// node that merges the expert passes (ffn_moe_cold_add when the L2 split runs,
-// ffn_moe_cache_merged with the VRAM cache, ffn_moe_down otherwise): its columns
-// are E_e per routed position, so no weight division is needed. The final
-// ffn_moe_weighted mul is not usable: it can be scheduled onto the GPU when the
-// dense layers are offloaded, even though the expert chain runs on the host.
-// Runs only while the drop lever is on, and only for host-buffer decode nodes
+// real drop impact: fold one layer's per-expert output norm into the EWMA the
+// drop accounting uses. The norm is reduced in the graph (ffn_moe_out_norm, see
+// build_moe_ffn) on the node's own backend, so an expert served from VRAM is
+// measured on the GPU and only a few bytes cross to the host. A host norm is
+// applied here; a device norm is queued for observe_norms_begin()/finish().
+// Runs only while the drop lever is on, and only on the decode graph
 void llama_disk_stage::node_computed_callback(struct ggml_tensor * node, void * user_data) {
 #if defined(_WIN32)
     auto * self = static_cast<llama_disk_stage *>(user_data);
@@ -1840,23 +2088,12 @@ void llama_disk_stage::node_computed_callback(struct ggml_tensor * node, void * 
     if (!p.active || node == nullptr || !p.drop_enabled()) {
         return;
     }
-    // decode only: a multi-token graph never saved the routed ids
-    if (node->ne[2] != 1 || node->type != GGML_TYPE_F32 || node->data == nullptr ||
-            node->buffer == nullptr || !ggml_backend_buffer_is_host(node->buffer)) {
+    static const char prefix[] = "ffn_moe_out_norm-";
+    if (std::strncmp(node->name, prefix, sizeof(prefix) - 1) != 0) {
         return;
     }
-
-    static const char n_cold[]  = "ffn_moe_cold_add-";
-    static const char n_mc[]    = "ffn_moe_cache_merged-";
-    // a per-expert down scale renames the merged node (the scale itself is
-    // already folded into the down projection, so the read stays correct)
-    static const char n_plain[] = "ffn_moe_down-";
-    static const char n_scaled[] = "ffn_moe_down_scaled-";
-    const bool is_cold   = std::strncmp(node->name, n_cold,   sizeof(n_cold)   - 1) == 0;
-    const bool is_mc     = std::strncmp(node->name, n_mc,     sizeof(n_mc)     - 1) == 0;
-    const bool is_plain  = std::strncmp(node->name, n_plain,  sizeof(n_plain)  - 1) == 0;
-    const bool is_scaled = std::strncmp(node->name, n_scaled, sizeof(n_scaled) - 1) == 0;
-    if (!is_cold && !is_mc && !is_plain && !is_scaled) {
+    // decode only: a multi-token graph never saved the routed ids
+    if (node->ne[2] != 1 || node->ne[1] <= 0 || node->type != GGML_TYPE_F32) {
         return;
     }
     const char * dash = std::strrchr(node->name, '-');
@@ -1865,46 +2102,61 @@ void llama_disk_stage::node_computed_callback(struct ggml_tensor * node, void * 
         return;
     }
     impl::cache_layer & c = p.cache[il];
-    if (c.table == nullptr || c.out_norm.empty()) {
+    if (c.table == nullptr || c.out_norm.empty() || (int64_t) c.meas_ids.size() != node->ne[1]) {
         return;
     }
-    const int64_t n_used = node->ne[1];
-    const int64_t n_embd = node->ne[0];
-    if (n_used <= 0 || n_embd <= 0 || (int64_t) c.meas_ids.size() != n_used) {
-        return;
-    }
-
-    // a pass covers every routed position, but the ones it does not serve are
-    // zeroed (sentinel skip, dropped weights), so a zero column is left unmeasured
-    const char * base = (const char *) node->data;
-    for (int64_t i = 0; i < n_used; ++i) {
-        const int32_t id = c.meas_ids[(size_t) i];
-        if (id < 0 || id >= (int32_t) c.out_norm.size()) {
-            continue;
-        }
-        const char * col = base + i * node->nb[1];
-        double acc = 0.0;
-        if (node->nb[0] == sizeof(float)) {
-            const float * v = (const float *) col;
-            for (int64_t e = 0; e < n_embd; ++e) {
-                acc += (double) v[e] * (double) v[e];
-            }
-        } else {
-            for (int64_t e = 0; e < n_embd; ++e) {
-                const float v = *(const float *) (col + e * node->nb[0]);
-                acc += (double) v * (double) v;
-            }
-        }
-        if (!(acc > 0.0)) {
-            continue;
-        }
-        const float norm = (float) std::sqrt(acc);
-        float & slot     = c.out_norm[(size_t) id];
-        slot = slot > 0.0f ? slot + p.out_norm_alpha * (norm - slot) : norm;
+    if (node->buffer != nullptr && node->data != nullptr && ggml_backend_buffer_is_host(node->buffer)) {
+        p.apply_out_norm(il, (const float *) node->data);
+    } else if (node->buffer != nullptr) {
+        p.norm_pending.push_back({ il, node });
     }
 #else
     GGML_UNUSED(node);
     GGML_UNUSED(user_data);
+#endif
+}
+
+// batch the device norms onto the pinned staging rows; the caller's single decode
+// sync covers the copies, then observe_norms_finish() folds them in
+void llama_disk_stage::observe_norms_begin(ggml_backend_sched_t sched) {
+#if defined(_WIN32)
+    impl & p = *pimpl;
+    if (p.norm_pending.empty()) {
+        return;
+    }
+    int64_t slots = 0;
+    for (const auto & e : p.norm_pending) {
+        slots = std::max<int64_t>(slots, e.node->ne[1]);
+    }
+    ggml_backend_t     be0  = ggml_backend_sched_get_tensor_backend(sched, p.norm_pending[0].node);
+    ggml_backend_dev_t dev0 = be0 != nullptr ? ggml_backend_get_device(be0) : nullptr;
+    if (!p.ensure_norm_stage(dev0, slots, (int64_t) p.cache.size())) {
+        p.norm_pending.clear();
+        return;
+    }
+    for (const auto & e : p.norm_pending) {
+        ggml_backend_t be = ggml_backend_sched_get_tensor_backend(sched, e.node);
+        if (be == nullptr) {
+            continue;
+        }
+        float * dst = p.norm_stage + (size_t) e.il * (size_t) p.norm_stage_slots;
+        ggml_backend_tensor_get_async(be, e.node, dst, 0, (size_t) e.node->ne[1] * sizeof(float));
+    }
+#else
+    GGML_UNUSED(sched);
+#endif
+}
+
+void llama_disk_stage::observe_norms_finish() {
+#if defined(_WIN32)
+    impl & p = *pimpl;
+    for (const auto & e : p.norm_pending) {
+        if ((int64_t) p.cache[e.il].meas_ids.size() != e.node->ne[1]) {
+            continue;
+        }
+        p.apply_out_norm(e.il, p.norm_stage + (size_t) e.il * (size_t) p.norm_stage_slots);
+    }
+    p.norm_pending.clear();
 #endif
 }
 
@@ -1992,10 +2244,15 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
         return whole ? 100.0 * (double) part / (double) whole : 0.0;
     };
 
-    // every block leads with the selections the previous tier passed down
+    // every block leads with the selections the previous tier passed down. The
+    // L2 never looks up what the drop and the substitution removed, so its base
+    // is its own lookups; the wider RAM-miss funnel is printed next to it and the
+    // gap is what the later tiers suppressed
+    const uint64_t l2_lookups    = p.n_l2_all_hits + p.n_l2_all_misses;
+    const uint64_t l2_suppressed = base_l2 > l2_lookups ? base_l2 - l2_lookups : 0;
     const size_t s_bl2 = out.size();
-    line("  base      : %" PRIu64 " RAM misses (%.1f%% of %" PRIu64 " routed)",
-         base_l2, pct(base_l2, routed), routed);
+    line("  base      : %" PRIu64 " lookups (%.1f%% of %" PRIu64 " RAM misses, %.1f%% of %" PRIu64 " routed) | %" PRIu64 " never looked up",
+         l2_lookups, pct(l2_lookups, base_l2), base_l2, pct(base_l2, routed), routed, l2_suppressed);
     const std::string sec_base_l2 = out.substr(s_bl2);
 
     const size_t s_bsub = out.size();
@@ -2004,13 +2261,13 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     const std::string sec_base_sub = out.substr(s_bsub);
 
     const size_t s_bdrop = out.size();
-    line("  base      : %" PRIu64 " after substitution (%.1f%% of %" PRIu64 " routed)",
-         base_drop, pct(base_drop, routed), routed);
+    line("  base      : %" PRIu64 " would-be reads of %" PRIu64 " RAM misses (%.1f%% of %" PRIu64 " routed)",
+         base_drop, base_l2, pct(base_drop, routed), routed);
     const std::string sec_base_drop = out.substr(s_bdrop);
 
     const size_t s_bdisk = out.size();
-    line("  base      : %" PRIu64 " reads (%.1f%% of %" PRIu64 " routed)",
-         base_disk, pct(base_disk, routed), routed);
+    line("  base      : %" PRIu64 " reads of %" PRIu64 " would-be reads (%.1f%% of %" PRIu64 " routed)",
+         base_disk, base_drop, pct(base_disk, routed), routed);
     const std::string sec_base_disk = out.substr(s_bdisk);
 
     // the sets read into the decode cache at load and the graph split state
@@ -2076,6 +2333,9 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     if ((p.drop_fraction > 0.0f || p.drop_probe) && p.drop_warm) {
         char layer_cap[16];
         char tok_cap[16];
+        char real_cap[40];
+        char real_tok_cap[40];
+        char adapt[16];
         if (p.drop_max_mass > 0.0f) {
             snprintf(layer_cap, sizeof(layer_cap), "%.1f%%", 100.0 * (double) p.drop_max_mass);
         } else {
@@ -2086,40 +2346,101 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
         } else {
             snprintf(tok_cap, sizeof(tok_cap), "off");
         }
-        line("  config    : fraction %.3f, below-rel %.2f, layer-cap %s, token-cap %s",
-             (double) p.drop_fraction, (double) p.drop_below_rel, layer_cap, tok_cap);
-        line("  dropped   : %.1f%% cumulative (%" PRIu64 "/%" PRIu64 ") | %.1f%% this interval (%" PRIu64 "/%" PRIu64
-             ") | %s skipped | worst layer perturb %.1f%% score / %.1f%% real, worst token perturb %.1f%%",
-             pct(p.n_dropped_routes, base_drop), p.n_dropped_routes, base_drop,
+        if (p.drop_max_real_mass > 0.0f) {
+            snprintf(real_cap, sizeof(real_cap), "%.1f%% layer", 100.0 * (double) p.drop_max_real_mass);
+        } else {
+            snprintf(real_cap, sizeof(real_cap), "off");
+        }
+        if (p.drop_max_real_mass_token > 0.0f) {
+            snprintf(real_tok_cap, sizeof(real_tok_cap), "%.1f%% token", 100.0 * (double) p.drop_max_real_mass_token);
+        } else {
+            snprintf(real_tok_cap, sizeof(real_tok_cap), "off");
+        }
+        if (p.drop_real_target > 0.0f) {
+            snprintf(adapt, sizeof(adapt), "%.3f", (double) p.drop_real_target);
+        } else {
+            snprintf(adapt, sizeof(adapt), "off");
+        }
+        line("  config    : fraction %.3f | floor %.2f x top | rank %s | layer cap %s | token cap %s",
+             (double) p.drop_fraction, (double) p.drop_below_rel,
+             p.drop_rank_real ? "real" : "score", layer_cap, tok_cap);
+        line("              real-mass cap %s / %s | adapt %s", real_cap, real_tok_cap, adapt);
+        line("  dropped   : %.1f%% of would-be reads (%" PRIu64 ") | %.1f%% this interval (%" PRIu64 "/%" PRIu64 ") | %s not read",
+             pct(p.n_dropped_routes, base_drop), p.n_dropped_routes,
              pct(d_dropped, d_base_drop), d_dropped, d_base_drop,
-             report_volume(p.n_dropped_bytes).c_str(),
-             100.0 * p.drop_worst_mass, 100.0 * p.drop_worst_real_mass, 100.0 * p.drop_worst_token_mass);
-        // real impact: the droppable experts are the cold ones, so only the ones
-        // that were computed in another token carry a measured output norm. The
-        // covered fraction is printed so an always-cold, always-dropped expert
-        // cannot make the share look reassuring
+             report_volume(p.n_dropped_bytes).c_str());
+        // which test ended the drop loop. Floor and budget only claim the
+        // candidates they removed, the caps the part of the budget they stopped
+        {
+            const uint64_t whole = base_drop > 0 ? base_drop : 1;
+            line("  limited   : floor %.0f%% | budget %.0f%% | caps %.0f%% | dropped %.0f%% (whole run)",
+                 pct(p.n_drop_excl_floor, whole), pct(p.n_drop_excl_budget, whole),
+                 pct(p.n_drop_stop_cap, whole), pct(p.n_dropped_routes, whole));
+        }
+        // real impact: the dropped experts are never computed, so their norm is
+        // estimated from the per-expert memory, while the kept ones contribute
+        // their fresh norm of this token. Both masses are accumulated in
+        // apply_out_norm(), so the ratio is not two stale numbers divided by
+        // each other
         const double real_share = p.n_routed_real_mass > 0.0
                 ? 100.0 * p.n_dropped_real_mass / p.n_routed_real_mass : 0.0;
         // the same removal measured by router score alone, the number the caps
-        // and the probe use: real vs score is the factor score mass misstates
-        const double score_share = p.n_routed_mass > 0.0
-                ? 100.0 * p.n_dropped_mass / p.n_routed_mass : 0.0;
+        // and the probe use: real vs score is the factor
+        const double score_share = p.n_routed_score_all > 0.0
+                ? 100.0 * p.n_dropped_mass / p.n_routed_score_all : 0.0;
+        // the output vector, not the mass: includes the renormalization of the
+        // kept experts, so it is the number to judge the drop by
+        const double perturb_share = p.n_routed_perturb_e > 0.0
+                ? 100.0 * std::sqrt(p.n_dropped_perturb_e / p.n_routed_perturb_e) : 0.0;
         const double drop_cov = p.n_dropped_all > 0
                 ? 100.0 * (double) p.n_dropped_measured / (double) p.n_dropped_all : 0.0;
         const double routed_cov = p.n_routed_all > 0
                 ? 100.0 * (double) p.n_routed_measured / (double) p.n_routed_all : 0.0;
-        line("  real drop : %.1f%% real vs %.1f%% score of routed output mass | over %.1f%% of dropped experts (%" PRIu64 "/%" PRIu64
-             ") | routed measured %.1f%%",
-             real_share, score_share, drop_cov, p.n_dropped_measured, p.n_dropped_all, routed_cov);
+        line("%s", "  removed   : mean      worst layer   worst token     of the routed output, whole run");
+        line("    score   : %5.1f%%      %5.1f%%        %5.1f%%        router weight",
+             100.0 * score_share, 100.0 * p.drop_worst_mass_run, 100.0 * p.drop_worst_token_mass_run);
+        line("    real    : %5.1f%%      %5.1f%%        %5.1f%%        weight x output norm",
+             100.0 * real_share, 100.0 * p.drop_worst_real_run, 100.0 * p.drop_worst_token_real_run);
+        line("    perturb : %5.1f%%      %5.1f%%        %5.1f%%        output vector, renorm included",
+             100.0 * perturb_share, 100.0 * p.drop_worst_perturb_run, 100.0 * p.drop_worst_token_perturb_run);
+        line("  this itv  : layer real %.1f%% perturb %.1f%% | token real %.1f%% perturb %.1f%%",
+             100.0 * p.drop_worst_real_mass, 100.0 * p.drop_worst_perturb,
+             100.0 * p.drop_worst_token_real, 100.0 * p.drop_worst_token_perturb);
+        line("  evidence  : %.1f%% of dropped experts carry a stored norm (%" PRIu64 "/%" PRIu64
+             ") | %.1f%% of routed positions measured fresh",
+             drop_cov, p.n_dropped_measured, p.n_dropped_all, routed_cov);
+        if (p.drop_measure_every > 0) {
+            const double mean_err = p.n_verify > 0 ? 100.0 * p.n_verify_rel_err / (double) p.n_verify : 0.0;
+            const double close    = p.n_verify > 0 ? 100.0 * (double) p.n_verify_close / (double) p.n_verify : 0.0;
+            line("  probe     : %" PRIu64 " dropped experts measured (every %" PRId64 " fills) | mean estimate error %.1f%% | within 2x %.1f%%",
+                 p.n_verify, p.drop_measure_every, mean_err, close);
+        }
+        if (p.drop_real_target > 0.0f) {
+            int     throttled = 0;
+            double  sum_real  = 0.0;
+            double  max_real  = 0.0;
+            int64_t n_layer   = 0;
+            for (const impl::cache_layer & cl : p.cache) {
+                if (cl.budget_scale < 0.999f) {
+                    throttled++;
+                }
+                if (cl.real_ewma > 0.0) {
+                    sum_real += cl.real_ewma;
+                    max_real  = std::max(max_real, cl.real_ewma);
+                    n_layer++;
+                }
+            }
+            const double mean_real = n_layer > 0 ? sum_real / (double) n_layer : 0.0;
+            line("  adapt     : %d/%zu layers throttled | mean layer real %.1f%% | worst layer real (ewma) %.1f%%",
+                 throttled, p.cache.size(), 100.0 * mean_real, 100.0 * max_real);
+        }
     }
     const std::string sec_drop = out.substr(s_drop);
 
     const size_t s_l = out.size();
-    // the L2 only sees the routes that were not substituted or dropped, so its
-    // rate is over its own lookups, not the wider RAM-miss base the funnel
-    // counts. The warm-phase rate excludes the lookups served before the pool
-    // warmed, so it is printed apart
-    const uint64_t l2_lookups      = p.n_l2_all_hits + p.n_l2_all_misses;
+    // the rate is over the lookups the base line prints, so the two agree. The
+    // warm-phase rate excludes the lookups served before the pool warmed, so it
+    // is printed apart
     const uint64_t d_l2_all_miss   = p.n_l2_all_misses > p.prev_l2_all_misses ? p.n_l2_all_misses - p.prev_l2_all_misses : 0;
     const uint64_t d_l2_lookups    = d_l2_all + d_l2_all_miss;
     line("  hit       : %.1f%% cumulative (%" PRIu64 "/%" PRIu64 ") | %.1f%% this interval (%" PRIu64 "/%" PRIu64
@@ -2269,7 +2590,10 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     p.prev_dec_dropped_mass  = p.n_dropped_mass;
     p.drop_worst_mass        = 0.0;
     p.drop_worst_token_mass  = 0.0;
+    p.drop_worst_token_real  = 0.0;
     p.drop_worst_real_mass   = 0.0;
+    p.drop_worst_perturb       = 0.0;
+    p.drop_worst_token_perturb = 0.0;
     p.prev_dec_tokens        = decode_tokens;
     p.prev_base_sub          = base_sub;
     p.prev_base_drop         = base_drop;
@@ -2453,7 +2777,9 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                    const char * warm_experts_path, const char * base_template_path,
                                    int32_t sparse_max, float drop_fraction, float drop_below_rel,
                                    float drop_max_mass, float drop_max_mass_token, float substitute_rel, int32_t substitute_pool,
-                                   bool drop_probe, uint64_t permanent_bytes,
+                                   bool drop_probe, int32_t drop_measure_every,
+                                   bool drop_rank_real, float drop_max_real_mass, float drop_max_real_mass_token,
+                                   float drop_real_target, uint64_t permanent_bytes,
                                    const std::vector<std::pair<void *, size_t>> & extra_l2_regions) :
     pimpl(std::make_unique<impl>(model)) {
     impl & p = *pimpl;
@@ -2505,6 +2831,11 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     p.substitute_rel  = std::min(std::max(substitute_rel, 0.0f), 0.999f);
     p.substitute_pool = std::min(std::max(substitute_pool, 0), 64);
     p.drop_probe      = drop_probe;
+    p.drop_measure_every = drop_measure_every;
+    p.drop_rank_real  = drop_rank_real;
+    p.drop_max_real_mass = drop_max_real_mass;
+    p.drop_max_real_mass_token = drop_max_real_mass_token;
+    p.drop_real_target = drop_real_target;
     p.drop_active    = p.drop_enabled();
 
     // split the host decode MoE into a hot and a cold pass so the cold disk read
@@ -4430,12 +4761,14 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
         // so the decision is a pre-pass over the (small) routed set; the main
         // loop only honors it. The probe records the distribution
         std::vector<uint8_t> & drop        = p.fs_drop;
+        std::vector<uint8_t> & probe       = p.fs_probe;
         std::vector<uint8_t> & subst       = p.fs_subst;
         std::vector<int32_t> & subst_slot  = p.fs_subst_slot;
         std::vector<uint8_t> & subst_l2    = p.fs_subst_l2;
         std::vector<float>   & subst_scale = p.fs_subst_scale;
         std::vector<int32_t> & subst_used  = p.fs_subst_used;
         bool drop_planned = false;
+        bool probe_planned = false;
         if (p.drop_enabled() && probs != nullptr && p.resident_warm()) {
             drop.assign((size_t) n_ids, 0);
             drop_planned = true;
@@ -4448,6 +4781,13 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                 }
             }
             const float floor_score = p.drop_below_rel * max_score;
+            // --disk-stage-drop-measure-every: one layer fill in every N keeps
+            // the experts the drop would remove, so their true output norm is
+            // measured and the report can score the stored estimate
+            const bool measure = p.drop_measure_every > 0 &&
+                    (++p.n_fill_calls % (uint64_t) p.drop_measure_every == 0);
+            probe.assign((size_t) n_ids, 0);
+            probe_planned = measure;
 
             // candidates: cold experts below the relative floor. The highest
             // score is never below A * max, so the top expert is always kept
@@ -4484,6 +4824,9 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                     n_cold_all++;
                     if (probs[i] < floor_score) {
                         cold.push_back(i);
+                    } else {
+                        // a non-resident expert that is not weak enough to drop
+                        p.n_drop_excl_floor++;
                     }
                 }
             }
@@ -4744,50 +5087,120 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                 }
                 cold.resize(w);
             }
-            // drop the lowest-score candidates, up to round(Q * n_expert_used):
+            // the estimated per-expert output norm, from the memory the drop
+            // measurement fills. An expert with no estimate is charged the
+            // layer's mean measured norm, so an unknown one is not free
+            double  n_norm_sum = 0.0;
+            int64_t n_norm     = 0;
+            for (int64_t i = 0; i < n_ids; ++i) {
+                const int32_t eid = ids[i];
+                if (eid >= 0 && eid < (int32_t) c.out_norm.size() && c.out_norm[(size_t) eid] > 0.0f) {
+                    n_norm_sum += (double) c.out_norm[(size_t) eid];
+                    n_norm++;
+                }
+            }
+            const double layer_avg_norm = n_norm > 0 ? n_norm_sum / (double) n_norm : 0.0;
+            const auto   est_norm       = [&](int64_t pos) -> double {
+                const int32_t eid = ids[pos];
+                if (eid >= 0 && eid < (int32_t) c.out_norm.size() && c.out_norm[(size_t) eid] > 0.0f) {
+                    return (double) c.out_norm[(size_t) eid];
+                }
+                return layer_avg_norm;
+            };
+            // the layer's estimated routed real mass, the denominator the
+            // real-mass ceilings and the impact ranking work against
+            double layer_real_routed = 0.0;
+            for (int64_t i = 0; i < n_ids; ++i) {
+                layer_real_routed += (double) probs[i] * est_norm(i);
+            }
+
+            // drop the weakest candidates, up to round(Q * n_used * governor):
             // the floor decides which experts are weak and Q caps how many of
-            // them are dropped. The token ceiling is a running budget over the
-            // token's layer fills, so the final perturbation is bounded
+            // them are dropped. With drop_rank_real the candidates are ranked by
+            // their estimated removed output (score * norm) instead of the score
+            // alone, so the drop removes the least real mass it can. The score
+            // and real-mass ceilings are running budgets over the token's fills
             double dropped_mass = 0.0;
+            double dropped_real = 0.0;
             if (p.drop_fraction > 0.0f) {
-                int32_t budget = (int32_t) std::llround((double) p.drop_fraction * (double) n_ids);
+                const double scale = p.drop_real_target > 0.0f ? (double) c.budget_scale : 1.0;
+                int32_t      budget = (int32_t) std::llround((double) p.drop_fraction * (double) n_ids * scale);
+                if (budget < (int32_t) cold.size()) {
+                    // candidates the per-layer budget cannot reach
+                    p.n_drop_excl_budget += (uint64_t) ((int32_t) cold.size() - budget);
+                }
                 budget = std::min<int32_t>(budget, (int32_t) cold.size());
-                std::sort(cold.begin(), cold.end(), [probs](int64_t a, int64_t b) {
-                    return probs[a] < probs[b];
-                });
+                if (p.drop_rank_real) {
+                    std::sort(cold.begin(), cold.end(), [&](int64_t a, int64_t b) {
+                        return (double) probs[a] * est_norm(a) < (double) probs[b] * est_norm(b);
+                    });
+                } else {
+                    std::sort(cold.begin(), cold.end(), [probs](int64_t a, int64_t b) {
+                        return probs[a] < probs[b];
+                    });
+                }
                 const bool   layer_cap    = p.drop_max_mass > 0.0f;
                 const double layer_budget = (double) p.drop_max_mass * layer_mass;
                 const bool   token_cap    = p.drop_max_mass_token > 0.0f;
                 const double token_budget = (double) p.drop_max_mass_token * (p.tok_routed_mass + layer_mass);
+                const bool   layer_real_cap    = p.drop_max_real_mass > 0.0f;
+                const double layer_real_budget = (double) p.drop_max_real_mass * layer_real_routed;
+                const bool   token_real_cap    = p.drop_max_real_mass_token > 0.0f;
+                const double token_real_budget = (double) p.drop_max_real_mass_token * (p.tok_routed_real + layer_real_routed);
+                int32_t decided = 0;
                 for (int32_t k = 0; k < budget; ++k) {
-                    const double w = (double) probs[cold[(size_t) k]];
+                    const double w  = (double) probs[cold[(size_t) k]];
+                    const double wr = w * est_norm(cold[(size_t) k]);
                     if (layer_cap && layer_subst_mass + dropped_mass + w > layer_budget) {
                         break;
                     }
                     if (token_cap && p.tok_dropped_mass + layer_subst_mass + dropped_mass + w > token_budget) {
                         break;
                     }
-                    drop[(size_t) cold[(size_t) k]] = 1;
-                    dropped_mass += w;
+                    if (layer_real_cap && dropped_real + wr > layer_real_budget) {
+                        break;
+                    }
+                    if (token_real_cap && p.tok_dropped_real + dropped_real + wr > token_real_budget) {
+                        break;
+                    }
+                    decided++;
+                    if (measure) {
+                        // keep the expert, but remember it as a would-be drop
+                        probe[(size_t) cold[(size_t) k]] = 1;
+                    } else {
+                        drop[(size_t) cold[(size_t) k]] = 1;
+                        dropped_mass += w;
+                        dropped_real += wr;
+                    }
                 }
+                // candidates the caps stopped before the budget ran out
+                p.n_drop_stop_cap += (uint64_t) (budget - decided);
             }
             // token ceiling accounting: the running budget the next layer sees.
             // The per-layer worst tracks the same combined perturbation as the
             // cap, so a substitution-only run is not reported as 0%
             if (p.drop_fraction > 0.0f || p.substitute_enabled()) {
                 const double layer_perturb = layer_subst_mass + dropped_mass;
-                if (layer_mass > 0.0 && layer_perturb / layer_mass > p.drop_worst_mass) {
-                    p.drop_worst_mass = layer_perturb / layer_mass;
+                const double share = layer_mass > 0.0 ? layer_perturb / layer_mass : 0.0;
+                if (share > p.drop_worst_mass) {
+                    p.drop_worst_mass = share;
+                }
+                if (share > p.drop_worst_mass_run) {
+                    p.drop_worst_mass_run = share;
                 }
                 p.tok_routed_mass  += layer_mass;
                 p.tok_dropped_mass += layer_perturb;
+                p.tok_routed_real  += layer_real_routed;
+                p.tok_dropped_real += dropped_real;
             }
         }
 
-        // per-layer real drop impact: dropped output share over the measured
-        // routed total, tracked as a worst case like the score perturb above
-        double layer_routed_real  = 0.0;
-        double layer_dropped_real = 0.0;
+        // the post-compute hook recomputes the real drop impact from this
+        // token's fresh norms, so keep every routed position's id, score and
+        // decision here and let apply_out_norm() do the accounting
+        c.meas_ids.assign(ids, ids + n_ids);
+        c.meas_scores.assign((size_t) n_ids, 0.0f);
+        c.meas_drop.assign((size_t) n_ids, 0);
 
         for (int64_t i = 0; i < n_ids; ++i) {
             const int32_t id = ids[i];
@@ -4795,17 +5208,9 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                 continue;
             }
             p.n_routed_routes++;
-            // real drop impact: the routed total over the measured subset. A
-            // position whose expert norm was never measured is left out of the
-            // total and of the dropped share alike, so the coverage stays visible
+            c.meas_scores[(size_t) i] = probs != nullptr ? probs[i] : 0.0f;
             if (probs != nullptr) {
-                p.n_routed_all++;
-                if (id < (int32_t) c.out_norm.size() && c.out_norm[(size_t) id] > 0.0f) {
-                    p.n_routed_measured++;
-                    const double rc = (double) probs[i] * (double) c.out_norm[(size_t) id];
-                    p.n_routed_real_mass += rc;
-                    layer_routed_real    += rc;
-                }
+                p.n_routed_score_all += (double) probs[i];
             }
             if (l2_table != nullptr) {
                 l2_table[id] = l2_sentinel; // default: not in the L2 pool
@@ -4816,6 +5221,8 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
             // the graph's weight renormalization
             const bool dropped     = drop_planned && i < (int64_t) drop.size()  && drop[(size_t) i]  != 0;
             const bool substituted = drop_planned && i < (int64_t) subst.size() && subst[(size_t) i] != 0;
+            const bool probed      = probe_planned && i < (int64_t) probe.size() && probe[(size_t) i] != 0;
+            c.meas_drop[(size_t) i] = dropped ? 1 : (probed ? 2 : 0);
             if (c.keep != nullptr) {
                 ((float *) c.keep->data)[id] = dropped ? 0.0f : (substituted ? subst_scale[(size_t) i] : 1.0f);
             }
@@ -4852,13 +5259,6 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                 p.n_dropped_routes++;
                 if (probs != nullptr) {
                     p.n_dropped_mass += (double) probs[i];
-                    p.n_dropped_all++;
-                    if (id < (int32_t) c.out_norm.size() && c.out_norm[(size_t) id] > 0.0f) {
-                        p.n_dropped_measured++;
-                        const double dc = (double) probs[i] * (double) c.out_norm[(size_t) id];
-                        p.n_dropped_real_mass += dc;
-                        layer_dropped_real    += dc;
-                    }
                 }
                 for (int r = 0; r < 3; ++r) {
                     if (regions[r].stride != 0) {
@@ -4961,14 +5361,6 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
             }
         }
 
-        // worst single-layer real perturbation of this fill: dropped output
-        // share over the measured routed total, tracked like drop_worst_mass
-        if (layer_routed_real > 0.0) {
-            const double real_perturb = layer_dropped_real / layer_routed_real;
-            if (real_perturb > p.drop_worst_real_mass) {
-                p.drop_worst_real_mass = real_perturb;
-            }
-        }
     }
 
     // fill_cache()/fill_cache_begin() run the copies and hand the disk batch to
@@ -5350,9 +5742,34 @@ void llama_disk_stage::split_token_end() {
         if (frac > p.drop_worst_token_mass) {
             p.drop_worst_token_mass = frac;
         }
+        if (frac > p.drop_worst_token_mass_run) {
+            p.drop_worst_token_mass_run = frac;
+        }
+    }
+    if (p.tok_routed_real > 0.0) {
+        const double frac = p.tok_dropped_real / p.tok_routed_real;
+        if (frac > p.drop_worst_token_real) {
+            p.drop_worst_token_real = frac;
+        }
+        if (frac > p.drop_worst_token_real_run) {
+            p.drop_worst_token_real_run = frac;
+        }
+    }
+    if (p.tok_routed_perturb_e > 0.0 && p.tok_dropped_perturb_e > 0.0) {
+        const double frac = std::sqrt(p.tok_dropped_perturb_e / p.tok_routed_perturb_e);
+        if (frac > p.drop_worst_token_perturb) {
+            p.drop_worst_token_perturb = frac;
+        }
+        if (frac > p.drop_worst_token_perturb_run) {
+            p.drop_worst_token_perturb_run = frac;
+        }
     }
     p.tok_routed_mass  = 0.0;
     p.tok_dropped_mass = 0.0;
+    p.tok_routed_real  = 0.0;
+    p.tok_dropped_real = 0.0;
+    p.tok_routed_perturb_e  = 0.0;
+    p.tok_dropped_perturb_e = 0.0;
     const impl::split_acc & a = p.trace_split_tok;
     if (a.layers == 0) {
         return;

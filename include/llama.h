@@ -576,6 +576,29 @@ extern "C" {
         // the disk-stage report without dropping anything (--disk-stage-drop-probe)
         bool disk_stage_drop_probe;
 
+        // on one layer fill in every N, do not apply the drop so the experts it
+        // would have removed are computed and the stored output-norm estimate
+        // can be scored against the truth (--disk-stage-drop-measure-every).
+        // Costs the skipped disk reads on those fills, so 0 = off
+        int32_t disk_stage_drop_measure_every;
+
+        // rank the drop candidates by their estimated real output impact
+        // (score * measured output norm) instead of by score alone
+        // (--disk-stage-drop-rank). true = real (default), false = score
+        bool disk_stage_drop_rank_real;
+
+        // hard ceilings on the estimated real output mass the drop removes, as a
+        // fraction of the layer's / token's routed real mass. Same idea as
+        // disk_stage_drop_max_mass, but on the measured quantity
+        // (--disk-stage-drop-max-real-mass[-token], 0 = off)
+        float disk_stage_drop_max_real_mass;
+        float disk_stage_drop_max_real_mass_token;
+
+        // per-layer governor target: when a layer's measured real drop impact
+        // runs above this share its drop budget is scaled down, and scaled back
+        // up when it runs below (--disk-stage-drop-real-target, 0 = off)
+        float disk_stage_drop_real_target;
+
         // disk stage: dedicated mlocked CPU memory used as an L2 eviction pool
         // that survives prefill (--disk-stage-l2-permanent-mib). Unlike the
         // staging-slab and dense-vram L2 pools, its entries are not cleared when

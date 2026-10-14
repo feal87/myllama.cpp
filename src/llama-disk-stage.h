@@ -124,7 +124,9 @@ public:
                      const char * warm_experts_path, const char * base_template_path,
                      int32_t sparse_max, float drop_fraction, float drop_below_rel,
                      float drop_max_mass, float drop_max_mass_token, float substitute_rel, int32_t substitute_pool,
-                     bool drop_probe, uint64_t permanent_bytes,
+                     bool drop_probe, int32_t drop_measure_every,
+                     bool drop_rank_real, float drop_max_real_mass, float drop_max_real_mass_token,
+                     float drop_real_target, uint64_t permanent_bytes,
                      const std::vector<std::pair<void *, size_t>> & extra_l2_regions);
     ~llama_disk_stage();
 
@@ -337,6 +339,13 @@ public:
     // the drop lever removes. Fires after the split compute, while the buffer is
     // still intact, so the graph is not chunked. user_data is the llama_disk_stage
     static void node_computed_callback(struct ggml_tensor * node, void * user_data);
+
+    // decode readback of the per-expert squared norms that node_computed_callback
+    // captured for the graph that just computed. begin() queues one async D2H per
+    // device norm onto pinned rows; the caller then does its single decode sync;
+    // finish() folds the values into the per-expert EWMA
+    void observe_norms_begin(ggml_backend_sched_t sched);
+    void observe_norms_finish();
 
 private:
     struct impl;

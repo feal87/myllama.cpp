@@ -133,6 +133,20 @@ struct llama_cparams {
     // disk stage: measure and report the routed score distribution without
     // dropping anything (--disk-stage-drop-probe)
     bool    disk_stage_drop_probe;
+    // disk stage: one layer fill in every N skips the drop so the would-be
+    // dropped experts are measured and the stored estimate can be scored
+    // (--disk-stage-drop-measure-every, 0 = off)
+    int32_t disk_stage_drop_measure_every;
+    // disk stage: rank the drop candidates by estimated real impact instead of
+    // score (--disk-stage-drop-rank real)
+    bool    disk_stage_drop_rank_real;
+    // disk stage: ceilings on the estimated real output mass the drop removes,
+    // per layer and per token (--disk-stage-drop-max-real-mass[-token], 0 = off)
+    float   disk_stage_drop_max_real_mass;
+    float   disk_stage_drop_max_real_mass_token;
+    // disk stage: per-layer governor target for the measured real drop impact
+    // (--disk-stage-drop-real-target, 0 = off)
+    float   disk_stage_drop_real_target;
     // disk stage: dedicated mlocked L2 pool that survives prefill
     // (--disk-stage-l2-permanent-mib, 0 = off)
     uint64_t disk_stage_l2_permanent_bytes;
