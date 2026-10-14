@@ -861,10 +861,12 @@ struct llama_disk_stage::impl {
     double   n_routed_perturb_e   = 0.0;
     double   n_dropped_perturb_e  = 0.0;
     // which test ended the drop loop: would-be reads removed by the candidate
-    // floor, by the per-layer budget, or stopped early by a cap
+    // floor, by the per-layer budget, or stopped early by a cap. cold_all is the
+    // post-warm candidate count, the only denominator those three share
     uint64_t n_drop_excl_floor    = 0;
     uint64_t n_drop_excl_budget   = 0;
     uint64_t n_drop_stop_cap      = 0;
+    uint64_t n_drop_cold_all      = 0;
 
     // --disk-stage-drop-measure-every: on every N-th single-token decode the
     // drop is not applied, so the experts it would have removed are computed and
@@ -2372,10 +2374,10 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
         // which test ended the drop loop. Floor and budget only claim the
         // candidates they removed, the caps the part of the budget they stopped
         {
-            const uint64_t whole = base_drop > 0 ? base_drop : 1;
-            line("  limited   : floor %.0f%% | budget %.0f%% | caps %.0f%% | dropped %.0f%% (whole run)",
+            const uint64_t whole = p.n_drop_cold_all > 0 ? p.n_drop_cold_all : 1;
+            line("  limited   : floor %.0f%% | budget %.0f%% | caps %.0f%% | dropped %.0f%% (of %" PRIu64 " since warm)",
                  pct(p.n_drop_excl_floor, whole), pct(p.n_drop_excl_budget, whole),
-                 pct(p.n_drop_stop_cap, whole), pct(p.n_dropped_routes, whole));
+                 pct(p.n_drop_stop_cap, whole), pct(p.n_dropped_routes, whole), p.n_drop_cold_all);
         }
         // real impact: the dropped experts are never computed, so their norm is
         // estimated from the per-expert memory, while the kept ones contribute
@@ -2398,11 +2400,11 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
                 ? 100.0 * (double) p.n_routed_measured / (double) p.n_routed_all : 0.0;
         line("%s", "  removed   : mean      worst layer   worst token     of the routed output, whole run");
         line("    score   : %5.1f%%      %5.1f%%        %5.1f%%        router weight",
-             100.0 * score_share, 100.0 * p.drop_worst_mass_run, 100.0 * p.drop_worst_token_mass_run);
+             score_share, 100.0 * p.drop_worst_mass_run, 100.0 * p.drop_worst_token_mass_run);
         line("    real    : %5.1f%%      %5.1f%%        %5.1f%%        weight x output norm",
-             100.0 * real_share, 100.0 * p.drop_worst_real_run, 100.0 * p.drop_worst_token_real_run);
-        line("    perturb : %5.1f%%      %5.1f%%        %5.1f%%        output vector, renorm included",
-             100.0 * perturb_share, 100.0 * p.drop_worst_perturb_run, 100.0 * p.drop_worst_token_perturb_run);
+             real_share, 100.0 * p.drop_worst_real_run, 100.0 * p.drop_worst_token_real_run);
+        line("    perturb : %5.1f%%      %5.1f%%        %5.1f%%        output vector, rms, renorm included",
+             perturb_share, 100.0 * p.drop_worst_perturb_run, 100.0 * p.drop_worst_token_perturb_run);
         line("  this itv  : layer real %.1f%% perturb %.1f%% | token real %.1f%% perturb %.1f%%",
              100.0 * p.drop_worst_real_mass, 100.0 * p.drop_worst_perturb,
              100.0 * p.drop_worst_token_real, 100.0 * p.drop_worst_token_perturb);
@@ -4835,6 +4837,7 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                 p.probe_cold_max = std::max<uint64_t>(p.probe_cold_max, n_cold_all);
                 p.probe_calls++;
             }
+            p.n_drop_cold_all += n_cold_all;
             // a pool of the highest scoring non-routed experts: the substitution
             // source, and what the probe simulation measures. The router already
             // scores every expert, so the pool costs no extra compute
