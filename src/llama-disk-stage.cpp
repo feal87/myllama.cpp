@@ -1543,6 +1543,7 @@ struct llama_disk_stage::impl {
     uint64_t prev_dec_substituted   = 0;
     uint64_t prev_dec_tokens        = 0;
     // previous report's funnel bases, for the per-interval tier rates
+    uint64_t prev_base_l2           = 0;
     uint64_t prev_base_sub          = 0;
     uint64_t prev_base_drop         = 0;
     double   prev_dec_routed_mass   = 0.0;
@@ -2341,6 +2342,7 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     const uint64_t d_tokens     = decode_tokens > p.prev_dec_tokens ? decode_tokens - p.prev_dec_tokens : 0;
     const impl::split_acc split = p.split_tot - p.prev_split_tot;
     // funnel bases and the L2 hits over them, for the per-interval tier rates
+    const uint64_t d_base_l2   = base_l2   > p.prev_base_l2   ? base_l2   - p.prev_base_l2   : 0;
     const uint64_t d_base_sub  = base_sub  > p.prev_base_sub  ? base_sub  - p.prev_base_sub  : 0;
     const uint64_t d_base_drop = base_drop > p.prev_base_drop ? base_drop - p.prev_base_drop : 0;
     const uint64_t d_l2_all    = p.n_l2_all_hits > p.prev_l2_all_hits ? p.n_l2_all_hits - p.prev_l2_all_hits : 0;
@@ -2360,15 +2362,14 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
         return whole ? 100.0 * (double) part / (double) whole : 0.0;
     };
 
-    // every block leads with the selections the previous tier passed down. The
-    // L2 never looks up what the drop and the substitution removed, so its base
-    // is its own lookups; the wider RAM-miss funnel is printed next to it and the
-    // gap is what the later tiers suppressed
-    const uint64_t l2_lookups    = p.n_l2_all_hits + p.n_l2_all_misses;
-    const uint64_t l2_suppressed = base_l2 > l2_lookups ? base_l2 - l2_lookups : 0;
+    // every block leads with the selections that reached that tier, which are
+    // the previous tier's remainder: base_l2 = RAM misses, base_sub = L2 misses,
+    // base_drop = would-be reads, base_disk = reads. Each base line prints that
+    // working set and its share of the routed selections; the tier's own
+    // conversion rate (L2 hit, substitution, drop) is in the lines below it
     const size_t s_bl2 = out.size();
-    line("  base      : %" PRIu64 " lookups (%.1f%% of %" PRIu64 " RAM misses, %.1f%% of %" PRIu64 " routed) | %" PRIu64 " never looked up",
-         l2_lookups, pct(l2_lookups, base_l2), base_l2, pct(base_l2, routed), routed, l2_suppressed);
+    line("  base      : %" PRIu64 " RAM misses (%.1f%% of %" PRIu64 " routed)",
+         base_l2, pct(base_l2, routed), routed);
     const std::string sec_base_l2 = out.substr(s_bl2);
 
     const size_t s_bsub = out.size();
@@ -2377,13 +2378,13 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     const std::string sec_base_sub = out.substr(s_bsub);
 
     const size_t s_bdrop = out.size();
-    line("  base      : %" PRIu64 " would-be reads of %" PRIu64 " RAM misses (%.1f%% of %" PRIu64 " routed)",
-         base_drop, base_l2, pct(base_drop, routed), routed);
+    line("  base      : %" PRIu64 " would-be reads (%.1f%% of %" PRIu64 " routed)",
+         base_drop, pct(base_drop, routed), routed);
     const std::string sec_base_drop = out.substr(s_bdrop);
 
     const size_t s_bdisk = out.size();
-    line("  base      : %" PRIu64 " reads of %" PRIu64 " would-be reads (%.1f%% of %" PRIu64 " routed)",
-         base_disk, base_drop, pct(base_disk, routed), routed);
+    line("  base      : %" PRIu64 " reads (%.1f%% of %" PRIu64 " routed)",
+         base_disk, pct(base_disk, routed), routed);
     const std::string sec_base_disk = out.substr(s_bdisk);
 
     // the sets read into the decode cache at load and the graph split state
@@ -2565,15 +2566,16 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     const std::string sec_drop = out.substr(s_drop);
 
     const size_t s_l = out.size();
-    // the rate is over the lookups the base line prints, so the two agree. The
-    // warm-phase rate excludes the lookups served before the pool warmed, so it
-    // is printed apart
-    const uint64_t d_l2_all_miss   = p.n_l2_all_misses > p.prev_l2_all_misses ? p.n_l2_all_misses - p.prev_l2_all_misses : 0;
-    const uint64_t d_l2_lookups    = d_l2_all + d_l2_all_miss;
+    // the rate is over the RAM misses the L2 receives, not the lookups that
+    // physically executed: the drop and the substitution remove some experts
+    // before the counted lookup, but they already asked the pool
+    // (available_id -> evict_has), so those are L2 misses too. Over the executed
+    // lookups this rate would depend on the lower tiers. The warm-phase rate is
+    // the pool's steady state after it filled, so it uses the warm lookups
     line("  hit       : %.1f%% cumulative (%" PRIu64 "/%" PRIu64 ") | %.1f%% this interval (%" PRIu64 "/%" PRIu64
-         ") | warm-phase %.1f%% | %" PRIu64 " skipped cold",
-         pct(p.n_l2_all_hits, l2_lookups), p.n_l2_all_hits, l2_lookups,
-         pct(d_l2_all, d_l2_lookups), d_l2_all, d_l2_lookups,
+         ") | warm-phase %.1f%% | %" PRIu64 " cold-phase lookups",
+         pct(p.n_l2_all_hits, base_l2), p.n_l2_all_hits, base_l2,
+         pct(d_l2_all, d_base_l2), d_l2_all, d_base_l2,
          lookups ? 100.0 * p.n_l2_hits / lookups : 0.0, p.n_l2_cold);
 
     line("  l2 served : %s avoided this interval (%s promoted) | %s total",
@@ -2720,6 +2722,7 @@ void llama_disk_stage::print_stats(uint64_t decode_tokens, uint64_t routed, uint
     p.itv_perturb_sum = 0.0;
     p.itv_tokens      = 0;
     p.prev_dec_tokens        = decode_tokens;
+    p.prev_base_l2           = base_l2;
     p.prev_base_sub          = base_sub;
     p.prev_base_drop         = base_drop;
     p.prev_split_tot         = p.split_tot;
