@@ -754,6 +754,8 @@ struct llama_disk_stage::impl {
     std::vector<int>        evict_pool_id;    // layer -> pool, -1 when not pooled
     bool                    evict_populated = false; // pools hold entries a prefill would clobber
     bool                    prefill_mode    = true;  // external pools alias dense weights, no writes allowed
+    // optional SLRU demand trace (env LLAMA_DISK_STAGE_L2_TRACE = output path)
+    std::ofstream           l2_trace;
 
     // per-layer expert -> L2 slot table the graph remaps through, plus the public
     // view. The pool's weight tensors are shared; only the table is per layer
@@ -2909,6 +2911,7 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                    bool drop_rank_real, float drop_max_real_mass, float drop_max_real_mass_token,
                                    float drop_max_perturb,
                                    float drop_real_target, uint64_t permanent_bytes,
+                                   float l2_slru_protected_frac,
                                    const std::vector<std::pair<void *, size_t>> & extra_l2_regions) :
     pimpl(std::make_unique<impl>(model)) {
     impl & p = *pimpl;
@@ -2933,10 +2936,21 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
     GGML_UNUSED(substitute_pool);
     GGML_UNUSED(drop_probe);
     GGML_UNUSED(permanent_bytes);
+    GGML_UNUSED(l2_slru_protected_frac);
     return;
 #else
     if (!model.has_disk_weights()) {
         return;
+    }
+
+    // optional SLRU demand trace (env LLAMA_DISK_STAGE_L2_TRACE = output path):
+    // one "pool key fill_seg" line per decode lookup, decode thread only
+    if (const char * l2_trace_path = std::getenv("LLAMA_DISK_STAGE_L2_TRACE");
+        l2_trace_path != nullptr && l2_trace_path[0] != '\0') {
+        p.l2_trace.open(l2_trace_path, std::ios::out | std::ios::trunc);
+        if (!p.l2_trace) {
+            LLAMA_LOG_WARN("%s: cannot open L2 trace file %s\n", __func__, l2_trace_path);
+        }
     }
 
     // cache-aware opportunistic dropping: the lowest fraction of the routed
@@ -3923,9 +3937,10 @@ llama_disk_stage::llama_disk_stage(const llama_model & model, ggml_backend_dev_t
                                 ep.permanent = g < region_permanent.size() && region_permanent[g] != 0;
                                 ep.external  = reg.external;
                                 ep.sentinel  = cap - 1; // never filled, skipped by the graph
-                                // protected gets 70%: one-shot misses enter
-                                // probation and cannot displace a re-read
-                                ep.prot_cap  = ep.sentinel - std::max(1, ep.sentinel * 3 / 10);
+                                // protected gets the configured share of the
+                                // pool; one-shot misses enter probation and
+                                // cannot displace a re-read
+                                ep.prot_cap  = ep.sentinel - std::max(1, (int32_t) (ep.sentinel * (1.0f - l2_slru_protected_frac)));
                                 size_t off = 0;
                                 for (const auto & role : roles) {
                                     const size_t stride = src[il].r[role.slot].stride;
@@ -5317,7 +5332,8 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
                     if (layer_perturb_cap) {
                         const double wd = (dropped_mass + w) / layer_mass;
                         if (wd > 0.0 && wd < 1.0) {
-                            const double b    = dropped_wn2 + wr * wr;
+                            // b must carry the same normalized weights as layer_out_sq, or the estimate scales with the raw gating mass
+                            const double b    = (dropped_wn2 + wr * wr) / (layer_mass * layer_mass);
                             const double tail = layer_out_sq + b / (wd * wd) - 2.0 * b / wd;
                             const double amp  = wd / (1.0 - wd);
                             const double prt  = tail > 0.0 ? std::sqrt(amp * amp * tail / layer_out_sq) : 0.0;
@@ -5445,6 +5461,9 @@ bool llama_disk_stage::fill_cache_plan(int il, const int32_t * ids, int64_t n_id
             if (epid >= 0) {
                 impl::evict_pool & ep = p.evict_pools[(size_t) epid];
                 const int64_t      key = ((int64_t) il << 32) | (uint32_t) id;
+                if (p.l2_trace.is_open()) {
+                    p.l2_trace << epid << ' ' << key << " 0\n";
+                }
                 int32_t            eslot = p.evict_touch(epid, key);
                 const bool         hit   = eslot >= 0;
                 if (hit) {
@@ -6149,6 +6168,9 @@ void llama_disk_stage::resident_remove(int il, int32_t id, bool keep_l2) {
     if (demote_l2) {
         impl::evict_pool & ep = p.evict_pools[(size_t) epid];
         const int64_t      key = ((int64_t) il << 32) | (uint32_t) id;
+        if (p.l2_trace.is_open()) {
+            p.l2_trace << epid << ' ' << key << " 1\n";
+        }
         // only demote when the expert is not already in the L2: the bytes are the
         // same, and the copy must land in a reserved (unpublished) slot so the
         // VRAM upload worker's l2_copy can never read a half-written one

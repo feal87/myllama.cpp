@@ -1787,6 +1787,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.disk_stage_drop_max_perturb = params.disk_stage_drop_max_perturb;
     cparams.disk_stage_drop_real_target = params.disk_stage_drop_real_target;
     cparams.disk_stage_l2_permanent_bytes = params.disk_stage_l2_permanent_mib * 1024ull * 1024ull;
+    cparams.disk_stage_l2_slru_protected_frac = params.disk_stage_l2_slru_protected_frac;
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;

@@ -264,6 +264,7 @@ llama_context::llama_context(
     cparams.disk_stage_drop_max_perturb = params.disk_stage_drop_max_perturb;
     cparams.disk_stage_drop_real_target = params.disk_stage_drop_real_target;
     cparams.disk_stage_l2_permanent_bytes = params.disk_stage_l2_permanent_bytes;
+    cparams.disk_stage_l2_slru_protected_frac = params.disk_stage_l2_slru_protected_frac;
 
     // The hot-expert cache is the shared router-observation engine: it maintains
     // the global decayed ranking behind the RAM pinning tier (--pin-hot-experts
@@ -309,6 +310,7 @@ llama_context::llama_context(
                 cparams.disk_stage_drop_max_perturb,
                 cparams.disk_stage_drop_real_target,
                 cparams.disk_stage_l2_permanent_bytes,
+                cparams.disk_stage_l2_slru_protected_frac,
                 params.dense_vram_tensors != nullptr && params.dense_vram_tensors[0] != '\0'
                     ? llama_dense_vram::find_host_regions(model, params.dense_vram_tensors)
                     : std::vector<std::pair<void *, size_t>>());
@@ -5413,6 +5415,7 @@ llama_context_params llama_context_default_params() {
         /*.disk_stage_drop_max_perturb =*/ 0.0f,
         /*.disk_stage_drop_real_target =*/ 0.0f,
         /*.disk_stage_l2_permanent_bytes =*/ 0,
+        /*.disk_stage_l2_slru_protected_frac =*/ 0.70f,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

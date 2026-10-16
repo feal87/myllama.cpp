@@ -128,6 +128,7 @@ public:
                      bool drop_rank_real, float drop_max_real_mass, float drop_max_real_mass_token,
                      float drop_max_perturb,
                      float drop_real_target, uint64_t permanent_bytes,
+                     float l2_slru_protected_frac,
                      const std::vector<std::pair<void *, size_t>> & extra_l2_regions);
     ~llama_disk_stage();
 

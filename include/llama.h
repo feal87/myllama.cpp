@@ -613,6 +613,10 @@ extern "C" {
         // across turns. 0 = off
         uint64_t disk_stage_l2_permanent_bytes;
 
+        // disk stage: share of each L2 eviction pool held in the SLRU protected
+        // segment, the rest is probation (--disk-stage-l2-slru-protected-frac)
+        float disk_stage_l2_slru_protected_frac;
+
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)

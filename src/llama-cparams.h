@@ -153,6 +153,8 @@ struct llama_cparams {
     // disk stage: dedicated mlocked L2 pool that survives prefill
     // (--disk-stage-l2-permanent-mib, 0 = off)
     uint64_t disk_stage_l2_permanent_bytes;
+    // SLRU protected share of each L2 pool (--disk-stage-l2-slru-protected-frac)
+    float    disk_stage_l2_slru_protected_frac;
 
     llama_context * ctx_other;
 };

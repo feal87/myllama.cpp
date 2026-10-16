@@ -3313,6 +3313,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_DISK_STAGE_L2_PERMANENT_MIB"));
     add_opt(common_arg(
+        {"--disk-stage-l2-slru-protected-frac"}, "F",
+        string_format(
+            "with --load-mode dio, the share of each L2 eviction pool reserved for\n"
+            "the SLRU protected segment (default: %.2f); the rest is probation. A\n"
+            "miss enters probation, a hit promotes it to protected, and evictions\n"
+            "come from probation, so 1.0 is a pure frequency cache and 0.0 a pure\n"
+            "recency LRU. See --disk-stage-l2-permanent-mib for the pool itself",
+            (double) params.disk_stage_l2_slru_protected_frac
+        ),
+        [](common_params & params, const std::string & value) {
+            const float v = std::stof(value);
+            if (v < 0.0f || v > 1.0f) {
+                throw std::invalid_argument("error: --disk-stage-l2-slru-protected-frac must be in [0, 1]");
+            }
+            params.disk_stage_l2_slru_protected_frac = v;
+        }
+    ).set_env("LLAMA_ARG_DISK_STAGE_L2_SLRU_PROTECTED_FRAC"));
+    add_opt(common_arg(
         {"--hot-experts-prefetch"},
         {"--no-hot-experts-prefetch"},
         string_format(

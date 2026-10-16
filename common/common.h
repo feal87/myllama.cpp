@@ -574,6 +574,10 @@ struct common_params {
     // disk stage: dedicated mlocked L2 pool, in MiB, that survives prefill
     // (0 = off). See --disk-stage-l2-permanent-mib.
     uint64_t disk_stage_l2_permanent_mib = 0;
+    // disk stage: share of each L2 eviction pool held in the SLRU protected
+    // segment; the rest is probation (0 = pure recency LRU, 1 = everything
+    // protected). See --disk-stage-l2-slru-protected-frac.
+    float    disk_stage_l2_slru_protected_frac = 0.70f;
 
     // GPU-resident cache for host-offloaded MoE experts, served from VRAM on
     // decode (0 = disabled). See --moe-expert-cache*. Works with --pin-hot-experts
