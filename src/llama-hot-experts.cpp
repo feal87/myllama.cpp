@@ -56,6 +56,16 @@ llama_hot_expert_cache::llama_hot_expert_cache(const llama_model & model,
         }
     }
 
+    if (const char * route_path = std::getenv("LLAMA_HOT_EXPERTS_ROUTE_TRACE");
+        route_path != nullptr && route_path[0] != '\0') {
+        route_file = std::fopen(route_path, "wb");
+        if (route_file == nullptr) {
+            LLAMA_LOG_WARN("%s: failed to open expert route trace '%s'\n", __func__, route_path);
+        } else {
+            LLAMA_LOG_INFO("%s: writing the decode routing stream to %s\n", __func__, route_path);
+        }
+    }
+
     if (n_moe_layers == 0) {
         if (n_pin > 0) {
             LLAMA_LOG_WARN("%s: no MoE layers detected in model, --pin-hot-experts has no effect\n", __func__);
@@ -136,6 +146,10 @@ llama_hot_expert_cache::~llama_hot_expert_cache() {
         write_profile();
         std::fclose(profile_file);
         profile_file = nullptr;
+    }
+    if (route_file != nullptr) {
+        std::fclose(route_file);
+        route_file = nullptr;
     }
 
     // stop the pin worker and drain whatever is queued (pending jobs are simply
@@ -732,6 +746,20 @@ void llama_hot_expert_cache::observe_decode_finish() {
     }
 
     const int32_t * ids_all = obs_ids;
+
+    if (route_file != nullptr) {
+        for (int il = 0; il < (int) obs_off.size(); ++il) {
+            if (obs_off[il] < 0) {
+                continue;
+            }
+            std::fprintf(route_file, "%d:", il);
+            for (int k = 0; k < obs_cnt[il]; ++k) {
+                std::fprintf(route_file, "%d,", ids_all[obs_off[il] + k]);
+            }
+            std::fputc(' ', route_file);
+        }
+        std::fputc('\n', route_file);
+    }
 
     // one lock for the whole ubatch (the old per-layer lock/unlock was 48
     // uncontended acquisitions per decode token on the same mutex)

@@ -542,6 +542,9 @@ class llama_hot_expert_cache {
     llama_disk_stage * disk_stage = nullptr; // direct-read staging of the routed experts (null when disabled)
     const bool     track_rank;       // rank feeds pinning/VRAM tier; false = prefetch-only mode
     std::FILE *    profile_file = nullptr;
+    // optional raw decode-routing trace (env LLAMA_HOT_EXPERTS_ROUTE_TRACE =
+    // path): one line per decode token, "il:id,id,.. il:.. ". Diagnostic only
+    std::FILE *    route_file   = nullptr;
     std::vector<int32_t> profile_output; // decode tokens of the current profile
     uint64_t       profile_id = 0;
     uint64_t       profile_tokens = 0;
