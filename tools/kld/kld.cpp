@@ -442,7 +442,7 @@ int main(int argc, char ** argv) {
         inputs.chat_template_kwargs["reasoning_effort"] = "\"" + cli.reasoning_effort + "\"";
 
         const common_chat_params chat = common_chat_templates_apply(tmpls.get(), inputs);
-        prompt_text = chat.prompt;
+        prompt_text = chat.prompt.str();
     }
 
     std::vector<llama_token> all_tokens = common_tokenize(vocab, prompt_text, false, true);
