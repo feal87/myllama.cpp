@@ -121,8 +121,7 @@ struct tallocr_chunk {
 struct ggml_dyn_tallocr {
     size_t alignment;
     size_t max_chunk_size;
-    // no backend-imposed max size: the interval allocator may build the layout
-    // for this buffer type instead of the incremental best-fit
+    // no backend-imposed max size: the interval layout always fits this buffer type
     bool unlimited;
     struct tallocr_chunk * chunks[GGML_VBUFFER_MAX_CHUNKS];
     int n_chunks;
@@ -552,8 +551,8 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
         if (galloc->buf_tallocs[i] == NULL) {
             size_t alignment = ggml_backend_buft_get_alignment(bufts[i]);
             size_t max_size = ggml_backend_buft_get_max_size(bufts[i]);
-            // a buffer type without a max size uses the interval allocator; one
-            // with a max size keeps the incremental chunked allocator
+            // a buffer type with a max size caps the single chunk of the interval layout,
+            // so reserve falls back to the incremental chunked allocator when it does not fit
             const bool unlimited = (max_size == SIZE_MAX);
             galloc->buf_tallocs[i] = ggml_dyn_tallocr_new(alignment, max_size, unlimited);
         }
@@ -1071,7 +1070,8 @@ static void ggml_gallocr_interval_place(ggml_gallocr_t galloc) {
     }
 }
 
-static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
+// returns false when the interval layout does not fit a buffer type that has a max size
+static bool ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool interval) {
     // clear hash tables
     ggml_hash_set_reset(&galloc->hash_set);
     memset(galloc->hash_values, 0, sizeof(struct hash_node) * galloc->hash_set.size);
@@ -1079,19 +1079,6 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
         galloc->hash_values[i].unit = -1;
     }
 
-    // the interval layout needs a single unbounded address space per buffer type;
-    // a buffer type with a max size keeps the incremental chunked allocator
-    bool interval = true;
-    for (int i = 0; i < galloc->n_buffers; i++) {
-        if (!galloc->buf_tallocs[i]->unlimited) {
-            interval = false;
-            break;
-        }
-    }
-    if (!galloc->alloc_logged) {
-        galloc->alloc_logged = true;
-        GGML_LOG_INFO("%s: compute buffer allocator: %s\n", __func__, interval ? "interval" : "incremental");
-    }
     if (interval) {
         galloc->planning = true;
         galloc->n_units = 0;
@@ -1209,7 +1196,19 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
             hn->addr.chunk = 0;
             hn->addr.offset = galloc->units[u].offset;
         }
+        // the interval layout is one chunk per address space, so it must stay under the max size of a bounded buffer type
+        for (int i = 0; i < galloc->n_buffers; i++) {
+            struct ggml_dyn_tallocr * talloc = galloc->buf_tallocs[i];
+            if (talloc->unlimited) {
+                continue;
+            }
+            if (ggml_dyn_tallocr_max_size(talloc, 0) > talloc->max_chunk_size) {
+                return false;
+            }
+        }
     }
+
+    return true;
 }
 
 static bool ggml_gallocr_reserve_n_impl(
@@ -1234,8 +1233,19 @@ static bool ggml_gallocr_reserve_n_impl(
         ggml_dyn_tallocr_reset(galloc->buf_tallocs[i]);
     }
 
-    // allocate in hash table
-    ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+    // the interval layout is tighter, but a buffer type with a max size forces the
+    // incremental chunked allocator when the layout does not fit under that size
+    bool interval = ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, true);
+    if (!interval) {
+        for (int i = 0; i < galloc->n_buffers; i++) {
+            ggml_dyn_tallocr_reset(galloc->buf_tallocs[i]);
+        }
+        ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, false);
+    }
+    if (!galloc->alloc_logged) {
+        galloc->alloc_logged = true;
+        GGML_LOG_INFO("%s: compute buffer allocator: %s\n", __func__, interval ? "interval" : "incremental");
+    }
 
     // set the node_allocs from the hash table
     if (galloc->n_nodes < graph->n_nodes) {
