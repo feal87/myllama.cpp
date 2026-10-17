@@ -1178,18 +1178,19 @@ struct llama_disk_stage::impl {
                 tok_active    = true;
             }
             // output-vector perturbation. Removing the experts and renormalizing
-            // over what is left is delta = (W_D/(1-W_D)) * (Y - R), where R is the
-            // dropped experts' weighted output. With orthogonal experts
-            // |Y - R|^2 = |Y|^2 + |R|^2 - 2<Y,R> and all three terms are sums of
-            // (w n)^2. The branch delta and energy carry the graph's output scale
-            // and the denominator is pulled back to pre-drop: the measured branch
+            // over what is left moves the routed sum by delta = (W_D*Y - R)/(1-W_D),
+            // where R is the dropped experts' weighted output. With orthogonal
+            // experts |delta|^2 = (W_D^2|Y|^2 + |R|^2 - 2 W_D|R|^2)/(1-W_D)^2 and
+            // the post-drop energy is |Y1|^2 = (|Y|^2 - |R|^2)/(1-W_D)^2. The
+            // branch delta and energy carry the graph's output scale and the
+            // denominator is pulled back to pre-drop: the measured branch
             // ||scale*Y1 + S||^2 plus scale^2*(||Y0||^2 - ||Y1||^2), so the shared
             // expert and the routed/shared cross term are included
             if (drop_warm && w_drop > 0.0 && w_drop < 1.0 && out_sq_all > 0.0) {
                 const double tail     = out_sq_all + out_sq_drop / (w_drop * w_drop) - 2.0 * out_sq_drop / w_drop;
                 const double amp      = w_drop / (1.0 - w_drop);
                 const double delta_sq = tail > 0.0 ? amp * amp * tail : 0.0;
-                const double y1_sq    = tail / ((1.0 - w_drop) * (1.0 - w_drop));
+                const double y1_sq    = (out_sq_all - out_sq_drop) / ((1.0 - w_drop) * (1.0 - w_drop));
                 const double scale_sq = (double) branch_scale * (double) branch_scale;
                 tok_perturb_num += scale_sq * delta_sq;
                 tok_perturb_den += scale_sq * (out_sq_all - y1_sq);
