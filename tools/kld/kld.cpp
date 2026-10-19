@@ -31,10 +31,16 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
+
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -181,14 +187,14 @@ static int klb_nv(int n_vocab) {
     return 2 * ((n_vocab + 1) / 2) + 4;
 }
 
-static void write_bytes(std::ofstream & out, const void * p, size_t n) {
+static void write_bytes(std::ostream & out, const void * p, size_t n) {
     out.write((const char *) p, (std::streamsize) n);
 }
-static void read_bytes(std::ifstream & in, void * p, size_t n) {
+static void read_bytes(std::istream & in, void * p, size_t n) {
     in.read((char *) p, (std::streamsize) n);
 }
 
-static void write_base_header(std::ofstream & out, int n_vocab, uint32_t P, uint32_t D,
+static void write_base_header(std::ostream & out, int n_vocab, uint32_t P, uint32_t D,
                               const std::string & tag, const std::vector<llama_token> & toks) {
     const uint32_t version = KLB_VER;
     const uint32_t nv      = (uint32_t) n_vocab;
@@ -204,7 +210,7 @@ static void write_base_header(std::ofstream & out, int n_vocab, uint32_t P, uint
 }
 
 // returns false and logs on any mismatch
-static bool read_base_header(std::ifstream & in, int n_vocab, uint32_t & P, uint32_t & D,
+static bool read_base_header(std::istream & in, int n_vocab, uint32_t & P, uint32_t & D,
                              const std::string & tag, const std::vector<llama_token> & toks) {
     char magic[8];
     uint32_t version = 0, nv = 0, taglen = 0;
@@ -324,8 +330,8 @@ static void print_usage(int, char ** argv) {
     printf("  --reasoning-effort LEVEL template reasoning_effort (default: max)\n");
     printf("  --prefill-prefix-file F  prepend this text instead of applying the template\n");
     printf("  --prefill-batch N        multi-token prefill ubatch (default: n_batch)\n");
-    printf("  --save-base FILE         drop-off arm: write the base log-probs\n");
-    printf("  --load-base FILE         treatment arm: read the base log-probs and score\n");
+    printf("  --save-base FILE         drop-off arm: write the base log-probs ('-' = stdout)\n");
+    printf("  --load-base FILE         treatment arm: read the base log-probs ('-' = stdin)\n");
     printf("  --dump-positions FILE    write per-position CSV\n");
     printf("  --max-decode-tokens N    stop after N decode tokens (-1 = all)\n");
     printf("  --config-tag STR         tag written to / checked against the base file\n");
@@ -475,25 +481,45 @@ int main(int argc, char ** argv) {
             all_tokens[P - 2], all_tokens[P - 1]);
 
     // ---- base file streams ----
-    std::ofstream  base_out;
-    std::ifstream  base_in;
+    // "-" streams the raw base over stdout/stdin, so a wrapper can compress or
+    // decompress it on the fly instead of materialising a multi-GiB file.
+    std::ofstream  base_out_file;
+    std::ifstream  base_in_file;
+    std::ostream * base_out = nullptr;
+    std::istream * base_in  = nullptr;
     std::vector<uint16_t> base_block(nv);
     if (!cli.save_base.empty()) {
-        base_out.open(cli.save_base, std::ios::binary);
-        if (!base_out) {
-            LOG_ERR("%s: failed to open %s for writing\n", __func__, cli.save_base.c_str());
-            return 1;
+        if (cli.save_base == "-") {
+#if defined(_WIN32)
+            _setmode(_fileno(stdout), _O_BINARY);
+#endif
+            base_out = &std::cout;
+        } else {
+            base_out_file.open(cli.save_base, std::ios::binary);
+            if (!base_out_file) {
+                LOG_ERR("%s: failed to open %s for writing\n", __func__, cli.save_base.c_str());
+                return 1;
+            }
+            base_out = &base_out_file;
         }
         const uint32_t p32 = (uint32_t) P, d32 = (uint32_t) D;
-        write_base_header(base_out, n_vocab, p32, d32, cli.config_tag, all_tokens);
+        write_base_header(*base_out, n_vocab, p32, d32, cli.config_tag, all_tokens);
     } else if (!cli.load_base.empty()) {
-        base_in.open(cli.load_base, std::ios::binary);
-        if (!base_in) {
-            LOG_ERR("%s: failed to open %s\n", __func__, cli.load_base.c_str());
-            return 1;
+        if (cli.load_base == "-") {
+#if defined(_WIN32)
+            _setmode(_fileno(stdin), _O_BINARY);
+#endif
+            base_in = &std::cin;
+        } else {
+            base_in_file.open(cli.load_base, std::ios::binary);
+            if (!base_in_file) {
+                LOG_ERR("%s: failed to open %s\n", __func__, cli.load_base.c_str());
+                return 1;
+            }
+            base_in = &base_in_file;
         }
         uint32_t p32 = 0, d32 = 0;
-        if (!read_base_header(base_in, n_vocab, p32, d32, cli.config_tag, all_tokens)) {
+        if (!read_base_header(*base_in, n_vocab, p32, d32, cli.config_tag, all_tokens)) {
             return 1;
         }
         if ((int64_t) p32 != P || (int64_t) d32 != D) {
@@ -522,16 +548,16 @@ int main(int argc, char ** argv) {
     }
 
     auto score = [&](int64_t pos, llama_token target, const float * logits, uint64_t drop_step, uint64_t routed_step) {
-        if (base_out.is_open()) {
+        if (base_out != nullptr) {
             double nll = quantize_log_softmax(n_vocab, logits, base_block.data(), target);
             const uint32_t p32 = (uint32_t) pos;
             const uint32_t t32 = (uint32_t) target;
             const float    f32 = (float) nll;
-            write_bytes(base_out, &p32, 4);
-            write_bytes(base_out, &t32, 4);
-            write_bytes(base_out, &f32, 4);
-            write_bytes(base_out, base_block.data(), (size_t) nv * 2);
-            if (!base_out) {
+            write_bytes(*base_out, &p32, 4);
+            write_bytes(*base_out, &t32, 4);
+            write_bytes(*base_out, &f32, 4);
+            write_bytes(*base_out, base_block.data(), (size_t) nv * 2);
+            if (!*base_out) {
                 LOG_ERR("%s: base write failed at pos %lld\n", __func__, (long long) pos);
                 exit(1);
             }
@@ -540,14 +566,14 @@ int main(int argc, char ** argv) {
             }
             return;
         }
-        if (base_in.is_open()) {
+        if (base_in != nullptr) {
             uint32_t p32 = 0, t32 = 0;
             float    f32 = 0.0f;
-            read_bytes(base_in, &p32, 4);
-            read_bytes(base_in, &t32, 4);
-            read_bytes(base_in, &f32, 4);
-            read_bytes(base_in, base_block.data(), (size_t) nv * 2);
-            if (!base_in) {
+            read_bytes(*base_in, &p32, 4);
+            read_bytes(*base_in, &t32, 4);
+            read_bytes(*base_in, &f32, 4);
+            read_bytes(*base_in, base_block.data(), (size_t) nv * 2);
+            if (!*base_in) {
                 LOG_ERR("%s: base read failed at pos %lld\n", __func__, (long long) pos);
                 exit(1);
             }
@@ -666,8 +692,16 @@ int main(int argc, char ** argv) {
 
     LOG_INF("total: %.1f s (prefill %.1f + decode %.1f)\n", t_prefill + t_dec, t_prefill, t_dec);
 
+    if (base_out != nullptr) {
+        base_out->flush();
+        if (!*base_out) {
+            LOG_ERR("%s: final base flush failed\n", __func__);
+            return 1;
+        }
+    }
+
     // ---- summary ----
-    if (base_in.is_open() && stats.count > 0) {
+    if (base_in != nullptr && stats.count > 0) {
         std::sort(kld_values.begin(), kld_values.end());
         std::sort(p_diff_values.begin(), p_diff_values.end());
 
