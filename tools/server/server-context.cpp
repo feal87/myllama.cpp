@@ -4420,6 +4420,9 @@ private:
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
+                            // number of cached tokens shared with the new prompt, before any checkpoint is restored
+                            const int n_prefix = n_past;
+
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
                             const bool has_new_tokens = (n_past < slot.task->n_tokens());
 
@@ -4631,9 +4634,21 @@ private:
                                     if (ctx_dft != nullptr) {
                                         llama_context_reset_lazy_quant(ctx_dft);
                                     }
-
                                     n_past   = 0;
                                     pos_next = 0;
+                                }
+                            }
+
+                            {
+                                // erase any checkpoints with pos_max > pos_next, or that cover tokens not shared with the new prompt
+                                for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
+                                    const auto & cur = *it;
+                                    if (cur.pos_max > pos_next || cur.n_tokens > n_prefix) {
+                                        SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+                                        it = slot.prompt.checkpoints.erase(it);
+                                    } else {
+                                        ++it;
+                                    }
                                 }
                             }
 
